@@ -31,7 +31,10 @@ This repository implements **Milestone 0 (architecture foundation)** and
 **Milestone 1 (build MVP)** of the product requirements, with Milestone 2
 interfaces in place. See [PRD.md](PRD.md) for the full product definition (the
 original Chinese text is in [PRD.com](PRD.com)) and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the engineering contract.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the engineering contract,
+[docs/MILESTONES.md](docs/MILESTONES.md) for what is delivered and how it is
+verified, and [docs/TOOLCHAIN-RESOLUTION.md](docs/TOOLCHAIN-RESOLUTION.md) for
+the resolution chain.
 
 What works today:
 
@@ -41,24 +44,25 @@ What works today:
 | Manifest (`cova.toml`) | Full parse/validate/serialise with round-trip |
 | Target model (triples, ABI, constraints) | Structured, normalising, compiler-independent |
 | Toolchain discovery and probing | Real discovery + real compile/link probes |
-| Toolchain resolution | System-first → managed → trusted download chain, with diagnostics |
+| Toolchain resolution | System-first → managed fallback, with structured diagnostics; no download registry in this build |
 | Build graph, planner, scheduler | Independent IR; compiler providers emit commands |
 | Incremental builds | Depfile-driven header tracking, content-hash cache keys |
 | `build`, `run`, `test`, `check`, `clean`, `fmt` | Works end to end |
 | `doctor`, `target list`, `toolchain list/explain`, `sysroot list/verify` | Works |
 | Sysroot installation | Local archive only; no public registry yet (fails honestly) |
-| Dependency manager (`add`, `fetch`, `update`, `vendor`) | Manifest edits only; no fetcher yet (fails honestly) |
-| Workspace | Discovery, ordering and shared settings; multi-package builds wired |
+| Dependency manager (`add`, `fetch`, `update`, `vendor`) | Manifest edits; workspace path dependencies are built and linked; no registry fetcher yet (fails honestly) |
+| Workspace | Discovery, ordering, shared settings and multi-package builds |
+| Self-hosting | A root `cova.toml` lets a built Cova build, test and run itself (Stage 1) |
 
 What deliberately does **not** work yet, by design:
 
-- **No package registry and no source fetcher.** `cova add`/`fetch`/`update`
-  refuse rather than simulate a download. PRD §18.1 forbids trusting content we
-  cannot verify.
+- **No package registry and no source fetcher.** Remote `cova add`, `cova
+  fetch` and `cova update` refuse rather than simulate a download. PRD §18.1
+  forbids trusting content we cannot verify.
 - **No managed toolchain download.** `cova toolchain install` explains that no
   trusted registry is configured.
-- **No C++ Modules.** `scan_deps_argv` returns "not supported" rather than
-  pretending.
+- **No C++ Modules.** The capability probe reports modules unsupported and the
+  planner does not emit scans rather than pretending.
 - **No remote execution.** `--runner remote` is rejected explicitly.
 
 ## Building Cova
@@ -75,6 +79,15 @@ COVA_CXX=clang++ ./bootstrap/build.sh
 The bootstrap script probes the compiler for the C++26 baseline features Cova
 actually uses (`<expected>`, `<print>`, concepts, ranges, designated
 initializers) — it does not infer support from a version number (PRD §16.4).
+
+Cova can also build itself once a Stage 0 binary exists (PRD §16.2):
+
+```bash
+./bootstrap/build.sh
+export PATH="$PWD/build/bootstrap/bin:$PATH"
+cova build          # Stage 1: the repository root is a Cova package
+cova test
+```
 
 Day-to-day development uses the same driver directly:
 

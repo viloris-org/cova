@@ -273,6 +273,37 @@ std::optional<toolchain::ResolvedToolchain> resolve_toolchain_or_report(
   return report.toolchain;
 }
 
+namespace {
+
+void render_diagnostic(const Diagnostic& diagnostic, CommandContext& ctx, int depth = 0) {
+  const std::string indent(static_cast<std::size_t>(depth) * 2, ' ');
+  switch (diagnostic.severity) {
+    case Severity::Warning:
+      ctx.ui->warn(indent + diagnostic.message);
+      break;
+    case Severity::Error:
+    case Severity::Bug:
+      ctx.ui->error(indent + diagnostic.message);
+      break;
+    case Severity::Help:
+    case Severity::Note:
+      ctx.ui->out(indent + diagnostic.message);
+      break;
+  }
+  if (!diagnostic.detail.empty()) {
+    for (const auto& line : str::split(diagnostic.detail, '\n')) {
+      if (!line.empty()) {
+        ctx.ui->out(indent + "  " + line);
+      }
+    }
+  }
+  for (const auto& child : diagnostic.children) {
+    render_diagnostic(child, ctx, depth + 1);
+  }
+}
+
+}  // namespace
+
 void print_resolution_failure(const toolchain::ResolutionReport& report, CommandContext& ctx) {
   DiagnosticEngine engine;
   if (report.failure.code.empty()) {
@@ -280,15 +311,15 @@ void print_resolution_failure(const toolchain::ResolutionReport& report, Command
   } else {
     engine.emit(report.failure);
   }
-  engine.render(std::cerr, false);
+  report_diagnostics(engine, ctx);
   for (const auto& decision : report.decisions) {
     ctx.ui->verbose(decision);
   }
 }
 
 int report_diagnostics(const DiagnosticEngine& engine, CommandContext& ctx) {
-  if (!engine.diagnostics().empty()) {
-    engine.render(std::cerr, false);
+  for (const auto& diagnostic : engine.diagnostics()) {
+    render_diagnostic(diagnostic, ctx);
   }
   if (!engine.has_errors()) {
     return 0;
@@ -303,8 +334,7 @@ int report_diagnostics(const DiagnosticEngine& engine, CommandContext& ctx) {
 int report_error(const Error& error, CommandContext& ctx) {
   DiagnosticEngine engine;
   engine.emit(diagnostic_from_error(error));
-  engine.render(std::cerr, false);
-  return 1;
+  return report_diagnostics(engine, ctx);
 }
 
 Result<LockState> load_toolchain_lock(const LoadedProject& project, CommandContext& ctx) {

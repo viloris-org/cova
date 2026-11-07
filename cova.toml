@@ -1,0 +1,29 @@
+[package]
+name = "cova"
+version = "0.1.0"
+edition = "c++26"
+description = "Cova build system, package manager and toolchain manager"
+
+[build]
+type = "executable"
+sources = ["src/**/*.cpp"]
+public-includes = ["src"]
+compile-options = ["-Wall", "-Wextra", "-Wpedantic", "-Wno-unused-parameter"]
+
+[profile.dev]
+optimization = 0
+debug = true
+assertions = true
+
+[profile.release]
+optimization = 3
+debug = false
+lto = true
+assertions = false
+
+[toolchain]
+policy = "system-first"
+auto-install = false
+
+[test]
+sources = ["tests/unit/**/*.cpp", "tests/integration/**/*.cpp"]
