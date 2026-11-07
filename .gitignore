@@ -1,0 +1,40 @@
+# Build output
+build/
+.dir/
+out/
+artifacts/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Build system scratch
+.ninja_log
+.ninja_deps
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Caches
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
