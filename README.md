@@ -29,7 +29,8 @@ cova build --target aarch64-unknown-linux-musl
 
 This repository implements **Milestone 0 (architecture foundation)** and
 **Milestone 1 (build MVP)** of the product requirements, with Milestone 2
-interfaces in place. See [PRD.com](PRD.com) for the full product definition and
+interfaces in place. See [PRD.md](PRD.md) for the full product definition (the
+original Chinese text is in [PRD.com](PRD.com)) and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the engineering contract.
 
 What works today:
@@ -165,7 +166,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation
 
-- [PRD.com](PRD.com) — product requirements
+- [PRD.md](PRD.md) — product requirements (English)
+- [PRD.com](PRD.com) — product requirements (original Chinese)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module boundaries, conventions, testing rules
 - [docs/MILESTONES.md](docs/MILESTONES.md) — what is delivered per milestone and how it is verified
 - [docs/TOOLCHAIN-RESOLUTION.md](docs/TOOLCHAIN-RESOLUTION.md) — the resolution chain in detail
