@@ -5,8 +5,9 @@
 > Lead first.
 
 Cova is a C/C++ build system, package manager and cross-compilation toolchain
-manager, written in C++26 and inspired by Cargo. The PRD is `PRD.com` at the
-repo root; `§n.n` below refers to its sections.
+manager, written in C++26 and inspired by Cargo. The PRD is `PRD.md` at the
+repo root (the original Chinese text is `PRD.com`); `§n.n` below refers to its
+sections.
 
 **Current delivery target: Milestone 0 (architecture foundation) + Milestone 1
 (build MVP), with Milestone 2 interfaces in place and honest diagnostics.**
