@@ -332,8 +332,10 @@ std::vector<std::string> compare_locks(const lockfile::DependencyLock& expected,
       differences.push_back("`" + package.name + "` is not recorded");
       continue;
     }
-    actual_by_name.erase(it);
+    // Read the recorded package before erasing the entry: `it` points into
+    // the map node, so touching it after erase is a use-after-free.
     const lockfile::LockedPackage& recorded = *it->second;
+    actual_by_name.erase(it);
     auto differ = [&](const std::string& what) {
       differences.push_back("`" + package.name + "` " + what);
     };

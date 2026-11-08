@@ -141,7 +141,7 @@ std::optional<stdfs::path> find_manifest_root(const stdfs::path& extracted) {
   std::error_code ec;
   for (auto it = stdfs::directory_iterator(extracted, ec); it != stdfs::directory_iterator();
        it.increment(ec)) {
-    if (it->is_directory()) {
+    if (fs::is_directory(it->path())) {
       directories.push_back(it->path());
     }
   }

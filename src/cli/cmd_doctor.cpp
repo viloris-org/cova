@@ -197,7 +197,7 @@ int cmd_toolchain(CommandContext& ctx) {
       if (fs::is_directory(dirs->toolchains)) {
         for (auto it = stdfs::directory_iterator(dirs->toolchains, ec);
              it != stdfs::directory_iterator(); it.increment(ec)) {
-          if (it->is_directory()) {
+          if (fs::is_directory(it->path())) {
             managed.push_back(it->path());
           }
         }

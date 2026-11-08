@@ -194,7 +194,7 @@ int cmd_clean(CommandContext& ctx) {
     std::error_code ec;
     for (auto it = stdfs::directory_iterator(target_dir, ec); it != stdfs::directory_iterator();
          it.increment(ec)) {
-      if (!it->is_directory()) {
+      if (!fs::is_directory(it->path())) {
         continue;
       }
       const auto profile_dir = it->path() / profile;

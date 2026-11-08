@@ -65,7 +65,7 @@ std::vector<FoundSysroot> scan_sysroots(const stdfs::path& root) {
   std::error_code ec;
   for (auto it = stdfs::directory_iterator(root, ec); it != stdfs::directory_iterator();
        it.increment(ec)) {
-    if (!it->is_directory()) {
+    if (!fs::is_directory(it->path())) {
       continue;
     }
     const auto manifest_path = it->path() / "sysroot.toml";

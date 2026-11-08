@@ -114,7 +114,7 @@ std::vector<stdfs::path> managed_compiler_candidates(const stdfs::path& root) {
   std::error_code ec;
   for (auto it = stdfs::directory_iterator(root, ec); it != stdfs::directory_iterator();
        it.increment(ec)) {
-    if (!it->is_directory()) {
+    if (!fs::is_directory(it->path())) {
       continue;
     }
     for (const auto& bin : {it->path() / "bin", it->path()}) {
@@ -124,7 +124,7 @@ std::vector<stdfs::path> managed_compiler_candidates(const stdfs::path& root) {
       std::error_code scan_ec;
       for (auto entry = stdfs::directory_iterator(bin, scan_ec);
            entry != stdfs::directory_iterator(); entry.increment(scan_ec)) {
-        if (!entry->is_regular_file()) {
+        if (!fs::is_regular_file(entry->path())) {
           continue;
         }
         auto match = match_driver(entry->path().filename().string());
@@ -478,7 +478,7 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
     std::error_code ec;
     for (auto it = stdfs::directory_iterator(root, ec); it != stdfs::directory_iterator();
          it.increment(ec)) {
-      if (!it->is_regular_file()) {
+      if (!fs::is_regular_file(it->path())) {
         continue;
       }
       const std::string name = basename_lower(it->path());

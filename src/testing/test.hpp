@@ -161,8 +161,10 @@ class ScopedEnv {
 
 #define COVA_CHECK_EQ(a, b)                                                       \
   do {                                                                            \
-    const auto& cova_lhs_ = (a);                                                  \
-    const auto& cova_rhs_ = (b);                                                  \
+    /* By value: binding a reference to `*optional` does not extend the           \
+       optional temporary's lifetime, so the reference would dangle. */           \
+    auto cova_lhs_ = (a);                                                         \
+    auto cova_rhs_ = (b);                                                         \
     if (!(cova_lhs_ == cova_rhs_)) {                                              \
       COVA_FAIL_AT("expected equality:\n  left:  " +                              \
                        ::cova::test::format_value(cova_lhs_) +                    \
@@ -173,8 +175,8 @@ class ScopedEnv {
 
 #define COVA_CHECK_NE(a, b)                                                       \
   do {                                                                            \
-    const auto& cova_lhs_ = (a);                                                  \
-    const auto& cova_rhs_ = (b);                                                  \
+    auto cova_lhs_ = (a);                                                         \
+    auto cova_rhs_ = (b);                                                         \
     if (cova_lhs_ == cova_rhs_) {                                                 \
       COVA_FAIL_AT("expected inequality with: " +                                 \
                        ::cova::test::format_value(cova_rhs_),                     \

@@ -79,7 +79,7 @@ bool has_cxx_driver() {
     for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end;
          it.increment(ec)) {
       const std::string filename = it->path().filename().string();
-      for (const std::string& prefix : {"g++-", "clang++-"}) {
+      for (const std::string_view prefix : {"g++-", "clang++-"}) {
         if (filename.rfind(prefix, 0) == 0) {
           return true;
         }

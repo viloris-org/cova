@@ -339,7 +339,9 @@ BreakBeforeBraces: Attach
 PointerAlignment: Left
 SortIncludes: CaseSensitive
 SpaceAfterTemplateKeyword: false
-Standard: c++26
+# `Latest` rather than `c++26`: clang-format rejects a standard newer than it
+# knows ("unknown enumerated scalar"), and `Latest` means the newest it supports.
+Standard: Latest
 ...
 )";
 }

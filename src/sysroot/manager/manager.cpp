@@ -718,7 +718,7 @@ Result<std::vector<InstalledSysroot>> SysrootManager::list() const {
   std::error_code ec;
   for (auto it = stdfs::directory_iterator(options_.sysroots_root, ec);
        it != stdfs::directory_iterator(); it.increment(ec)) {
-    if (!it->is_directory()) {
+    if (!fs::is_directory(it->path())) {
       continue;
     }
     const auto manifest_path = it->path() / "sysroot.toml";
@@ -1084,7 +1084,7 @@ Result<SysrootManager::GcPlan> SysrootManager::plan_gc() const {
   std::error_code ec;
   for (auto it = stdfs::directory_iterator(options_.store_root, ec);
        it != stdfs::directory_iterator(); it.increment(ec)) {
-    if (!it->is_directory()) {
+    if (!fs::is_directory(it->path())) {
       continue;
     }
     const std::string name = it->path().filename().string();
