@@ -95,6 +95,11 @@ EOF
 
 built="$(find "$topdir/RPMS" -name '*.rpm' -type f | head -1)"
 [[ -n "$built" ]] || die "rpmbuild produced no package"
-output="$OUT_DIR/$(basename "$built")"
+
+# The Version tag keeps `~` (it sorts correctly), but GitHub rewrites `~` to `.`
+# in release asset names, which would invalidate the published checksum. Spell
+# the *file name* with dots so the asset name and its checksum agree.
+filename="$(basename "$built" | tr '~' '.')"
+output="$OUT_DIR/$filename"
 cp "$built" "$output"
 note "built $output"

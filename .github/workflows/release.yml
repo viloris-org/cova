@@ -167,23 +167,25 @@ jobs:
           path: stage
 
       - name: Create universal binary
+        # Staged outside dist/ so the raw binary is never published as an asset;
+        # only the packaged artifacts are.
         run: |
-          mkdir -p dist
+          mkdir -p build/universal
           lipo -create \
             stage/cova-macos-x86_64/cova \
             stage/cova-macos-arm64/cova \
-            -output dist/cova
-          chmod +x dist/cova
-          lipo -info dist/cova
+            -output build/universal/cova
+          chmod +x build/universal/cova
+          lipo -info build/universal/cova
           # lipo drops the signature, and Apple Silicon refuses unsigned
           # binaries, so re-apply an ad-hoc signature.
-          codesign --force --sign - dist/cova
-          codesign --verify --verbose dist/cova
-          dist/cova --version
+          codesign --force --sign - build/universal/cova
+          codesign --verify --verbose build/universal/cova
+          build/universal/cova --version
 
       - name: Build .pkg, .dmg and universal tarball
         env:
-          COVA_BINARY: ${{ github.workspace }}/dist/cova
+          COVA_BINARY: ${{ github.workspace }}/build/universal/cova
           COVA_PACKAGE_ARCH: universal
           COVA_PACKAGE_OS: macos
         run: bash scripts/package/build-all.sh
