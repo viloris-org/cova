@@ -135,6 +135,15 @@ struct ExtractLimits {
 Status extract_archive_safely(const stdfs::path& archive, const stdfs::path& dest_root,
                               const ExtractLimits& limits = {});
 
+// Copies a component archive into the download cache, verifying its SHA-256
+// (and size, when non-zero) against the trusted registry entry. The cached file
+// is named by digest so identical content is never staged twice. Shared by the
+// sysroot and toolchain installers.
+Result<stdfs::path> stage_verified_archive(const stdfs::path& downloads_root,
+                                           const stdfs::path& archive,
+                                           std::string_view expected_sha256,
+                                           std::uint64_t expected_size = 0);
+
 // Helper used by tests and by `cova sysroot install` for local archives.
 Status install_from_archive(const stdfs::path& archive, const stdfs::path& sysroots_root,
                             const SysrootManifest& manifest);

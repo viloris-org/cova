@@ -53,8 +53,7 @@ bool safe_relative_entry(std::string_view entry) {
   if (entry.front() == '/' || entry.front() == '\\') {
     return false;
   }
-  if (entry.size() >= 2 && std::isalpha(static_cast<unsigned char>(entry[0])) &&
-      entry[1] == ':') {
+  if (entry.size() >= 2 && std::isalpha(static_cast<unsigned char>(entry[0])) && entry[1] == ':') {
     return false;
   }
   for (const auto& component : str::split(entry, '/')) {
@@ -87,9 +86,9 @@ Result<std::vector<std::string>> list_tar(const fs::Path& archive) {
       continue;
     }
     if (!safe_relative_entry(trimmed)) {
-      return fail<std::vector<std::string>>(Error::make(
-          "cova::sysroot::unsafe_archive",
-          "archive entry escapes the extraction root: `" + trimmed + "`"));
+      return fail<std::vector<std::string>>(
+          Error::make("cova::sysroot::unsafe_archive",
+                      "archive entry escapes the extraction root: `" + trimmed + "`"));
     }
     entries.push_back(trimmed);
   }
@@ -108,14 +107,14 @@ Result<std::vector<std::string>> list_tar(const fs::Path& archive) {
       }
       const auto arrow = line.find(" -> ");
       if (arrow == std::string::npos) {
-        return fail<std::vector<std::string>>(Error::make(
-            "cova::sysroot::unsafe_archive", "archive link entry has no target"));
+        return fail<std::vector<std::string>>(
+            Error::make("cova::sysroot::unsafe_archive", "archive link entry has no target"));
       }
       const std::string target = str::trim(line.substr(arrow + 4));
       if (!safe_relative_entry(target)) {
-        return fail<std::vector<std::string>>(Error::make(
-            "cova::sysroot::unsafe_archive",
-            "archive link target escapes the extraction root: `" + target + "`"));
+        return fail<std::vector<std::string>>(
+            Error::make("cova::sysroot::unsafe_archive",
+                        "archive link target escapes the extraction root: `" + target + "`"));
       }
     }
   }
@@ -139,9 +138,9 @@ Result<std::vector<std::string>> list_zip(const fs::Path& archive) {
       continue;
     }
     if (!safe_relative_entry(trimmed)) {
-      return fail<std::vector<std::string>>(Error::make(
-          "cova::sysroot::unsafe_archive",
-          "archive entry escapes the extraction root: `" + trimmed + "`"));
+      return fail<std::vector<std::string>>(
+          Error::make("cova::sysroot::unsafe_archive",
+                      "archive entry escapes the extraction root: `" + trimmed + "`"));
     }
     entries.push_back(trimmed);
   }
@@ -160,14 +159,14 @@ Result<std::vector<std::string>> list_zip(const fs::Path& archive) {
       }
       const auto arrow = line.find(" -> ");
       if (arrow == std::string::npos) {
-        return fail<std::vector<std::string>>(Error::make(
-            "cova::sysroot::unsafe_archive", "archive link entry has no target"));
+        return fail<std::vector<std::string>>(
+            Error::make("cova::sysroot::unsafe_archive", "archive link entry has no target"));
       }
       const std::string target = str::trim(line.substr(arrow + 4));
       if (!safe_relative_entry(target)) {
-        return fail<std::vector<std::string>>(Error::make(
-            "cova::sysroot::unsafe_archive",
-            "archive link target escapes the extraction root: `" + target + "`"));
+        return fail<std::vector<std::string>>(
+            Error::make("cova::sysroot::unsafe_archive",
+                        "archive link target escapes the extraction root: `" + target + "`"));
       }
     }
   }
@@ -177,8 +176,12 @@ Result<std::vector<std::string>> list_zip(const fs::Path& archive) {
 Status extract_tar(const fs::Path& archive, const fs::Path& dest) {
   proc::ProcessSpec spec;
   spec.program = "tar";
-  spec.args = {"-xf", fs::generic_string(archive), "-C", fs::generic_string(dest),
-               "--no-same-owner", "--no-same-permissions"};
+  spec.args = {"-xf",
+               fs::generic_string(archive),
+               "-C",
+               fs::generic_string(dest),
+               "--no-same-owner",
+               "--no-same-permissions"};
   spec.timeout = std::chrono::milliseconds(120000);
   auto result = proc::run(spec);
   if (!result || !result->success()) {
@@ -219,6 +222,173 @@ std::optional<fs::Path> find_manifest_root(const fs::Path& extracted) {
   return std::nullopt;
 }
 
+// ---------------------------------------------------------------------------
+// Trusted local registry (PRD §8.6, §18.1)
+// ---------------------------------------------------------------------------
+//
+// A registry is a directory with an `index.toml` and content-addressed archive
+// files. Cova never installs an archive whose SHA-256 does not match the index;
+// an entry without a hash is a malformed registry, not a "trust me" shortcut.
+
+struct RegistrySysrootEntry {
+  std::string id;
+  std::string name;
+  std::string target;
+  std::string crt;
+  std::string libcpp;
+  std::string archive;
+  std::string sha256;
+  std::string license;
+  std::string source_url;
+  std::uint64_t size_bytes = 0;
+  std::vector<std::string> provides;
+};
+
+Result<std::vector<RegistrySysrootEntry>> load_registry_entries(const fs::Path& registry_root) {
+  std::vector<RegistrySysrootEntry> entries;
+  const auto index = registry_root / "index.toml";
+  if (!fs::is_regular_file(index)) {
+    return entries;
+  }
+  auto document = toml::parse_file(fs::generic_string(index));
+  if (!document || !document->is_table()) {
+    return fail<std::vector<RegistrySysrootEntry>>(
+        Error::make("cova::registry::invalid", "registry index is not a valid TOML table")
+            .with("path: " + fs::generic_string(index)));
+  }
+  const auto& table = *document->as_table();
+  auto array = table.find("sysroot");
+  if (array == table.end() || !array->second.is_array()) {
+    return entries;
+  }
+  for (const auto& value : *array->second.as_array()) {
+    const auto* item = value.as_table();
+    if (item == nullptr) {
+      continue;
+    }
+    RegistrySysrootEntry entry;
+    entry.id = string_or(*item, "id");
+    entry.name = string_or(*item, "name");
+    entry.target = string_or(*item, "target");
+    entry.crt = string_or(*item, "crt");
+    entry.libcpp = string_or(*item, "libcpp");
+    entry.archive = string_or(*item, "archive");
+    entry.sha256 = lower(string_or(*item, "sha256"));
+    entry.license = string_or(*item, "license");
+    entry.source_url = string_or(*item, "source");
+    entry.provides = array_or(*item, "provides");
+    if (auto size = get(*item, "size-bytes");
+        size != nullptr && size->is_integer() && size->as_integer() > 0) {
+      entry.size_bytes = static_cast<std::uint64_t>(size->as_integer());
+    }
+    if (entry.name.empty()) {
+      entry.name = entry.id;
+    }
+    if (entry.id.empty()) {
+      entry.id = entry.name;
+    }
+    if (entry.target.empty() || entry.archive.empty() || entry.sha256.empty()) {
+      return fail<std::vector<RegistrySysrootEntry>>(
+          Error::make("cova::registry::invalid", "registry sysroot entry `" + entry.name +
+                                                     "` must declare target, archive and sha256"));
+    }
+    entries.push_back(std::move(entry));
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const RegistrySysrootEntry& a, const RegistrySysrootEntry& b) {
+              if (a.target != b.target) {
+                return a.target < b.target;
+              }
+              return a.name < b.name;
+            });
+  return entries;
+}
+
+Result<fs::Path> registry_archive_path(const fs::Path& registry_root, std::string_view archive) {
+  std::string text = str::trim(archive);
+  if (str::starts_with(text, "http://") || str::starts_with(text, "https://") ||
+      str::starts_with(text, "ftp://")) {
+    return fail<fs::Path>(
+        Error::make("cova::registry::download_unsupported",
+                    "this build cannot download sysroot archives over the network")
+            .with("archive: " + text)
+            .with("mirror the archive into the local registry and reference it by relative path"));
+  }
+  if (str::starts_with(text, "file://")) {
+    text = text.substr(7);
+  }
+  fs::Path path(text);
+  if (!path.is_absolute()) {
+    const fs::Path root = fs::absolute_normalized(registry_root);
+    path = fs::absolute_normalized(root / path);
+    if (!fs::is_within(path, root)) {
+      return fail<fs::Path>(
+          Error::make("cova::registry::unsafe_path",
+                      "registry archive path escapes the registry root: `" + text + "`"));
+    }
+  } else {
+    path = fs::absolute_normalized(path);
+  }
+  if (!fs::is_regular_file(path) && !fs::is_directory(path)) {
+    return fail<fs::Path>(
+        Error::make("cova::registry::archive_missing",
+                    "registry archive does not exist: " + fs::generic_string(path)));
+  }
+  return path;
+}
+
+// Copies an archive into the download cache and verifies its content hash. The
+// cached file is named by hash, so the same content is never fetched twice.
+Result<fs::Path> stage_verified_archive_impl(const fs::Path& downloads_root,
+                                             const fs::Path& archive,
+                                             std::string_view expected_sha256,
+                                             std::uint64_t expected_size) {
+  if (!fs::is_regular_file(archive)) {
+    return fail<fs::Path>(
+        Error::make("cova::registry::archive_missing",
+                    "registry archive is not a file: " + fs::generic_string(archive)));
+  }
+  if (expected_size != 0 && fs::file_size(archive) != expected_size) {
+    return fail<fs::Path>(Error::make("cova::registry::verification_failed",
+                                      "archive size does not match the registry entry")
+                              .with("expected: " + std::to_string(expected_size) + " bytes")
+                              .with("found: " + std::to_string(fs::file_size(archive)) + " bytes"));
+  }
+  auto digest = Sha256::hex_of_file(archive);
+  if (!digest) {
+    return fail<fs::Path>(digest.error());
+  }
+  if (!str::iequals(*digest, expected_sha256)) {
+    return fail<fs::Path>(Error::make("cova::registry::verification_failed",
+                                      "archive checksum does not match the registry entry")
+                              .with("expected: " + std::string(expected_sha256))
+                              .with("found: " + *digest));
+  }
+  auto created = fs::create_directories(downloads_root);
+  if (!created) {
+    return fail<fs::Path>(created.error());
+  }
+  const auto cached = downloads_root / (str::to_lower(*digest) + "-" + archive.filename().string());
+  if (fs::is_regular_file(cached)) {
+    auto cached_digest = Sha256::hex_of_file(cached);
+    if (cached_digest && str::iequals(*cached_digest, expected_sha256)) {
+      return cached;
+    }
+  }
+  auto copied = fs::copy_file(archive, cached, true);
+  if (!copied) {
+    return fail<fs::Path>(copied.error());
+  }
+  auto copied_digest = Sha256::hex_of_file(cached);
+  if (!copied_digest || !str::iequals(*copied_digest, expected_sha256)) {
+    auto cleanup = fs::remove_file(cached);
+    (void)cleanup;
+    return fail<fs::Path>(Error::make("cova::registry::verification_failed",
+                                      "the staged archive failed verification after copying"));
+  }
+  return cached;
+}
+
 std::uint64_t tree_size(const fs::Path& root) {
   std::uint64_t total = 0;
   std::error_code ec;
@@ -242,8 +412,8 @@ Status validate_extracted_tree(const fs::Path& dest, const ExtractLimits& limits
        it != stdfs::recursive_directory_iterator(); it.increment(ec)) {
     ++entries;
     if (entries > limits.max_entries) {
-      return fail(Error::make("cova::sysroot::unsafe_archive",
-                              "archive contains too many entries"));
+      return fail(
+          Error::make("cova::sysroot::unsafe_archive", "archive contains too many entries"));
     }
     const auto status = it->symlink_status(ec);
     if (ec) {
@@ -256,8 +426,8 @@ Status validate_extracted_tree(const fs::Path& dest, const ExtractLimits& limits
                                 "archive contains a symlink that cannot be read"));
       }
       if (target.is_absolute()) {
-        return fail(Error::make("cova::sysroot::unsafe_archive",
-                                "archive contains an absolute symlink"));
+        return fail(
+            Error::make("cova::sysroot::unsafe_archive", "archive contains an absolute symlink"));
       }
       const auto resolved = fs::normalize(it->path().parent_path() / target);
       if (!fs::is_within(resolved, dest)) {
@@ -277,17 +447,14 @@ Status validate_extracted_tree(const fs::Path& dest, const ExtractLimits& limits
     } else if (stdfs::is_directory(status)) {
       // Directories are fine.
     } else {
-      return fail(Error::make("cova::sysroot::unsafe_archive",
-                              "archive contains a special file"));
+      return fail(Error::make("cova::sysroot::unsafe_archive", "archive contains a special file"));
     }
   }
   return ok();
 }
 
-Result<InstalledSysroot> install_tree(const fs::Path& source_root,
-                                      const SysrootManifest& manifest,
-                                      const fs::Path& sysroots_root,
-                                      const fs::Path& allowed_root) {
+Result<InstalledSysroot> install_tree(const fs::Path& source_root, const SysrootManifest& manifest,
+                                      const fs::Path& sysroots_root, const fs::Path& allowed_root) {
   if (!fs::is_directory(source_root)) {
     return fail<InstalledSysroot>(
         Error::make("cova::sysroot::invalid", "the sysroot tree does not exist"));
@@ -341,7 +508,14 @@ Result<InstalledSysroot> install_tree(const fs::Path& source_root,
 
 std::string crt_text(platform::Crt crt) { return std::string(platform::to_string(crt)); }
 
-}  // namespace
+} // namespace
+
+Result<stdfs::path> stage_verified_archive(const stdfs::path& downloads_root,
+                                           const stdfs::path& archive,
+                                           std::string_view expected_sha256,
+                                           std::uint64_t expected_size) {
+  return stage_verified_archive_impl(downloads_root, archive, expected_sha256, expected_size);
+}
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -391,8 +565,8 @@ std::string SysrootManifest::to_toml() const {
 Result<SysrootManifest> SysrootManifest::from_toml(std::string_view text) {
   auto document = toml::parse(text, "sysroot.toml");
   if (!document || !document->is_table()) {
-    return fail<SysrootManifest>(Error::make("cova::sysroot::manifest",
-                                             "sysroot.toml is not a valid TOML table"));
+    return fail<SysrootManifest>(
+        Error::make("cova::sysroot::manifest", "sysroot.toml is not a valid TOML table"));
   }
   const Table& table = *document->as_table();
   SysrootManifest manifest;
@@ -400,14 +574,14 @@ Result<SysrootManifest> SysrootManifest::from_toml(std::string_view text) {
   manifest.name = string_or(table, "name");
   const std::string target_text = string_or(table, "target");
   if (target_text.empty()) {
-    return fail<SysrootManifest>(Error::make("cova::sysroot::manifest",
-                                             "sysroot.toml is missing `target`"));
+    return fail<SysrootManifest>(
+        Error::make("cova::sysroot::manifest", "sysroot.toml is missing `target`"));
   }
   auto target = platform::Triple::parse(target_text);
   if (!target) {
-    return fail<SysrootManifest>(Error::make("cova::sysroot::manifest",
-                                             "sysroot.toml has an invalid target")
-                                     .with(target.error().message));
+    return fail<SysrootManifest>(
+        Error::make("cova::sysroot::manifest", "sysroot.toml has an invalid target")
+            .with(target.error().message));
   }
   manifest.target = *target;
   if (auto value = get(table, "min-os-version"); value != nullptr && value->is_string()) {
@@ -421,26 +595,44 @@ Result<SysrootManifest> SysrootManifest::from_toml(std::string_view text) {
     }
   }
   const std::string crt = lower(string_or(table, "crt"));
-  if (crt == "glibc") manifest.crt = platform::Crt::Glibc;
-  else if (crt == "musl") manifest.crt = platform::Crt::Musl;
-  else if (crt == "uclibc") manifest.crt = platform::Crt::Uclibc;
-  else if (crt == "msvc") manifest.crt = platform::Crt::Msvc;
-  else if (crt == "wasi") manifest.crt = platform::Crt::WasmWasi;
-  else if (crt == "none") manifest.crt = platform::Crt::None;
+  if (crt == "glibc")
+    manifest.crt = platform::Crt::Glibc;
+  else if (crt == "musl")
+    manifest.crt = platform::Crt::Musl;
+  else if (crt == "uclibc")
+    manifest.crt = platform::Crt::Uclibc;
+  else if (crt == "msvc")
+    manifest.crt = platform::Crt::Msvc;
+  else if (crt == "wasi")
+    manifest.crt = platform::Crt::WasmWasi;
+  else if (crt == "none")
+    manifest.crt = platform::Crt::None;
   const std::string libcpp = lower(string_or(table, "libcpp"));
-  if (libcpp == "libstdc++") manifest.libcpp = platform::LibCpp::LibStdCpp;
-  else if (libcpp == "libc++") manifest.libcpp = platform::LibCpp::LibCpp;
-  else if (libcpp == "msvc-stl") manifest.libcpp = platform::LibCpp::MsvcStl;
-  else if (libcpp == "none") manifest.libcpp = platform::LibCpp::NoStd;
+  if (libcpp == "libstdc++")
+    manifest.libcpp = platform::LibCpp::LibStdCpp;
+  else if (libcpp == "libc++")
+    manifest.libcpp = platform::LibCpp::LibCpp;
+  else if (libcpp == "msvc-stl")
+    manifest.libcpp = platform::LibCpp::MsvcStl;
+  else if (libcpp == "none")
+    manifest.libcpp = platform::LibCpp::NoStd;
   const std::string abi = lower(string_or(table, "abi"));
-  if (abi == "sysv") manifest.abi = platform::Abi::SysV;
-  else if (abi == "msvc") manifest.abi = platform::Abi::Msvc;
-  else if (abi == "musl") manifest.abi = platform::Abi::Musl;
-  else if (abi == "gnueabi") manifest.abi = platform::Abi::Gnueabi;
-  else if (abi == "gnueabihf") manifest.abi = platform::Abi::Gnueabihf;
-  else if (abi == "wasm") manifest.abi = platform::Abi::Wasm;
-  else if (abi == "eabi") manifest.abi = platform::Abi::Eabi;
-  else if (abi == "macho") manifest.abi = platform::Abi::MachO;
+  if (abi == "sysv")
+    manifest.abi = platform::Abi::SysV;
+  else if (abi == "msvc")
+    manifest.abi = platform::Abi::Msvc;
+  else if (abi == "musl")
+    manifest.abi = platform::Abi::Musl;
+  else if (abi == "gnueabi")
+    manifest.abi = platform::Abi::Gnueabi;
+  else if (abi == "gnueabihf")
+    manifest.abi = platform::Abi::Gnueabihf;
+  else if (abi == "wasm")
+    manifest.abi = platform::Abi::Wasm;
+  else if (abi == "eabi")
+    manifest.abi = platform::Abi::Eabi;
+  else if (abi == "macho")
+    manifest.abi = platform::Abi::MachO;
   manifest.compiler_family = string_or(table, "compiler-family");
   manifest.dynamic_linker = string_or(table, "dynamic-linker");
   manifest.include_dirs = array_or(table, "include-dirs");
@@ -463,8 +655,7 @@ Result<SysrootManifest> SysrootManifest::from_toml(std::string_view text) {
 // ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
-Status verify(const fs::Path& sysroot_root, const SysrootManifest& manifest,
-              VerifyReport& out) {
+Status verify(const fs::Path& sysroot_root, const SysrootManifest& manifest, VerifyReport& out) {
   out.ok = true;
   auto add = [&](std::string check, bool passed, std::string detail) {
     out.findings.push_back(VerifyFinding{std::move(check), passed, std::move(detail)});
@@ -487,8 +678,7 @@ Status verify(const fs::Path& sysroot_root, const SysrootManifest& manifest,
   }
   for (const auto& object : manifest.crt_objects) {
     const auto path = sysroot_root / object;
-    add("crt object", fs::is_regular_file(path) || fs::is_symlink(path),
-        fs::generic_string(path));
+    add("crt object", fs::is_regular_file(path) || fs::is_symlink(path), fs::generic_string(path));
   }
   if (!manifest.dynamic_linker.empty()) {
     fs::Path linker = manifest.dynamic_linker;
@@ -572,12 +762,12 @@ Result<InstalledSysroot> SysrootManager::find(std::string_view id) const {
       return entry;
     }
   }
-  return fail<InstalledSysroot>(Error::make("cova::sysroot::not_found",
-                                            "no installed sysroot named `" + std::string(id) + "`"));
+  return fail<InstalledSysroot>(Error::make(
+      "cova::sysroot::not_found", "no installed sysroot named `" + std::string(id) + "`"));
 }
 
-Result<std::vector<InstalledSysroot>> SysrootManager::find_for_target(
-    const platform::Triple& target) const {
+Result<std::vector<InstalledSysroot>>
+SysrootManager::find_for_target(const platform::Triple& target) const {
   std::vector<InstalledSysroot> out;
   auto all = list();
   if (!all) {
@@ -603,8 +793,7 @@ std::vector<std::pair<InstalledSysroot, VerifyReport>> SysrootManager::verify_al
     auto status = verify(entry.root, entry.manifest, report);
     if (!status) {
       report.ok = false;
-      report.findings.push_back(
-          VerifyFinding{"verification", false, status.error().message});
+      report.findings.push_back(VerifyFinding{"verification", false, status.error().message});
     }
     out.emplace_back(std::move(entry), std::move(report));
   }
@@ -613,25 +802,99 @@ std::vector<std::pair<InstalledSysroot, VerifyReport>> SysrootManager::verify_al
 
 Result<InstalledSysroot> SysrootManager::install(const platform::Triple& target,
                                                  const std::string& sysroot_name) {
-  // The only cache this build can verify is a local registry directory that
-  // contains an archive plus a manifest.
-  const fs::Path registry_candidate = options_.registry_root / "sysroots" / sysroot_name;
-  if (fs::is_directory(registry_candidate)) {
+  auto entries = load_registry_entries(options_.registry_root);
+  if (!entries) {
+    return fail<InstalledSysroot>(entries.error());
+  }
+
+  std::vector<RegistrySysrootEntry> matching;
+  for (const auto& entry : *entries) {
+    const bool name_matches =
+        sysroot_name.empty() || entry.name == sysroot_name || entry.id == sysroot_name;
+    if (!name_matches) {
+      continue;
+    }
+    auto parsed = platform::Triple::parse(entry.target);
+    if (!parsed || parsed->arch != target.arch || parsed->os != target.os) {
+      continue;
+    }
+    if (parsed->env != target.env && parsed->env != platform::Env::Unknown) {
+      continue;
+    }
+    if (!entry.crt.empty()) {
+      const std::string wanted = lower(entry.crt);
+      if (wanted != "unknown" && wanted != lower(std::string(platform::to_string(target.crt())))) {
+        continue;
+      }
+    }
+    matching.push_back(entry);
+  }
+
+  if (!matching.empty()) {
+    const RegistrySysrootEntry& entry = matching.front();
+    if (options_.offline) {
+      return fail<InstalledSysroot>(
+          Error::make("cova::registry::offline",
+                      "offline mode forbids downloading the sysroot `" + entry.name + "`")
+              .with("target: " + target.to_string())
+              .with("the component is not installed locally"));
+    }
+    if (!options_.allow_install) {
+      return fail<InstalledSysroot>(
+          Error::make("cova::registry::install_disabled",
+                      "installation is disabled, so the sysroot `" + entry.name +
+                          "` cannot be installed")
+              .with("target: " + target.to_string())
+              .with("remove --no-install / offline restrictions to allow it"));
+    }
+    auto archive = registry_archive_path(options_.registry_root, entry.archive);
+    if (!archive) {
+      return fail<InstalledSysroot>(archive.error());
+    }
+    auto staged = stage_verified_archive_impl(options_.downloads_root, *archive, entry.sha256,
+                                              entry.size_bytes);
+    if (!staged) {
+      return fail<InstalledSysroot>(staged.error());
+    }
+    auto installed = install_file(target, entry.name, *staged);
+    if (!installed) {
+      return installed;
+    }
+    // The registry's metadata is authoritative for the identity Cova records.
+    if (installed->manifest.crt == platform::Crt::Unknown) {
+      installed->manifest.crt = target.crt();
+    }
+    if (installed->manifest.libcpp == platform::LibCpp::Unknown) {
+      installed->manifest.libcpp = target.default_libcpp();
+    }
+    return installed;
+  }
+
+  // A manually populated `registry/sysroots/<name>` cache is still supported:
+  // the archive is hashed and verified by `install_file`, just without an
+  // index entry to compare against.
+  const fs::Path registry_candidate =
+      sysroot_name.empty() ? fs::Path{} : options_.registry_root / "sysroots" / sysroot_name;
+  if (!registry_candidate.empty() && fs::is_directory(registry_candidate)) {
     for (const auto& file : fs::walk_files(registry_candidate)) {
       const std::string extension = lower(file.extension().string());
-      if (extension == ".tar" || extension == ".gz" || extension == ".tgz" ||
-          extension == ".zip") {
+      if (extension == ".tar" || extension == ".gz" || extension == ".tgz" || extension == ".zip") {
         return install_file(target, sysroot_name, file);
       }
     }
   }
   return fail<InstalledSysroot>(
       Error::make("cova::sysroot::registry_unavailable",
-                  "no trusted registry is configured for sysroot installation")
-          .with("requested: " + target.to_string() + " / " + sysroot_name)
-          .with("Cova will not simulate a download or claim an install it did not verify "
+                  "no trusted registry entry is available for this sysroot")
+          .with("requested: " + target.to_string() +
+                (sysroot_name.empty() ? "" : " / " + sysroot_name))
+          .with("registry: " + fs::generic_string(options_.registry_root))
+          .with("Cova will not simulate a download or claim an install it did "
+                "not verify "
                 "(PRD §18.1)")
-          .with("install from a local archive with `cova sysroot install --from <archive>`"));
+          .with("add an `[[sysroot]]` entry to the registry index, or install "
+                "from a local "
+                "archive with `cova sysroot install --from <archive>`"));
 }
 
 Result<InstalledSysroot> SysrootManager::install_file(const platform::Triple& target,
@@ -656,18 +919,19 @@ Result<InstalledSysroot> SysrootManager::install_file(const platform::Triple& ta
     if (archive_path.empty()) {
       return fail<InstalledSysroot>(
           Error::make("cova::sysroot::registry_unavailable",
-                      "no local archive or registry cache entry is available for this sysroot")
+                      "no local archive or registry cache entry is available "
+                      "for this sysroot")
               .with("requested: " + target.to_string() + " / " + name));
     }
   }
   if (!fs::is_regular_file(archive_path) && !fs::is_directory(archive_path)) {
-    return fail<InstalledSysroot>(Error::make("cova::sysroot::archive_missing",
-                                              "archive " + fs::generic_string(archive_path) +
-                                                  " does not exist"));
+    return fail<InstalledSysroot>(
+        Error::make("cova::sysroot::archive_missing",
+                    "archive " + fs::generic_string(archive_path) + " does not exist"));
   }
 
-  const auto parent = options_.downloads_root.empty() ? options_.sysroots_root
-                                                      : options_.downloads_root;
+  const auto parent =
+      options_.downloads_root.empty() ? options_.sysroots_root : options_.downloads_root;
   auto created = fs::create_directories(parent);
   if (!created) {
     return fail<InstalledSysroot>(created.error());
@@ -752,13 +1016,22 @@ Result<InstalledSysroot> SysrootManager::install_file(const platform::Triple& ta
     }
   }
 
-  if (manifest.target.arch != target.arch || manifest.target.os != target.os) {
+  const bool environment_mismatch =
+      manifest.target.env != platform::Env::Unknown && target.env != platform::Env::Unknown &&
+      manifest.target.env != target.env;
+  const bool runtime_mismatch =
+      manifest.crt != platform::Crt::Unknown && manifest.crt != target.crt();
+  if (manifest.target.arch != target.arch || manifest.target.os != target.os ||
+      environment_mismatch || runtime_mismatch) {
     auto cleanup = fs::remove_tree(*scratch, parent);
     (void)cleanup;
-    return fail<InstalledSysroot>(Error::make(
-        "cova::sysroot::incompatible",
-        "the archive targets " + manifest.target.to_string() + " but " + target.to_string() +
-            " was requested"));
+    return fail<InstalledSysroot>(Error::make("cova::sysroot::incompatible",
+                                              "the archive targets " + manifest.target.to_string() +
+                                                  " but " + target.to_string() + " was requested")
+                                      .with("archive crt: " +
+                                            std::string(platform::to_string(manifest.crt)))
+                                      .with("requested crt: " +
+                                            std::string(platform::to_string(target.crt()))));
   }
   if (!manifest.id.empty()) {
     // preserve the manifest identity
@@ -774,7 +1047,8 @@ Result<InstalledSysroot> SysrootManager::install_file(const platform::Triple& ta
     manifest.size_bytes = fs::file_size(archive_path);
   }
 
-  auto installed = install_tree(extracted, manifest, options_.sysroots_root, options_.sysroots_root);
+  auto installed =
+      install_tree(extracted, manifest, options_.sysroots_root, options_.sysroots_root);
   if (fs::generic_string(*scratch) != fs::generic_string(archive_path)) {
     auto cleanup = fs::remove_tree(*scratch, parent);
     (void)cleanup;
@@ -906,4 +1180,4 @@ Status install_from_archive(const fs::Path& archive, const fs::Path& sysroots_ro
   return ok();
 }
 
-}  // namespace cova::sysroot
+} // namespace cova::sysroot

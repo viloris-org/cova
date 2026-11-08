@@ -207,8 +207,10 @@ Result<Version> Version::extract(std::string_view text) {
   // banners are full of noise ("Apple clang version 15.0.0 (clang-1500.3.9.4)"),
   // so tokens are delimited by anything that cannot appear in a version.
   std::size_t i = 0;
+  auto ident_char = [](char c) { return is_digit(c) || is_alpha(c) || c == '_'; };
   while (i < text.size()) {
-    const bool boundary = i == 0 || !(is_digit(text[i - 1]) || text[i - 1] == '.');
+    // `x86_64` contains 86, but it is part of an identifier, not a version.
+    const bool boundary = i == 0 || !(ident_char(text[i - 1]) || text[i - 1] == '.');
     if (!boundary || !is_digit(text[i])) {
       ++i;
       continue;
@@ -241,7 +243,7 @@ Result<Version> Version::extract(std::string_view text) {
       }
     }
     // The token must end here (or with a pre-release tag) to be a version.
-    const bool token_end = pos >= text.size() || !(is_digit(text[pos]) || text[pos] == '.');
+    const bool token_end = pos >= text.size() || !(ident_char(text[pos]) || text[pos] == '.');
     if (count >= 1 && token_end) {
       std::string_view candidate = text.substr(i, pos - i);
       auto parsed = Version::parse(candidate);

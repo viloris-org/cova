@@ -21,6 +21,11 @@ struct ProbeOptions {
   std::filesystem::path work_dir;
   // Target the compiler will be invoked for.
   platform::Triple target;
+  // Sysroot to pass to the compiler while probing. Empty means "use the
+  // compiler's own configured sysroot". Cross probing must pass this, otherwise
+  // a compiler that can emit target code may still be judged against host
+  // headers and libraries.
+  std::filesystem::path sysroot;
   // Capabilities the caller needs; probing may stop early once all are known.
   std::vector<std::string> required;  // "cpp", "c", "archive", "link", "stdlib", "c++26"
   int timeout_ms = 20000;
@@ -52,11 +57,15 @@ Status probe_stdlib_headers(const ToolchainDescriptor& descriptor,
 Status probe_cpp26_baseline(const ToolchainDescriptor& descriptor,
                             const ProbeOptions& options);
 
-// Reads a cached probe report for this descriptor fingerprint.
+// Reads a cached probe report for this descriptor fingerprint. `variant` must
+// include the probe target and sysroot, because the same compiler produces
+// different answers for host and cross targets.
 Result<ProbeReport> load_cached_probe(const std::filesystem::path& cache_dir,
-                                      const ToolchainDescriptor& descriptor);
+                                      const ToolchainDescriptor& descriptor,
+                                      std::string_view variant = {});
 Status store_cached_probe(const std::filesystem::path& cache_dir,
-                          const ToolchainDescriptor& descriptor, const ProbeReport& report);
+                          const ToolchainDescriptor& descriptor, const ProbeReport& report,
+                          std::string_view variant = {});
 
 // Human-readable rows for `cova toolchain explain` / `cova doctor`.
 std::string format_capability_table(const ToolchainCapabilities& capabilities);

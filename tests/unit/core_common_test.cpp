@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "core/common.hpp"
+#include "core/version/version.hpp"
 #include "testing/test.hpp"
 
 COVA_TEST_NAMED(common, error_to_string_includes_code_and_context) {
@@ -103,8 +104,7 @@ COVA_TEST_NAMED(common, split_whitespace_quoted) {
 
 COVA_TEST_NAMED(common, join) {
   const std::vector<std::string> parts{"a", "b", "c"};
-  COVA_CHECK_EQ(cova::str::join(std::span<const std::string>(parts), ", "),
-                std::string("a, b, c"));
+  COVA_CHECK_EQ(cova::str::join(std::span<const std::string>(parts), ", "), std::string("a, b, c"));
   const std::vector<std::string> single{"a"};
   COVA_CHECK_EQ(cova::str::join(std::span<const std::string>(single), ", "), std::string("a"));
   const std::vector<std::string> none;
@@ -169,6 +169,14 @@ COVA_TEST_NAMED(common, human_bytes) {
   COVA_CHECK_EQ(cova::human_bytes(1024), std::string("1.0 KiB"));
   COVA_CHECK_EQ(cova::human_bytes(15ull * 1024 * 1024), std::string("15.0 MiB"));
   COVA_CHECK_EQ(cova::human_bytes(2ull * 1024 * 1024 * 1024), std::string("2.0 GiB"));
+}
+
+COVA_TEST_NAMED(common, version_extract_ignores_triple_components) {
+  auto version =
+      COVA_REQUIRE_OK(cova::Version::extract("x86_64-pc-linux-gnu-g++ (GCC) 16.2.1 20260810"));
+  COVA_CHECK_EQ(version.to_string(), std::string("16.2.1"));
+  auto clang = COVA_REQUIRE_OK(cova::Version::extract("clang version 23.1.4 (https://llvm.org)"));
+  COVA_CHECK_EQ(clang.to_string(), std::string("23.1.4"));
 }
 
 COVA_TEST_MAIN()

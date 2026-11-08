@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,25 +23,37 @@ struct FoundSysroot {
   platform::Crt crt = platform::Crt::Unknown;
   platform::LibCpp libcpp = platform::LibCpp::Unknown;
   stdfs::path path;
+  bool managed = false;
+  std::string content_hash;
 };
 
 std::optional<platform::Crt> crt_from_text(std::string_view text) {
   const std::string value = str::to_lower(str::trim_view(text));
-  if (value == "glibc") return platform::Crt::Glibc;
-  if (value == "musl") return platform::Crt::Musl;
-  if (value == "uclibc") return platform::Crt::Uclibc;
-  if (value == "msvc") return platform::Crt::Msvc;
-  if (value == "wasi") return platform::Crt::WasmWasi;
-  if (value == "none") return platform::Crt::None;
+  if (value == "glibc")
+    return platform::Crt::Glibc;
+  if (value == "musl")
+    return platform::Crt::Musl;
+  if (value == "uclibc")
+    return platform::Crt::Uclibc;
+  if (value == "msvc")
+    return platform::Crt::Msvc;
+  if (value == "wasi")
+    return platform::Crt::WasmWasi;
+  if (value == "none")
+    return platform::Crt::None;
   return std::nullopt;
 }
 
 std::optional<platform::LibCpp> libcpp_from_text(std::string_view text) {
   const std::string value = str::to_lower(str::trim_view(text));
-  if (value == "libstdc++" || value == "libstdcxx") return platform::LibCpp::LibStdCpp;
-  if (value == "libc++" || value == "libcxx") return platform::LibCpp::LibCpp;
-  if (value == "msvc" || value == "msvc-stl") return platform::LibCpp::MsvcStl;
-  if (value == "none") return platform::LibCpp::NoStd;
+  if (value == "libstdc++" || value == "libstdcxx")
+    return platform::LibCpp::LibStdCpp;
+  if (value == "libc++" || value == "libcxx")
+    return platform::LibCpp::LibCpp;
+  if (value == "msvc" || value == "msvc-stl")
+    return platform::LibCpp::MsvcStl;
+  if (value == "none")
+    return platform::LibCpp::NoStd;
   return std::nullopt;
 }
 
@@ -80,10 +93,87 @@ std::vector<FoundSysroot> scan_sysroots(const stdfs::path& root) {
     }
     found.crt = crt_from_text(read("crt")).value_or(platform::Crt::Unknown);
     found.libcpp = libcpp_from_text(read("libcpp")).value_or(platform::LibCpp::Unknown);
+    found.content_hash = read("sha256");
+    if (found.content_hash.empty()) {
+      found.content_hash = Sha256::hex_of_file(manifest_path).value_or("");
+    }
     found.path = it->path() / "root";
     if (!fs::is_directory(found.path)) {
       found.path = it->path();
     }
+    found.managed = true;
+    out.push_back(std::move(found));
+  }
+  std::sort(out.begin(), out.end(),
+            [](const FoundSysroot& a, const FoundSysroot& b) { return a.id < b.id; });
+  return out;
+}
+
+// A root usable as `--sysroot`: the compiler expects `<root>/usr/include` and
+// `<root>/usr/lib`. A Debian multiarch prefix (`/usr/<triple>/include`) is not
+// a sysroot in this sense; a prefixed cross GCC already knows how to use it.
+bool looks_like_sysroot(const stdfs::path& root) {
+  if (!fs::is_directory(root)) {
+    return false;
+  }
+  const bool headers = fs::is_directory(root / "usr" / "include");
+  const bool libraries =
+      fs::is_directory(root / "usr" / "lib") || fs::is_directory(root / "usr" / "lib64");
+  return headers && libraries;
+}
+
+// Discovers sysroots that already exist on the host (PRD §7.4 mixed sources).
+// Cova never writes to these roots; it only uses them and records their path.
+std::vector<FoundSysroot> scan_system_sysroots(const platform::Triple& target) {
+  std::vector<FoundSysroot> out;
+  std::vector<stdfs::path> candidates;
+  if (auto explicit_root = fs::get_env("COVA_SYSROOT"); explicit_root && !explicit_root->empty()) {
+    candidates.emplace_back(*explicit_root);
+  }
+  const std::string triple = target.to_string();
+  for (const auto& pattern : {
+           "/opt/" + triple + "/sysroot",
+           "/opt/cross/" + triple + "/sysroot",
+           "/usr/local/" + triple + "/sysroot",
+           "/usr/" + triple + "/sysroot",
+       }) {
+    candidates.emplace_back(pattern);
+  }
+
+  std::set<std::string> seen;
+  for (const auto& candidate : candidates) {
+    if (!looks_like_sysroot(candidate)) {
+      continue;
+    }
+    const std::string canonical = fs::generic_string(fs::canonical_for_compare(candidate));
+    if (!seen.insert(canonical).second) {
+      continue;
+    }
+    FoundSysroot found;
+    found.target = target.to_string();
+    found.crt = target.crt();
+    found.libcpp = target.default_libcpp();
+    found.path = fs::absolute_normalized(candidate);
+    found.name = "system-" + target.to_short_string();
+    found.id = found.name + "-" + to_hex(Sha256::of(canonical)).substr(0, 8);
+    found.managed = false;
+    // A system sysroot has no Cova manifest to hash. Fingerprint its location,
+    // the include/lib directory mtimes and the two headers a libc change is
+    // most likely to touch. Anything stronger would require walking the tree on
+    // every resolution; the path stays in the lockfile either way.
+    Fingerprint fingerprint;
+    fingerprint.add(canonical);
+    for (const auto& directory : {"usr/include", "usr/lib", "usr/lib64"}) {
+      const auto mtime = fs::mtime_ns(found.path / directory);
+      fingerprint.add(mtime ? static_cast<std::int64_t>(*mtime) : -1);
+    }
+    for (const auto& header : {"usr/include/stdio.h", "usr/include/stdlib.h"}) {
+      const auto file = found.path / header;
+      if (fs::is_regular_file(file)) {
+        fingerprint.add(Sha256::hex_of_file(file).value_or(""));
+      }
+    }
+    found.content_hash = fingerprint.finish_hex();
     out.push_back(std::move(found));
   }
   std::sort(out.begin(), out.end(),
@@ -93,13 +183,13 @@ std::vector<FoundSysroot> scan_sysroots(const stdfs::path& root) {
 
 bool source_allowed(ToolchainSource source, Policy policy) {
   switch (policy) {
-    case Policy::SystemOnly:
-      return source == ToolchainSource::System || source == ToolchainSource::UserPath;
-    case Policy::ManagedOnly:
-      return source == ToolchainSource::Managed || source == ToolchainSource::Registry;
-    case Policy::SystemFirst:
-    case Policy::ManagedFirst:
-      return true;
+  case Policy::SystemOnly:
+    return source == ToolchainSource::System || source == ToolchainSource::UserPath;
+  case Policy::ManagedOnly:
+    return source == ToolchainSource::Managed || source == ToolchainSource::Registry;
+  case Policy::SystemFirst:
+  case Policy::ManagedFirst:
+    return true;
   }
   return true;
 }
@@ -107,29 +197,29 @@ bool source_allowed(ToolchainSource source, Policy policy) {
 int source_rank(ToolchainSource source, Policy policy) {
   if (policy == Policy::ManagedFirst) {
     switch (source) {
-      case ToolchainSource::Managed:
-        return 0;
-      case ToolchainSource::Registry:
-        return 1;
-      case ToolchainSource::UserPath:
-        return 2;
-      case ToolchainSource::System:
-        return 3;
-      case ToolchainSource::Unknown:
-        return 4;
-    }
-  }
-  switch (source) {
-    case ToolchainSource::System:
-      return 0;
-    case ToolchainSource::UserPath:
-      return 1;
     case ToolchainSource::Managed:
-      return 2;
+      return 0;
     case ToolchainSource::Registry:
+      return 1;
+    case ToolchainSource::UserPath:
+      return 2;
+    case ToolchainSource::System:
       return 3;
     case ToolchainSource::Unknown:
       return 4;
+    }
+  }
+  switch (source) {
+  case ToolchainSource::System:
+    return 0;
+  case ToolchainSource::UserPath:
+    return 1;
+  case ToolchainSource::Managed:
+    return 2;
+  case ToolchainSource::Registry:
+    return 3;
+  case ToolchainSource::Unknown:
+    return 4;
   }
   return 4;
 }
@@ -162,9 +252,11 @@ platform::AbiSignature make_abi_signature(const ToolchainDescriptor& descriptor,
                                           const platform::Triple& target) {
   platform::AbiSignature signature;
   signature.triple = target;
-  signature.abi = target.abi();
-  signature.crt = target.crt();
-  signature.libcpp = platform::default_libcpp_for(descriptor.family, target);
+  signature.abi = descriptor.abi != platform::Abi::Unknown ? descriptor.abi : target.abi();
+  signature.crt = descriptor.crt != platform::Crt::Unknown ? descriptor.crt : target.crt();
+  signature.libcpp = descriptor.libcpp != platform::LibCpp::Unknown
+                         ? descriptor.libcpp
+                         : platform::default_libcpp_for(descriptor.family, target);
   signature.link_mode = platform::LinkMode::Default;
   signature.exceptions = true;
   signature.rtti = true;
@@ -180,19 +272,39 @@ platform::AbiSignature make_abi_signature(const ToolchainDescriptor& descriptor,
   return signature;
 }
 
-bool is_cross_build(const platform::Triple& target) {
-  return !target.is_native_like();
+bool is_cross_build(const platform::Triple& target) { return !target.is_native_like(); }
+
+bool descriptor_supports_target(const ToolchainDescriptor& descriptor,
+                                const platform::Triple& target) {
+  if (target == platform::host_triple()) {
+    return true;
+  }
+  for (const auto& text : descriptor.supported_targets) {
+    if (text == target.to_string() || text == target.to_short_string()) {
+      return true;
+    }
+    auto parsed = platform::Triple::parse(text);
+    if (parsed && *parsed == target) {
+      return true;
+    }
+  }
+  // Clang can emit code for any target triple its build includes; the probe is
+  // what actually decides. GCC only supports the target it was configured for.
+  return descriptor.family == "clang" || descriptor.family == "clang-cl";
 }
 
-bool needs_sysroot(const platform::Triple& target) {
+bool needs_sysroot(const ToolchainDescriptor& descriptor, const platform::Triple& target) {
   if (!is_cross_build(target)) {
+    return false;
+  }
+  if (descriptor.self_contained) {
     return false;
   }
   return target.os == platform::Os::Linux || target.os == platform::Os::Android ||
          target.os == platform::Os::Wasi || target.os == platform::Os::Bare;
 }
 
-}  // namespace
+} // namespace
 
 std::vector<RankedCandidate> rank_candidates(const std::vector<ToolchainDescriptor>& candidates,
                                              const ResolutionRequest& request) {
@@ -236,16 +348,13 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     options.include_system = request.policy != Policy::ManagedOnly;
     options.include_managed = request.policy != Policy::SystemOnly;
     options.include_user_path = true;
+    options.managed_root = request.toolchains_root;
     if (request.compiler_family) {
       options.families.push_back(*request.compiler_family);
     }
     auto discovered = discover(options);
     if (discovered) {
       candidates = std::move(*discovered);
-    }
-    auto managed = discover_managed(request.toolchains_root);
-    if (managed) {
-      candidates.insert(candidates.end(), managed->begin(), managed->end());
     }
     report.decisions.push_back("discovered " + std::to_string(candidates.size()) +
                                " toolchain candidate(s)");
@@ -260,6 +369,16 @@ ResolutionReport resolve(const ResolutionRequest& request) {
 
   auto ranked = rank_candidates(candidates, request);
   auto sysroots = scan_sysroots(request.sysroots_root);
+  auto system_sysroots = scan_system_sysroots(request.target);
+  sysroots.insert(sysroots.end(), system_sysroots.begin(), system_sysroots.end());
+  // Source preference applies only after compatibility filtering; for sysroots
+  // the same rule means system first (managed first under the opposite policy).
+  std::sort(sysroots.begin(), sysroots.end(), [&](const FoundSysroot& a, const FoundSysroot& b) {
+    if (a.managed != b.managed) {
+      return request.policy == Policy::ManagedFirst ? a.managed : !a.managed;
+    }
+    return a.id < b.id;
+  });
 
   if (ranked.empty()) {
     report.failure = make_error("cova::toolchain::unresolved", "unable to resolve a toolchain");
@@ -277,9 +396,8 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     attempt.label = candidate.descriptor.label();
     const auto& descriptor = candidate.descriptor;
 
-    if (request.pinned_id && !request.pinned_id->empty() &&
-        *request.pinned_id != descriptor.id && *request.pinned_id != descriptor.label() &&
-        !fs::is_regular_file(*request.pinned_id)) {
+    if (request.pinned_id && !request.pinned_id->empty() && *request.pinned_id != descriptor.id &&
+        *request.pinned_id != descriptor.label() && !fs::is_regular_file(*request.pinned_id)) {
       attempt.reason = platform::RejectionReason::VersionMismatch;
       attempt.missing.push_back("toolchain `" + *request.pinned_id + "` is not installed");
       attempts.push_back(attempt);
@@ -297,8 +415,7 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     }
     if (!version_matches(descriptor, request)) {
       attempt.reason = platform::RejectionReason::VersionMismatch;
-      attempt.missing.push_back("compiler version " +
-                                request.compiler_version.value_or(""));
+      attempt.missing.push_back("compiler version " + request.compiler_version.value_or(""));
       attempts.push_back(attempt);
       report.decisions.push_back(attempt.label + ": rejected (version requirement)");
       continue;
@@ -314,12 +431,21 @@ ResolutionReport resolve(const ResolutionRequest& request) {
       report.decisions.push_back(attempt.label + ": rejected (not cross-capable)");
       continue;
     }
+    if (!descriptor_supports_target(descriptor, request.target)) {
+      attempt.reason = platform::RejectionReason::TargetUnsupported;
+      attempt.missing.push_back("support for " + request.target.to_string() +
+                                " (this driver targets " +
+                                str::join(descriptor.supported_targets, ", ") + ")");
+      attempts.push_back(attempt);
+      report.decisions.push_back(attempt.label + ": rejected (target unsupported)");
+      continue;
+    }
     attempt.matched_target = true;
 
     // Locate a sysroot before probing so the probe uses the real target headers
     // and libraries rather than the host's.
     std::optional<FoundSysroot> sysroot;
-    if (needs_sysroot(request.target)) {
+    if (needs_sysroot(descriptor, request.target)) {
       for (const auto& entry : sysroots) {
         auto parsed = platform::Triple::parse(entry.target);
         if (!parsed || parsed->arch != request.target.arch || parsed->os != request.target.os) {
@@ -335,16 +461,18 @@ ResolutionReport resolve(const ResolutionRequest& request) {
         break;
       }
       if (!sysroot) {
-        attempt.reason = request.offline
-                             ? platform::RejectionReason::OfflineRestriction
-                             : (request.allow_install
-                                    ? platform::RejectionReason::DownloadUnavailable
-                                    : platform::RejectionReason::SysrootMissing);
+        attempt.reason = request.offline ? platform::RejectionReason::OfflineRestriction
+                                         : (request.allow_install
+                                                ? platform::RejectionReason::DownloadUnavailable
+                                                : platform::RejectionReason::SysrootMissing);
         attempt.missing.push_back("a compatible " + request.target.to_string() + " sysroot");
         attempts.push_back(attempt);
         report.decisions.push_back(attempt.label + ": rejected (no compatible sysroot)");
         continue;
       }
+      attempt.sysroot_ok = true;
+    } else {
+      attempt.sysroot_ok = true;
     }
 
     ToolchainDescriptor probed = descriptor;
@@ -354,11 +482,15 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     }
 
     platform::CandidateEnvironment environment = probed.to_candidate(request.target);
+    const std::string probe_variant =
+        request.target.to_string() + "|" +
+        fs::generic_string(sysroot ? sysroot->path : probed.default_sysroot) + "|" +
+        (sysroot ? sysroot->content_hash : std::string());
     if (request.probe_capabilities) {
       ProbeReport probe_report;
       bool have_probe = false;
       if (!request.cache_root.empty()) {
-        auto cached = load_cached_probe(request.cache_root, probed);
+        auto cached = load_cached_probe(request.cache_root, probed, probe_variant);
         if (cached) {
           probe_report = std::move(*cached);
           have_probe = true;
@@ -368,10 +500,11 @@ ResolutionReport resolve(const ResolutionRequest& request) {
       if (!have_probe) {
         ProbeOptions probe_options;
         probe_options.target = request.target;
+        probe_options.sysroot = sysroot ? sysroot->path : probed.default_sysroot;
         probe_options.required = {"cpp", "link"};
         probe_report = probe(probed, probe_options).value_or(ProbeReport{});
         if (!request.cache_root.empty()) {
-          auto stored = store_cached_probe(request.cache_root, probed, probe_report);
+          auto stored = store_cached_probe(request.cache_root, probed, probe_report, probe_variant);
           (void)stored;
         }
         report.decisions.push_back(attempt.label + ": probed capabilities");
@@ -392,8 +525,11 @@ ResolutionReport resolve(const ResolutionRequest& request) {
       environment = probed.to_candidate(request.target);
     }
     attempt.probe_passed = true;
-    environment.sysroot_present = sysroot.has_value() || !probed.default_sysroot.empty();
-    environment.sysroot_id = sysroot ? sysroot->id : "";
+    const bool has_default_sysroot = !probed.default_sysroot.empty();
+    environment.sysroot_present =
+        sysroot.has_value() || has_default_sysroot || descriptor.self_contained;
+    environment.sysroot_id =
+        sysroot ? sysroot->id : (has_default_sysroot ? "compiler-default" : "");
 
     auto verdict = platform::evaluate(environment, request.constraints);
     if (!verdict.satisfied) {
@@ -416,6 +552,12 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     if (sysroot) {
       resolved.sysroot_id = sysroot->id;
       resolved.sysroot_path = sysroot->path;
+      resolved.sysroot_fingerprint = sysroot->content_hash;
+    } else if (!probed.default_sysroot.empty()) {
+      resolved.sysroot_id = "compiler-default";
+      resolved.sysroot_path = probed.default_sysroot;
+      resolved.sysroot_fingerprint =
+          to_hex(Sha256::of(fs::generic_string(probed.default_sysroot)));
     }
     resolved.environment = environment;
     resolved.decisions = report.decisions;
@@ -425,16 +567,16 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     report.resolved = true;
     report.rejected.clear();
     for (const auto& rejected : attempts) {
-      report.rejected.push_back(RejectedCandidate{
-          rejected.label, rejected.reason, str::join(rejected.missing, ", ")});
+      report.rejected.push_back(
+          RejectedCandidate{rejected.label, rejected.reason, str::join(rejected.missing, ", ")});
     }
     return report;
   }
 
   // Nothing survived.
   for (const auto& rejected : attempts) {
-    report.rejected.push_back(RejectedCandidate{
-        rejected.label, rejected.reason, str::join(rejected.missing, ", ")});
+    report.rejected.push_back(
+        RejectedCandidate{rejected.label, rejected.reason, str::join(rejected.missing, ", ")});
   }
   report.failure = build_failure_diagnostic(request, attempts);
   for (const auto& decision : report.decisions) {
@@ -488,7 +630,9 @@ Diagnostic build_failure_diagnostic(const ResolutionRequest& request,
   if (!request.allow_install) {
     diagnostic.line("installation is disabled: only local components may be used");
   }
-  diagnostic.line("suggested action: install a C++ compiler (clang or gcc), or provide a compatible sysroot with `cova sysroot install`");
+  diagnostic.line("suggested action: install a cross compiler with `cova "
+                  "toolchain install`, or provide "
+                  "a compatible sysroot with `cova sysroot install`");
   return diagnostic;
 }
 
@@ -508,4 +652,4 @@ std::string toolchain_lock_entry(const ResolvedToolchain& resolved) {
   return toml::write(table);
 }
 
-}  // namespace cova::toolchain
+} // namespace cova::toolchain

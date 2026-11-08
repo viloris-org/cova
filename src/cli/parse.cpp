@@ -741,7 +741,8 @@ std::string help_text(std::string_view topic) {
                        "Manage toolchains (§7).\n\n"
                        "  cova toolchain list [--json]        List discovered toolchains\n"
                        "  cova toolchain explain --target T  Explain the selection chain\n"
-                       "  cova toolchain install <id>         Install a managed component\n"
+                       "  cova toolchain install <id>         Install from the trusted registry\n"
+                       "                                    (--registry <dir>)\n"
                        "  cova toolchain remove <id>          Remove a managed component\n"
                        "  cova toolchain gc [--dry-run]       Reclaim unused components\n");
   }
@@ -750,6 +751,7 @@ std::string help_text(std::string_view topic) {
                        "Manage sysroots (§8).\n\n"
                        "  cova sysroot list [--json]              List installed sysroots\n"
                        "  cova sysroot install --target T [--from <archive>]\n"
+                       "                                    [--registry <dir>]\n"
                        "  cova sysroot verify [<id>]              Verify integrity\n");
   }
   if (topic == "target") {

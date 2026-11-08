@@ -20,6 +20,7 @@
 #include "core/filesystem/filesystem.hpp"
 #include "core/json/json.hpp"
 #include "core/process/process.hpp"
+#include "platform/binary/binary.hpp"
 
 namespace cova::cli {
 namespace {
@@ -141,6 +142,50 @@ Status maybe_write_lock(CommandContext& ctx, const PreparedBuild& prepared) {
   return status;
 }
 
+// Verifies that the artifacts Cova produced really are for the requested
+// target (PRD §22.4). This catches a host compiler that silently ignored
+// `--target`, which is exactly the class of bug cross-compilation must not hide.
+Status verify_artifacts(const PreparedBuild& prepared, CommandContext& ctx) {
+  for (const auto& output : prepared.plan.expected_outputs) {
+    if (!fs::is_regular_file(output)) {
+      return fail(Error::make("cova::build::artifact_missing",
+                              "the build reported success but the artifact is missing")
+                      .with("path: " + fs::generic_string(output)));
+    }
+    const std::string extension = str::to_lower(output.extension().string());
+    if (extension == ".a" || extension == ".lib" || extension == ".o" ||
+        extension == ".obj" || extension == ".d") {
+      continue;
+    }
+    auto info = platform::inspect_binary(output);
+    if (!info) {
+      return fail(Error::make("cova::build::artifact_uninspectable",
+                              "the build produced an artifact Cova cannot inspect")
+                      .with("path: " + fs::generic_string(output))
+                      .with(info.error().message));
+    }
+    if (info->format == platform::BinaryFormat::Unknown) {
+      return fail(Error::make("cova::build::artifact_unknown_format",
+                              "the build produced an artifact whose format is not recognised")
+                      .with("path: " + fs::generic_string(output))
+                      .with("Cova recognises ELF, PE/COFF, Mach-O and WebAssembly"));
+    }
+    if (info->format == platform::BinaryFormat::Archive) {
+      continue;
+    }
+    if (!platform::binary_matches_target(*info, prepared.target)) {
+      return fail(Error::make(
+          "cova::build::artifact_arch_mismatch",
+          "artifact " + fs::generic_string(output) + " does not match the requested target")
+          .with("expected: " + prepared.target.to_string())
+          .with("found: " + info->to_string())
+          .with("the compiler produced an artifact for a different architecture"));
+    }
+    ctx.ui->verbose("verified " + fs::generic_string(output) + ": " + info->to_string());
+  }
+  return ok();
+}
+
 // Executes a planned graph with incremental state and the shared artifact cache.
 int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
   auto config = effective_config(ctx);
@@ -162,7 +207,9 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
   env.target = prepared.target;
   env.abi = prepared.toolchain.abi_signature;
   env.toolchain_fingerprint = prepared.toolchain.fingerprint;
-  env.sysroot_fingerprint = prepared.toolchain.sysroot_id;
+  env.sysroot_fingerprint = prepared.toolchain.sysroot_fingerprint.empty()
+                                ? prepared.toolchain.sysroot_id
+                                : prepared.toolchain.sysroot_fingerprint;
 
   build::ExecuteOptions options;
   options.max_parallel = config->resolved_jobs();
@@ -320,6 +367,13 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     return 1;
   }
 
+  // A successful command line is not proof of a correct artifact. Check the
+  // produced binaries against the frozen target before reporting success.
+  auto verified = verify_artifacts(prepared, ctx);
+  if (!verified) {
+    return report_error(verified.error(), ctx);
+  }
+
   if (ctx.global.json) {
     json::Value out = json::Value::object();
     out.set("success", true);
@@ -468,7 +522,9 @@ int cmd_check(CommandContext& ctx) {
   env.target = prepared.target;
   env.abi = prepared.toolchain.abi_signature;
   env.toolchain_fingerprint = prepared.toolchain.fingerprint;
-  env.sysroot_fingerprint = prepared.toolchain.sysroot_id;
+  env.sysroot_fingerprint = prepared.toolchain.sysroot_fingerprint.empty()
+                                ? prepared.toolchain.sysroot_id
+                                : prepared.toolchain.sysroot_fingerprint;
 
   auto state = build::BuildState::load(prepared.project.layout.target_dir /
                                        target_dir_component(prepared.target) / ".cova" /

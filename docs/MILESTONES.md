@@ -29,20 +29,27 @@ The resolver is usable without a project build (`cova explain`, `cova doctor`).
 | `cova fmt` | `src/formatter` | `e2e_cli_test`, `formatter_test` |
 | Diagnostics in the requested stream | `src/cli/common.cpp` | `e2e_cli_test` |
 
-## Milestone 2 — Cross-compilation (interfaces + honest partial path)
+## Milestone 2 — Cross-compilation foundation (delivered)
 
-- Targets, ABI signatures, constraints and mixed-source descriptors exist and
-  are tested.
-- The resolver is system-first and refuses incompatible candidates with the
-  PRD §7.7 diagnostic shape.
-- A sysroot can be installed from a **local archive** (or a local registry
-  cache directory) with traversal-checked extraction and structural
-  verification. There is no public sysroot registry in this build.
-- Managed toolchain download and managed sysroot download are **not**
-  implemented. Commands report that rather than simulating a download.
-- Cross builds therefore succeed only when a compatible system sysroot is
-  already available; otherwise resolution fails with the missing-sysroot
-  diagnostic.
+| Requirement | Implementation | Verification |
+|---|---|---|
+| Structured targets, ABI signatures and constraints | `src/platform/{triple,abi,constraints}` | `platform_triple_test` |
+| Cross compiler discovery | Prefixed/versioned drivers (`aarch64-linux-musl-g++`, `g++-14`) in `src/toolchain/discovery` | `toolchain_resolver_test` |
+| System sysroot discovery | `/opt/<triple>/sysroot`, `/usr/local/<triple>/sysroot`, `$COVA_SYSROOT` in `src/toolchain/resolver` | `cross_clang_uses_a_system_sysroot` |
+| System-first resolver and mixed sources | `src/toolchain/resolver`; system compiler + system/managed sysroot | `toolchain_resolver_test`, `cova explain` |
+| Self-contained cross GCC | Prefixed GCC is not forced through a redundant Cova sysroot | `self_contained_cross_gcc_needs_no_sysroot` |
+| Trusted local component registry | `src/toolchain/installer`, `SysrootManager::install`, `docs/REGISTRY.md` | `toolchain_installer_test`, `sysroot_manager_test` |
+| Managed sysroot installation | Archive **or** trusted registry index; SHA-256/size verification; safe extraction; atomic commit | `registry_installs_verified_archive` |
+| Managed toolchain installation | Archive verified against the index, compiler banner re-checked, atomic commit | `installs_a_verified_registry_archive` |
+| `--offline` / `--no-install` | Refused before an archive is read; distinct diagnostics | `offline_cross_without_sysroot_names_the_restriction`, installer tests |
+| Artifact architecture verification | ELF, PE/COFF, Mach-O and WebAssembly inspection in `src/platform/binary` | `platform_binary_test`, `cross_build_rejects_a_wrong_architecture_artifact`; every successful build |
+| Target-specific output | `target/<triple>/<profile>` from the planner | `e2e_cli_test`, `build_planner_test` |
+
+No network transport is implemented. A registry archive referenced by an
+`http(s)://` URL is rejected; operators mirror archives into a local registry
+and record their SHA-256. A host without a compatible system cross compiler,
+system sysroot or installed managed component still fails with the
+missing-sysroot/target diagnostic rather than producing the wrong binary.
 
 ## Milestone 3 — Package management (command surface only)
 

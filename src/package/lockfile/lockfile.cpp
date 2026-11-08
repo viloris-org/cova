@@ -360,7 +360,8 @@ LockedToolchain lock_entry_from(const toolchain::ResolvedToolchain& resolved) {
     }
   }
   entry.sysroot_id = resolved.sysroot_id;
-  entry.sysroot_hash = resolved.sysroot_id;
+  entry.sysroot_hash = resolved.sysroot_fingerprint.empty() ? resolved.sysroot_id
+                                                             : resolved.sysroot_fingerprint;
   entry.abi_key = resolved.abi_signature.fingerprint_key();
   for (const auto& component : resolved.descriptor.components) {
     entry.components.push_back(component.role + "=" + fs::generic_string(component.path));
@@ -388,6 +389,13 @@ LockMismatch check_against_lock(const toolchain::ResolvedToolchain& resolved,
     mismatch.differences.push_back("sysroot changed: " + locked.sysroot_id + " -> " +
                                    resolved.sysroot_id);
   }
+  const std::string sysroot_hash = resolved.sysroot_fingerprint.empty()
+                                       ? resolved.sysroot_id
+                                       : resolved.sysroot_fingerprint;
+  if (!locked.sysroot_hash.empty() && !sysroot_hash.empty() &&
+      locked.sysroot_hash != sysroot_hash) {
+    mismatch.differences.push_back("sysroot content changed");
+  }
   const std::string abi_key = resolved.abi_signature.fingerprint_key();
   if (!locked.abi_key.empty() && locked.abi_key != abi_key) {
     mismatch.differences.push_back("ABI signature changed");
@@ -413,6 +421,9 @@ bool needs_rewrite(const ToolchainLock& lock, const toolchain::ResolvedToolchain
     return true;
   }
   if (existing->sysroot_id != desired.sysroot_id) {
+    return true;
+  }
+  if (!desired.sysroot_hash.empty() && existing->sysroot_hash != desired.sysroot_hash) {
     return true;
   }
   if (existing->abi_key != desired.abi_key) {

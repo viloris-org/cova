@@ -16,8 +16,9 @@
 #include "cli/cli.hpp"
 #include "cli/common.hpp"
 #include "core/filesystem/filesystem.hpp"
-#include "manifest/manifest.hpp"
+#include "core/hashing/hash.hpp"
 #include "core/process/process.hpp"
+#include "manifest/manifest.hpp"
 #include "platform/triple/triple.hpp"
 #include "testing/test.hpp"
 
@@ -49,24 +50,23 @@ CliRun run_cli(const std::vector<std::string>& args) {
   std::ostringstream out;
   std::ostringstream err;
   CliRun result;
-  result.exit_code =
-      cova::cli::run(static_cast<int>(argv.size()), argv.data(), out, err);
+  result.exit_code = cova::cli::run(static_cast<int>(argv.size()), argv.data(), out, err);
   result.out = out.str();
   result.err = err.str();
   return result;
 }
 
 // Skips the current test when a required tool is missing.
-#define COVA_SKIP_UNLESS_TOOL(name)                                    \
-  do {                                                                 \
-    if (!cova::fs::find_in_path(name).has_value()) {                    \
-      return;                                                          \
-    }                                                                  \
+#define COVA_SKIP_UNLESS_TOOL(name)                                                                \
+  do {                                                                                             \
+    if (!cova::fs::find_in_path(name).has_value()) {                                               \
+      return;                                                                                      \
+    }                                                                                              \
   } while (false)
 
 // Restores the working directory on scope exit.
 class ScopedCwd {
- public:
+public:
   explicit ScopedCwd(const stdfs::path& path) : old_(stdfs::current_path()) {
     stdfs::current_path(path);
   }
@@ -77,7 +77,7 @@ class ScopedCwd {
   ScopedCwd(const ScopedCwd&) = delete;
   ScopedCwd& operator=(const ScopedCwd&) = delete;
 
- private:
+private:
   stdfs::path old_;
 };
 
@@ -98,7 +98,48 @@ bool contains(const std::string& haystack, std::string_view needle) {
   return haystack.find(needle) != std::string::npos;
 }
 
-}  // namespace
+void make_executable(const stdfs::path& path) {
+  std::error_code ec;
+  stdfs::permissions(
+      path, stdfs::perms::owner_exec | stdfs::perms::group_exec | stdfs::perms::others_exec,
+      stdfs::perm_options::add, ec);
+}
+
+// A compiler stand-in that satisfies every invocation by creating its `-o`
+// outputs (and `-MF` depfile) without producing a real binary. It is enough to
+// exercise discovery, probing, planning and execution; artifact verification is
+// what must then reject the empty result.
+constexpr std::string_view kFakeCompiler = R"SH(#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'g++ (GCC) 14.2.0'
+  exit 0
+fi
+if [ "$1" = "-print-resource-dir" ]; then
+  dirname "$0"
+  exit 0
+fi
+out=""
+mf=""
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    -o) out="$arg" ;;
+    -MF) mf="$arg" ;;
+  esac
+  prev="$arg"
+done
+if [ -n "$mf" ]; then
+  mkdir -p "$(dirname "$mf")"
+  : > "$mf"
+fi
+if [ -n "$out" ]; then
+  mkdir -p "$(dirname "$out")"
+  : > "$out"
+fi
+exit 0
+)SH";
+
+} // namespace
 
 COVA_TEST_NAMED(integration, new_creates_a_complete_project) {
   cova::test::TempDir temp;
@@ -124,8 +165,7 @@ COVA_TEST_NAMED(integration, new_creates_a_complete_project) {
 
   // The generated manifest must be re-parseable by Cova itself.
   auto reloaded = cova::manifest::load(root / "cova.toml");
-  COVA_CHECK_MSG(reloaded.has_value(),
-                 reloaded ? "" : reloaded.error().to_string());
+  COVA_CHECK_MSG(reloaded.has_value(), reloaded ? "" : reloaded.error().to_string());
   COVA_CHECK_EQ(reloaded->manifest.package.name, std::string("hello"));
 }
 
@@ -257,8 +297,7 @@ COVA_TEST_NAMED(integration, end_to_end_new_build_run) {
   const stdfs::path binary = stdfs::path(temp.path()) / "hello" / "target" /
                              cova::cli::target_dir_component(cova::platform::host_triple()) /
                              "dev" / "bin" / "hello";
-  COVA_CHECK_MSG(cova::fs::is_regular_file(binary),
-                 "expected binary at " + binary.string());
+  COVA_CHECK_MSG(cova::fs::is_regular_file(binary), "expected binary at " + binary.string());
 
   auto run = run_cli({"run"});
   COVA_CHECK_MSG(run.ok(), run.combined());
@@ -281,8 +320,7 @@ COVA_TEST_NAMED(integration, incremental_build_rebuilds_nothing_when_unchanged) 
   COVA_CHECK_MSG(second.ok(), second.combined());
 
   // A no-change build must not execute any compile action (PRD §9.3, §19.1).
-  COVA_CHECK(contains(second.combined(), "up to date") ||
-             contains(second.combined(), "Finished"));
+  COVA_CHECK(contains(second.combined(), "up to date") || contains(second.combined(), "Finished"));
 
   // Touching a header must trigger a rebuild (PRD §9.3).
   const stdfs::path header = stdfs::path(temp.path()) / "inc" / "include" / "inc.hpp";
@@ -394,6 +432,57 @@ COVA_TEST_NAMED(integration, shell_escapes_are_never_interpreted) {
   // The command may reject the name or sanitise it, but nothing may be executed.
   COVA_CHECK(!cova::fs::is_regular_file(stdfs::path(temp.path()) / "pwned"));
   (void)result;
+}
+
+COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) {
+  COVA_SKIP_UNLESS_TOOL("tar");
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path base = temp.path();
+  const stdfs::path registry = base / "registry";
+  const stdfs::path stage = base / "stage" / "fake-cross";
+  const stdfs::path archive = registry / "archives" / "fake-cross.tar.gz";
+
+  write_text(stage / "bin" / "aarch64-linux-gnu-g++", kFakeCompiler);
+  make_executable(stage / "bin" / "aarch64-linux-gnu-g++");
+  write_text(stage / "toolchain.toml", "id = \"fake-cross\"\n"
+                                       "family = \"gcc\"\n"
+                                       "version = \"14.2.0\"\n"
+                                       "target = \"aarch64-unknown-linux-gnu\"\n"
+                                       "compiler = \"bin/aarch64-linux-gnu-g++\"\n");
+  stdfs::create_directories(archive.parent_path());
+  auto tar = cova::proc::run(
+      "tar", {"-czf", archive.string(), "-C", (base / "stage").string(), "fake-cross"});
+  COVA_CHECK_MSG(tar.has_value() && tar->success(), "could not create the fixture archive");
+
+  const std::string digest = *cova::Sha256::hex_of_file(archive);
+  write_text(registry / "index.toml", "[[toolchain]]\n"
+                                      "id = \"fake-cross\"\n"
+                                      "family = \"gcc\"\n"
+                                      "version = \"14.2.0\"\n"
+                                      "target = \"aarch64-unknown-linux-gnu\"\n"
+                                      "archive = \"archives/fake-cross.tar.gz\"\n"
+                                      "sha256 = \"" +
+                                          digest +
+                                          "\"\n"
+                                          "size-bytes = " +
+                                          std::to_string(cova::fs::file_size(archive)) +
+                                          "\n"
+                                          "compiler = \"bin/aarch64-linux-gnu-g++\"\n");
+
+  {
+    ScopedCwd cwd(base);
+    COVA_CHECK(run_cli({"new", "fake"}).ok());
+    auto installed =
+        run_cli({"toolchain", "install", "fake-cross", "--registry", registry.string()});
+    COVA_CHECK_MSG(installed.ok(), installed.combined());
+  }
+
+  ScopedCwd cwd(base / "fake");
+  auto built = run_cli({"build", "--target", "aarch64-unknown-linux-gnu"});
+  COVA_CHECK(!built.ok());
+  COVA_CHECK(contains(built.combined(), "cannot inspect") ||
+             contains(built.combined(), "artifact"));
 }
 
 COVA_TEST_MAIN()

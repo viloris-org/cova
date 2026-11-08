@@ -12,6 +12,7 @@
 #include "formatter/formatter.hpp"
 #include "sysroot/manager/manager.hpp"
 #include "toolchain/discovery/discovery.hpp"
+#include "toolchain/installer/installer.hpp"
 #include "toolchain/probe/probe.hpp"
 #include "toolchain/resolver/resolver.hpp"
 
@@ -129,18 +130,46 @@ int cmd_toolchain(CommandContext& ctx) {
       return cmd_explain(ctx);
     }
     case CommandId::ToolchainInstall: {
-      const std::string target_name =
+      const std::string requested =
           ctx.positionals().empty() ? std::string() : ctx.positionals().front();
-      DiagnosticEngine engine;
-      engine.emit(make_error(
-                      "cova::toolchain::registry_unavailable",
-                      "managed toolchain installation requires a trusted registry, which "
-                      "this build has no configuration for")
-                      .line("requested: " + (target_name.empty() ? "<none>" : target_name))
-                      .line("Cova will not simulate a download or claim an install it did not "
-                            "verify (PRD §18.1)")
-                      .line("use a system toolchain, or point --toolchain at an installed one"));
-      return report_diagnostics(engine, ctx);
+      toolchain::ToolchainInstallOptions options;
+      options.registry_root = dirs->registry;
+      if (auto registry = ctx.flags.get("registry"); registry && !registry->empty()) {
+        options.registry_root = fs::absolute_normalized(*registry);
+      }
+      options.toolchains_root = dirs->toolchains;
+      options.downloads_root = dirs->downloads;
+      options.offline = ctx.global.offline_mode();
+      options.allow_install = !ctx.global.no_install && !ctx.global.offline_mode();
+      toolchain::ToolchainInstaller installer(options);
+
+      if (requested.empty()) {
+        auto available = installer.available();
+        if (!available) {
+          return report_error(available.error(), ctx);
+        }
+        if (available->empty()) {
+          ctx.ui->info("no managed toolchains are available in the trusted registry");
+          ctx.ui->out("registry: " + fs::generic_string(options.registry_root));
+          ctx.ui->out("add a `[[toolchain]]` entry to its index.toml, or use a system compiler");
+          return 1;
+        }
+        ctx.ui->info("available managed toolchains:");
+        for (const auto& entry : *available) {
+          ctx.ui->out("  " + entry.to_string());
+        }
+        ctx.ui->out("install one with `cova toolchain install <id>`");
+        return 0;
+      }
+
+      auto installed = installer.install(requested);
+      if (!installed) {
+        return report_error(installed.error(), ctx);
+      }
+      ctx.ui->info("installed toolchain `" + installed->descriptor.label() + "` at " +
+                   fs::generic_string(installed->root));
+      ctx.ui->verbose("verified archive sha256 " + installed->entry.sha256);
+      return 0;
     }
     case CommandId::ToolchainRemove: {
       if (ctx.positionals().empty()) {
@@ -206,6 +235,9 @@ int cmd_sysroot(CommandContext& ctx) {
   options.store_root = dirs->store;
   options.downloads_root = dirs->downloads;
   options.registry_root = dirs->registry;
+  if (auto registry = ctx.flags.get("registry"); registry && !registry->empty()) {
+    options.registry_root = fs::absolute_normalized(*registry);
+  }
   options.offline = ctx.global.offline_mode();
   options.allow_install = !ctx.global.no_install && !ctx.global.offline_mode();
   options.interactive = ctx.ui->interactive();
@@ -267,7 +299,10 @@ int cmd_sysroot(CommandContext& ctx) {
         return report_error(target.error(), ctx);
       }
       // A local archive is the only install source this build can verify.
-      const std::string name = target->to_short_string();
+      std::string name;
+      if (ctx.positionals().size() > 1) {
+        name = ctx.positionals()[1];
+      }
       std::optional<fs::Path> archive;
       if (auto from = ctx.flags.get("from"); from && !from->empty()) {
         archive = fs::absolute_normalized(*from);
@@ -278,12 +313,21 @@ int cmd_sysroot(CommandContext& ctx) {
                               ctx);
         }
       }
-      auto installed = manager.install_file(*target, name, archive);
+      // With no explicit archive, consult the trusted registry index. An empty
+      // name lets the index choose the entry whose target/CRT matches.
+      auto installed = archive
+                           ? manager.install_file(*target,
+                                                  name.empty() ? target->to_short_string() : name,
+                                                  archive)
+                           : manager.install(*target, name);
       if (!installed) {
         return report_error(installed.error(), ctx);
       }
       ctx.ui->info("installed sysroot `" + installed->manifest.name + "` at " +
                    fs::generic_string(installed->root));
+      if (!installed->manifest.sha256.empty()) {
+        ctx.ui->verbose("verified archive sha256 " + installed->manifest.sha256);
+      }
       return 0;
     }
     case CommandId::SysrootVerify: {
@@ -387,6 +431,17 @@ int cmd_doctor(CommandContext& ctx) {
                              ? formatter_descriptor->version_text + " (" +
                                    formatter_descriptor->source + ")"
                              : "not found; `cova fmt` will not work"});
+
+  // Trusted component registry. Missing is a warning, not a failure: system
+  // toolchains and locally installed components still work.
+  if (dirs) {
+    const auto registry_index = dirs->registry / "index.toml";
+    checks.push_back(
+        Check{"component registry", fs::is_regular_file(registry_index), false,
+              fs::is_regular_file(registry_index)
+                  ? fs::generic_string(registry_index)
+                  : "no index.toml; managed installs are unavailable, system components work"});
+  }
 
   // Native target resolvability end to end.
   if (project) {

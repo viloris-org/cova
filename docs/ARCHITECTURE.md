@@ -6,11 +6,11 @@
 
 Cova is a C/C++ build system, package manager and cross-compilation toolchain
 manager, written in C++26 and inspired by Cargo. The PRD is `PRD.md` at the
-repo root (the original Chinese text is `PRD.com`); `§n.n` below refers to its
-sections.
+repo root; `§n.n` below refers to its sections.
 
 **Current delivery target: Milestone 0 (architecture foundation) + Milestone 1
-(build MVP), with Milestone 2 interfaces in place and honest diagnostics.**
+(build MVP) + Milestone 2 (cross-compilation foundation and trusted local
+component registry), with honest diagnostics for everything not yet built.**
 
 ---
 
@@ -52,9 +52,9 @@ Dependencies point **downwards only**. `core` knows nothing; `cli` knows everyth
 ```
 core  (common, diagnostics, filesystem, process, hashing, version, json, toml, config)
  ├── testing                    (in-tree test framework; depends on core)
- ├── platform                   (triple, abi, constraints)
- │    ├── toolchain             (descriptor, discovery, probe, resolver)
- │    │    └── sysroot          (manager, store, verifier)
+ ├── platform                   (triple, abi, constraints, binary inspection)
+ │    ├── sysroot               (manager, verifier, safe extraction, staging)
+ │    │    └── toolchain        (descriptor, discovery, probe, resolver, installer)
  │    ├── manifest               (cova.toml model)
  │    │    └── workspace         (multi-package discovery)
  │    ├── build                 (graph IR, planner, scheduler, executor, cache)
@@ -68,6 +68,9 @@ Enforced boundaries (PRD §17.2):
 * `build` must not include `cli`, and must not spawn `clang-format` (that is
   `formatter`). `build` *does* spawn compilers — via `build::action` providers.
 * `toolchain` must not include `build` (the resolver never builds anything).
+* `sysroot` must not include `toolchain`; the managed toolchain installer reuses
+  the sysroot module's verified archive staging and safe extraction rather than
+  duplicating security-critical code.
 * Only `cli` reads `argv`, decides exit codes, and prints user-facing text.
 
 ## 3. Module ownership
@@ -98,11 +101,13 @@ src/testing/test.hpp                     in-tree test framework
 src/platform/triple/triple.hpp           Triple, Arch/Os/Env/Abi, known targets
 src/platform/abi/abi.hpp                 AbiSignature, OsVersion, ABI checks
 src/platform/constraints/constraints.hpp Constraint, CandidateEnvironment, evaluate()
+src/platform/binary/binary.hpp           BinaryInfo, inspect_binary, arch matching
 src/toolchain/descriptor.hpp             ToolchainDescriptor, ResolvedToolchain
 src/toolchain/discovery/discovery.hpp    system compiler discovery
 src/toolchain/probe/probe.hpp            capability probes
 src/toolchain/resolver/resolver.hpp      ResolutionRequest/Report, resolve()
-src/sysroot/manager/manager.hpp          SysrootManifest, SysrootManager, safe extract
+src/toolchain/installer/installer.hpp    trusted registry toolchain installation
+src/sysroot/manager/manager.hpp          SysrootManifest, SysrootManager, safe extract, staging
 src/manifest/manifest.hpp                Manifest model, load/parse/to_toml
 src/workspace/workspace.hpp              Workspace, discover_project
 src/build/graph/graph.hpp                Action, ActionId, BuildGraph

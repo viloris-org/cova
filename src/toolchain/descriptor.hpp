@@ -85,6 +85,10 @@ struct ToolchainDescriptor {
   stdfs::path resource_dir;
   // Default sysroot advertised by the compiler, when any.
   stdfs::path default_sysroot;
+  // True when this driver already carries the runtime for the targets it names
+  // (a prefixed cross GCC, or a cross Clang configured with a sysroot). Such a
+  // toolchain does not require a separately installed Cova sysroot.
+  bool self_contained = false;
   // Syroot constraints this toolchain requires.
   std::optional<std::string> required_sysroot_target;
   platform::Crt crt = platform::Crt::Unknown;
@@ -118,6 +122,9 @@ struct ResolvedToolchain {
   // Resolved sysroot, if one is required for this target.
   std::string sysroot_id;
   stdfs::path sysroot_path;
+  // Content-derived identity of the sysroot (manifest hash or a conservative
+  // filesystem fingerprint), so a changed sysroot invalidates build actions.
+  std::string sysroot_fingerprint;
   // The frozen environment handed to the build graph.
   platform::CandidateEnvironment environment;
   // Human-readable chain of resolution decisions (transparency, PRD §1.3).

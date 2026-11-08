@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/filesystem/filesystem.hpp"
+#include "core/hashing/hash.hpp"
 #include "core/process/process.hpp"
 #include "core/toml/toml.hpp"
 
@@ -19,6 +20,9 @@ std::vector<std::string> driver_flags(const ToolchainDescriptor& descriptor,
   if ((descriptor.family == "clang" || descriptor.family == "clang-cl") &&
       options.target.is_valid() && options.target != platform::host_triple()) {
     flags.push_back("--target=" + options.target.to_string());
+  }
+  if (!options.sysroot.empty() && fs::is_directory(options.sysroot)) {
+    flags.push_back("--sysroot=" + fs::generic_string(options.sysroot));
   }
   return flags;
 }
@@ -106,8 +110,12 @@ Status run_probe_command(const ToolchainDescriptor& descriptor, const ProbeOptio
   return ok();
 }
 
-std::string probe_key(const ToolchainDescriptor& descriptor) {
-  return descriptor.content_hash.empty() ? descriptor.id : descriptor.content_hash;
+std::string probe_key(const ToolchainDescriptor& descriptor, std::string_view variant) {
+  std::string key = descriptor.content_hash.empty() ? descriptor.id : descriptor.content_hash;
+  if (!variant.empty()) {
+    key += "-" + to_hex(Sha256::of(variant)).substr(0, 16);
+  }
+  return key;
 }
 
 }  // namespace
@@ -386,8 +394,9 @@ Result<ProbeReport> probe(const ToolchainDescriptor& descriptor, const ProbeOpti
 }
 
 Result<ProbeReport> load_cached_probe(const stdfs::path& cache_dir,
-                                      const ToolchainDescriptor& descriptor) {
-  const auto path = cache_dir / "probes" / (probe_key(descriptor) + ".toml");
+                                      const ToolchainDescriptor& descriptor,
+                                      std::string_view variant) {
+  const auto path = cache_dir / "probes" / (probe_key(descriptor, variant) + ".toml");
   if (!fs::is_regular_file(path)) {
     return fail<ProbeReport>(Error::make("cova::toolchain::probe_cache_miss",
                                          "no cached probe for this toolchain"));
@@ -430,7 +439,7 @@ toml::Value bool_value(bool value) { return toml::Value(value); }
 }  // namespace
 
 Status store_cached_probe(const stdfs::path& cache_dir, const ToolchainDescriptor& descriptor,
-                          const ProbeReport& report) {
+                          const ProbeReport& report, std::string_view variant) {
   const auto directory = cache_dir / "probes";
   auto created = fs::create_directories(directory);
   if (!created) {
@@ -457,7 +466,8 @@ Status store_cached_probe(const stdfs::path& cache_dir, const ToolchainDescripto
   table.emplace("threads", bool_value(c.threads_available));
   table.emplace("module_scan", bool_value(c.cpp_modules_scan));
   table.emplace("succeeded", bool_value(report.succeeded));
-  return fs::write_file_atomic(directory / (probe_key(descriptor) + ".toml"), toml::write(table));
+  return fs::write_file_atomic(directory / (probe_key(descriptor, variant) + ".toml"),
+                               toml::write(table));
 }
 
 std::string format_capability_table(const ToolchainCapabilities& capabilities) {

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <initializer_list>
 #include <map>
 #include <set>
 #include <string>
@@ -18,10 +19,91 @@ std::string basename_lower(const stdfs::path& path) {
   return str::to_lower(path.filename().string());
 }
 
-bool is_compiler_driver(std::string_view filename) {
-  const std::string name = str::to_lower(filename);
-  return name == "clang++" || name == "clang" || name == "clang-cl" || name == "g++" ||
-         name == "gcc" || name == "c++";
+bool all_digits(std::string_view text) {
+  if (text.empty()) {
+    return false;
+  }
+  for (char c : text) {
+    if (std::isdigit(static_cast<unsigned char>(c)) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct DriverMatch {
+  std::string token;  // "g++", "clang++", ...
+  std::string family; // "gcc", "clang", "clang-cl"
+  std::string prefix; // "aarch64-linux-gnu" or empty for a host driver
+};
+
+// Longest tokens must be tried first so `clang-cl` is not mistaken for `clang`.
+const std::pair<std::string_view, std::string_view> kDriverTokens[] = {
+    {"clang-cl", "clang-cl"}, {"clang++", "clang"}, {"clang", "clang"}, {"g++", "gcc"},
+    {"gcc", "gcc"},           {"c++", "gcc"},       {"cc", "gcc"},
+};
+
+std::optional<DriverMatch> parse_driver_name(std::string_view name) {
+  for (const auto& [token, family] : kDriverTokens) {
+    if (name == token) {
+      return DriverMatch{std::string(token), std::string(family), {}};
+    }
+    if (name.size() > token.size() + 1 && str::ends_with(name, "-" + std::string(token))) {
+      const std::string prefix(name.substr(0, name.size() - token.size() - 1));
+      if (!prefix.empty() && !all_digits(prefix)) {
+        return DriverMatch{std::string(token), std::string(family), prefix};
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Accepts version suffixes (`g++-14`, `clang++-18`) and cross prefixes
+// (`aarch64-linux-gnu-g++`) in any combination.
+std::optional<DriverMatch> match_driver(std::string_view filename) {
+  std::string name = str::to_lower(filename);
+  if (str::ends_with(name, ".exe")) {
+    name.resize(name.size() - 4);
+  }
+  if (auto parsed = parse_driver_name(name)) {
+    return parsed;
+  }
+  // Strip one or more trailing "-<digits>" components.
+  for (;;) {
+    const auto dash = name.rfind('-');
+    if (dash == std::string::npos || dash + 1 >= name.size()) {
+      return std::nullopt;
+    }
+    if (!all_digits(std::string_view(name).substr(dash + 1))) {
+      return std::nullopt;
+    }
+    name.resize(dash);
+    if (auto parsed = parse_driver_name(name)) {
+      return parsed;
+    }
+  }
+}
+
+bool is_cxx_driver(const DriverMatch& match) {
+  // `clang`/`gcc` are C drivers: they do not link the C++ runtime, so using
+  // them as the C++ driver silently breaks every `std::` program. Versioned and
+  // prefixed forms keep the `++` in their token.
+  return match.token == "clang++" || match.token == "g++" || match.token == "c++" ||
+         match.token == "clang-cl";
+}
+
+std::optional<stdfs::path> find_first(const stdfs::path& directory,
+                                      const std::vector<std::string>& names) {
+  for (const auto& name : names) {
+    const auto candidate = directory / name;
+    if (fs::is_regular_file(candidate)) {
+      return candidate;
+    }
+    if (auto path = fs::find_in_path(name)) {
+      return path;
+    }
+  }
+  return std::nullopt;
 }
 
 std::vector<stdfs::path> managed_compiler_candidates(const stdfs::path& root) {
@@ -35,48 +117,45 @@ std::vector<stdfs::path> managed_compiler_candidates(const stdfs::path& root) {
     if (!it->is_directory()) {
       continue;
     }
-    for (const auto& name : {"clang++", "g++"}) {
-      const auto candidate = it->path() / "bin" / name;
-      if (fs::is_regular_file(candidate)) {
-        out.push_back(candidate);
+    for (const auto& bin : {it->path() / "bin", it->path()}) {
+      if (!fs::is_directory(bin)) {
+        continue;
+      }
+      std::error_code scan_ec;
+      for (auto entry = stdfs::directory_iterator(bin, scan_ec);
+           entry != stdfs::directory_iterator(); entry.increment(scan_ec)) {
+        if (!entry->is_regular_file()) {
+          continue;
+        }
+        auto match = match_driver(entry->path().filename().string());
+        if (match && is_cxx_driver(*match)) {
+          out.push_back(entry->path());
+        }
       }
     }
   }
   std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
   return out;
-}
-
-std::optional<stdfs::path> find_tool(const stdfs::path& compiler_dir,
-                                     std::initializer_list<std::string_view> names) {
-  for (const auto name : names) {
-    const auto candidate = compiler_dir / std::string(name);
-    if (fs::is_regular_file(candidate)) {
-      return candidate;
-    }
-    if (auto path = fs::find_in_path(name)) {
-      return path;
-    }
-  }
-  return std::nullopt;
 }
 
 std::string source_prefix(ToolchainSource source) {
   switch (source) {
-    case ToolchainSource::System:
-      return "system";
-    case ToolchainSource::Managed:
-      return "managed";
-    case ToolchainSource::UserPath:
-      return "user";
-    case ToolchainSource::Registry:
-      return "registry";
-    case ToolchainSource::Unknown:
-      break;
+  case ToolchainSource::System:
+    return "system";
+  case ToolchainSource::Managed:
+    return "managed";
+  case ToolchainSource::UserPath:
+    return "user";
+  case ToolchainSource::Registry:
+    return "registry";
+  case ToolchainSource::Unknown:
+    break;
   }
   return "unknown";
 }
 
-}  // namespace
+} // namespace
 
 std::optional<Version> parse_version_banner(std::string_view banner) {
   auto version = Version::extract(banner);
@@ -87,45 +166,80 @@ std::optional<Version> parse_version_banner(std::string_view banner) {
 }
 
 std::optional<std::string> family_from_executable(std::string_view filename) {
-  const std::string name = str::to_lower(filename);
-  if (name == "clang++" || name == "clang") {
-    return std::string("clang");
+  auto match = match_driver(filename);
+  if (!match) {
+    return std::nullopt;
   }
-  if (name == "clang-cl") {
-    return std::string("clang-cl");
+  return match->family;
+}
+
+std::optional<platform::Triple> target_from_executable(std::string_view filename) {
+  auto match = match_driver(filename);
+  if (!match || match->prefix.empty()) {
+    return std::nullopt;
   }
-  if (name == "g++" || name == "gcc") {
-    return std::string("gcc");
+  auto parsed = platform::Triple::parse(match->prefix);
+  if (!parsed) {
+    return std::nullopt;
   }
-  if (name == "c++") {
-    return std::string("gcc");
-  }
-  return std::nullopt;
+  return *parsed;
 }
 
 SiblingTools find_sibling_tools(const stdfs::path& compiler_path, std::string_view family) {
   SiblingTools tools;
-  const auto directory = compiler_path.has_parent_path() ? compiler_path.parent_path()
-                                                         : stdfs::path(".");
+  const auto directory =
+      compiler_path.has_parent_path() ? compiler_path.parent_path() : stdfs::path(".");
+  const auto match = match_driver(compiler_path.filename().string());
+  const std::string prefix = match ? match->prefix : std::string();
+  auto prefixed = [&](std::string_view name) {
+    return prefix.empty() ? std::string(name) : prefix + "-" + std::string(name);
+  };
+
   if (family == "clang" || family == "clang-cl") {
-    if (auto tool = find_tool(directory, {"ld.lld", "lld", "ld"})) {
-      tools.linker = *tool;
-    }
-    if (auto tool = find_tool(directory, {"llvm-ar", "ar"})) {
-      tools.archiver = *tool;
-    }
-    if (auto tool = find_tool(directory, {"llvm-objcopy", "objcopy"})) {
-      tools.objcopy = *tool;
+    if (prefix.empty()) {
+      if (auto tool = find_first(directory, {"ld.lld", "lld", "ld"})) {
+        tools.linker = *tool;
+      }
+      if (auto tool = find_first(directory, {"llvm-ar", "ar"})) {
+        tools.archiver = *tool;
+      }
+      if (auto tool = find_first(directory, {"llvm-objcopy", "objcopy"})) {
+        tools.objcopy = *tool;
+      }
+    } else {
+      // A prefixed cross driver invokes its own linker; recording the host `ld`
+      // here would misrepresent the toolchain in `explain` and in fingerprints.
+      if (auto tool = find_first(directory, {prefixed("ld.lld"), prefixed("ld")})) {
+        tools.linker = *tool;
+      }
+      if (auto tool = find_first(directory, {prefixed("llvm-ar"), prefixed("ar")})) {
+        tools.archiver = *tool;
+      }
+      if (auto tool = find_first(directory, {prefixed("llvm-objcopy"), prefixed("objcopy")})) {
+        tools.objcopy = *tool;
+      }
     }
   } else {
-    if (auto tool = find_tool(directory, {"ld", "ld.lld"})) {
-      tools.linker = *tool;
-    }
-    if (auto tool = find_tool(directory, {"ar", "llvm-ar"})) {
-      tools.archiver = *tool;
-    }
-    if (auto tool = find_tool(directory, {"objcopy", "llvm-objcopy"})) {
-      tools.objcopy = *tool;
+    if (prefix.empty()) {
+      if (auto tool = find_first(directory, {"ld", "ld.lld"})) {
+        tools.linker = *tool;
+      }
+      if (auto tool = find_first(directory, {"ar", "llvm-ar"})) {
+        tools.archiver = *tool;
+      }
+      if (auto tool = find_first(directory, {"objcopy", "llvm-objcopy"})) {
+        tools.objcopy = *tool;
+      }
+    } else {
+      if (auto tool = find_first(directory, {prefixed("ld"), prefixed("ld.lld")})) {
+        tools.linker = *tool;
+      }
+      if (auto tool = find_first(directory, {prefixed("ar"), prefixed("llvm-ar")})) {
+        tools.archiver = *tool;
+      }
+      if (auto tool = find_first(directory, {prefixed("objcopy"), prefixed("llvm-objcopy")})) {
+        tools.objcopy = *tool;
+      }
     }
   }
   return tools;
@@ -142,8 +256,8 @@ Result<stdfs::path> query_resource_dir(const stdfs::path& compiler_path) {
   }
   const std::string path = str::trim(result->stdout_text);
   if (path.empty()) {
-    return fail<stdfs::path>(Error::make(
-        "cova::toolchain::resource_dir", "the compiler did not report a resource directory"));
+    return fail<stdfs::path>(Error::make("cova::toolchain::resource_dir",
+                                         "the compiler did not report a resource directory"));
   }
   return stdfs::path(path);
 }
@@ -161,7 +275,13 @@ Result<stdfs::path> query_default_sysroot(const stdfs::path& compiler_path) {
   if (path.empty()) {
     return stdfs::path{};
   }
-  return stdfs::path(path);
+  const stdfs::path candidate(path);
+  // `/` is the host root, not a managed cross sysroot; treating it as one would
+  // make every host compiler look self-contained.
+  if (candidate == stdfs::path("/")) {
+    return stdfs::path{};
+  }
+  return candidate;
 }
 
 std::vector<std::string> query_supported_targets(const stdfs::path& compiler_path) {
@@ -196,17 +316,18 @@ std::vector<std::string> query_supported_targets(const stdfs::path& compiler_pat
 Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
                                               ToolchainSource source) {
   if (!fs::is_regular_file(compiler_path) || !proc::is_executable(compiler_path)) {
-    return fail<ToolchainDescriptor>(Error::make(
-        "cova::toolchain::not_executable",
-        "`" + fs::generic_string(compiler_path) + "` is not an executable compiler"));
+    return fail<ToolchainDescriptor>(
+        Error::make("cova::toolchain::not_executable",
+                    "`" + fs::generic_string(compiler_path) + "` is not an executable compiler"));
   }
   const std::string filename = basename_lower(compiler_path);
-  auto family = family_from_executable(filename);
-  if (!family) {
-    return fail<ToolchainDescriptor>(Error::make(
-        "cova::toolchain::unknown_family",
-        "`" + filename + "` is not a recognised clang or gcc driver"));
+  const auto match = match_driver(filename);
+  if (!match) {
+    return fail<ToolchainDescriptor>(
+        Error::make("cova::toolchain::unknown_family",
+                    "`" + filename + "` is not a recognised clang or gcc driver"));
   }
+  const std::string& family = match->family;
 
   proc::ProcessSpec spec;
   spec.program = compiler_path;
@@ -219,27 +340,36 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   const std::string banner = result->stdout_text + "\n" + result->stderr_text;
   auto version = parse_version_banner(banner);
   if (!version) {
-    return fail<ToolchainDescriptor>(Error::make(
-        "cova::toolchain::version_probe",
-        "could not determine the version of `" + fs::generic_string(compiler_path) + "`")
-        .with("output: " + str::collapse_whitespace(banner)));
+    return fail<ToolchainDescriptor>(
+        Error::make("cova::toolchain::version_probe", "could not determine the version of `" +
+                                                          fs::generic_string(compiler_path) + "`")
+            .with("output: " + str::collapse_whitespace(banner)));
   }
 
+  const platform::Triple host = platform::host_triple();
+  const auto inferred = target_from_executable(filename);
+  const platform::Triple configured_target = inferred.value_or(host);
+
   ToolchainDescriptor descriptor;
-  descriptor.family = *family;
+  descriptor.family = family;
   descriptor.version = *version;
   descriptor.source = source;
-  descriptor.host = platform::host_triple();
-  descriptor.crt = descriptor.host.crt();
-  descriptor.libcpp = platform::default_libcpp_for(descriptor.family, descriptor.host);
-  descriptor.abi = descriptor.host.abi();
-  descriptor.id = source_prefix(source) + "-" + descriptor.family + "-" +
-                  descriptor.version.to_string() + "-" +
-                  std::to_string(fnv1a64(fs::generic_string(fs::canonical_for_compare(compiler_path))) %
-                                 0xffffff);
+  descriptor.host = host;
+  descriptor.crt = configured_target.crt();
+  descriptor.libcpp = platform::default_libcpp_for(descriptor.family, configured_target);
+  descriptor.abi = configured_target.abi();
+  descriptor.id =
+      source_prefix(source) + "-" + descriptor.family + "-" + descriptor.version.to_string() + "-" +
+      (inferred ? inferred->to_short_string() + "-" : "") +
+      std::to_string(fnv1a64(fs::generic_string(fs::canonical_for_compare(compiler_path))) %
+                     0xffffff);
   descriptor.trust_level = source == ToolchainSource::System ? "system" : "managed";
-  descriptor.supported_targets = {descriptor.host.to_string()};
-  descriptor.supported_targets.push_back(descriptor.host.to_short_string());
+  descriptor.supported_targets = {configured_target.to_string()};
+  if (inferred) {
+    descriptor.supported_targets.push_back(inferred->to_short_string());
+  } else {
+    descriptor.supported_targets.push_back(host.to_short_string());
+  }
   std::sort(descriptor.supported_targets.begin(), descriptor.supported_targets.end());
   descriptor.supported_targets.erase(
       std::unique(descriptor.supported_targets.begin(), descriptor.supported_targets.end()),
@@ -256,7 +386,22 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   cxx.sha256 = Sha256::hex_of_file(cxx.path).value_or("");
   descriptor.components.push_back(cxx);
 
-  if (auto cc = find_tool(compiler_path.parent_path(), {"clang", "gcc"})) {
+  std::vector<std::string> cc_names;
+  if (!match->prefix.empty()) {
+    // Never fall back to the host `gcc`/`clang` for a prefixed cross driver: a C
+    // source compiled by the host compiler would silently produce a host object
+    // inside a cross build.
+    if (descriptor.family == "clang") {
+      cc_names.push_back(match->prefix + "-clang");
+    } else if (descriptor.family == "clang-cl") {
+      cc_names.push_back(match->prefix + "-clang-cl");
+    } else {
+      cc_names.push_back(match->prefix + "-gcc");
+    }
+  } else {
+    cc_names.push_back(descriptor.family == "clang" ? "clang" : "gcc");
+  }
+  if (auto cc = find_first(compiler_path.parent_path(), cc_names)) {
     ToolComponent component;
     component.role = "cc";
     component.path = fs::canonical_for_compare(*cc);
@@ -264,9 +409,10 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   }
 
   auto siblings = find_sibling_tools(compiler_path, descriptor.family);
-  for (auto [role, path] : std::vector<std::pair<std::string, stdfs::path>>{
-           {"linker", siblings.linker}, {"archiver", siblings.archiver},
-           {"objcopy", siblings.objcopy}}) {
+  for (auto [role, path] :
+       std::vector<std::pair<std::string, stdfs::path>>{{"linker", siblings.linker},
+                                                        {"archiver", siblings.archiver},
+                                                        {"objcopy", siblings.objcopy}}) {
     if (path.empty()) {
       continue;
     }
@@ -281,7 +427,15 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
     descriptor.resource_dir = *resource_dir;
   }
   if (auto default_sysroot = query_default_sysroot(compiler_path)) {
-    descriptor.default_sysroot = *default_sysroot;
+    if (fs::is_directory(*default_sysroot)) {
+      descriptor.default_sysroot = *default_sysroot;
+    }
+  }
+
+  // A prefixed cross GCC carries the target C runtime and libstdc++. A cross
+  // Clang is only self-contained when it was configured with a sysroot.
+  if (inferred && *inferred != host) {
+    descriptor.self_contained = descriptor.family == "gcc" || !descriptor.default_sysroot.empty();
   }
 
   descriptor.capabilities.c_compilation = true;
@@ -311,7 +465,7 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
   }
   if (options.include_managed) {
     if (auto dirs = fs::cova_dirs()) {
-      roots.push_back(dirs->toolchains);
+      roots.push_back(options.managed_root.empty() ? dirs->toolchains : options.managed_root);
     }
   }
 
@@ -328,16 +482,11 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
         continue;
       }
       const std::string name = basename_lower(it->path());
-      if (!is_compiler_driver(name)) {
+      const auto match = match_driver(name);
+      if (!match || !is_cxx_driver(*match)) {
         continue;
       }
-      // Prefer the C++ drivers; a bare `clang`/`gcc` is only used when no C++
-      // driver for the same family exists.
-      if (name == "clang" || name == "gcc" || name == "c++") {
-        continue;
-      }
-      const std::string canonical =
-          fs::generic_string(fs::canonical_for_compare(it->path()));
+      const std::string canonical = fs::generic_string(fs::canonical_for_compare(it->path()));
       if (!seen.insert(canonical).second) {
         continue;
       }
@@ -345,12 +494,38 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
       if (!descriptor) {
         continue;
       }
-      if (!options.families.empty() &&
-          std::find(options.families.begin(), options.families.end(), descriptor->family) ==
-              options.families.end()) {
+      if (!options.families.empty() && std::find(options.families.begin(), options.families.end(),
+                                                 descriptor->family) == options.families.end()) {
         continue;
       }
       descriptors.push_back(std::move(*descriptor));
+    }
+  }
+
+  // Managed toolchains live one directory deeper (`<root>/<id>/bin/<driver>`),
+  // so they need their own scan rather than the flat directory loop above.
+  if (options.include_managed) {
+    auto dirs = fs::cova_dirs();
+    const stdfs::path managed_root = options.managed_root.empty()
+                                         ? (dirs ? dirs->toolchains : stdfs::path{})
+                                         : options.managed_root;
+    if (!managed_root.empty()) {
+      auto managed = discover_managed(managed_root);
+      if (managed) {
+        for (auto& descriptor : *managed) {
+          const stdfs::path cxx = descriptor.component_path("cxx");
+          const std::string canonical = fs::generic_string(fs::canonical_for_compare(cxx));
+          if (!seen.insert(canonical).second) {
+            continue;
+          }
+          if (!options.families.empty() &&
+              std::find(options.families.begin(), options.families.end(), descriptor.family) ==
+                  options.families.end()) {
+            continue;
+          }
+          descriptors.push_back(std::move(descriptor));
+        }
+      }
     }
   }
 
@@ -359,13 +534,35 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
               if (a.family != b.family) {
                 return a.family < b.family;
               }
-              return b.version < a.version;
+              if (a.version != b.version) {
+                return b.version < a.version;
+              }
+              return a.id < b.id;
             });
-  return descriptors;
+  // Distribution aliases (`g++`, `c++`, `x86_64-pc-linux-gnu-g++`) point at the
+  // same binary. Listing all of them makes diagnostics noisy and lets ranking
+  // pick an arbitrary path; keep one descriptor per (family, version, target,
+  // content) identity.
+  std::set<std::string> identities;
+  std::vector<ToolchainDescriptor> unique;
+  for (auto& descriptor : descriptors) {
+    std::string key = descriptor.family + "|" + descriptor.version.to_string() + "|" +
+                      std::string(to_string(descriptor.source)) + "|";
+    std::vector<std::string> targets = descriptor.supported_targets;
+    std::sort(targets.begin(), targets.end());
+    key += str::join(targets, ",");
+    const auto* cxx = descriptor.component("cxx");
+    if (cxx != nullptr) {
+      key += "|" + cxx->sha256;
+    }
+    if (identities.insert(key).second) {
+      unique.push_back(std::move(descriptor));
+    }
+  }
+  return unique;
 }
 
-Result<std::vector<ToolchainDescriptor>> discover_managed(
-    const stdfs::path& toolchains_root) {
+Result<std::vector<ToolchainDescriptor>> discover_managed(const stdfs::path& toolchains_root) {
   std::vector<ToolchainDescriptor> out;
   for (const auto& path : managed_compiler_candidates(toolchains_root)) {
     auto descriptor = describe_compiler(path, ToolchainSource::Managed);
@@ -377,4 +574,4 @@ Result<std::vector<ToolchainDescriptor>> discover_managed(
   return out;
 }
 
-}  // namespace cova::toolchain
+} // namespace cova::toolchain

@@ -166,6 +166,7 @@ std::string ToolchainDescriptor::compute_fingerprint() const {
   }
   fingerprint.add(fs::generic_string(resource_dir));
   fingerprint.add(fs::generic_string(default_sysroot));
+  fingerprint.add(self_contained ? "self-contained" : "needs-sysroot");
   fingerprint.add(platform::to_string(crt));
   fingerprint.add(platform::to_string(libcpp));
   fingerprint.add(platform::to_string(abi));
@@ -194,6 +195,7 @@ std::string ResolvedToolchain::fingerprint_input() const {
   fingerprint.add(abi_signature.fingerprint_key());
   fingerprint.add(sysroot_id);
   fingerprint.add(fs::generic_string(sysroot_path));
+  fingerprint.add(sysroot_fingerprint);
   return fingerprint.finish_hex();
 }
 
