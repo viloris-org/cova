@@ -26,6 +26,19 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+std::string project_label(const LoadedProject& project) {
+  if (!project.manifest.package.name.empty()) {
+    return project.manifest.package.name;
+  }
+  if (project.workspace) {
+    const std::string name = project.workspace->root_dir.filename().string();
+    if (!name.empty()) {
+      return name;
+    }
+  }
+  return "workspace";
+}
+
 // A fully prepared build: everything resolved and planned, nothing executed.
 struct PreparedBuild {
   LoadedProject project;
@@ -220,27 +233,65 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
   (void)printed_progress;
 
-  // Persist incremental state for successful actions.
+  // Persist incremental state for every action whose outputs are current,
+  // including ones skipped by this run. Successful compiles additionally record
+  // the headers discovered through their depfile so the next build can detect a
+  // header change without recompiling once just to learn the dependencies.
   for (const auto& outcome : result->outcomes) {
-    if (!outcome.succeeded || outcome.skipped) {
+    if (!outcome.succeeded) {
       continue;
     }
     const build::Action* action = prepared.plan.graph.find(outcome.id);
     if (action == nullptr) {
       continue;
     }
+    build::Action key_action = *action;
     build::ActionRecord record;
-    record.cache_key = action->cache_key(env);
+    auto add_input = [&](const fs::Path& input) {
+      const std::string path = fs::generic_string(input);
+      for (const auto& [existing, digest] : record.input_hashes) {
+        (void)digest;
+        if (existing == path) {
+          return;
+        }
+      }
+      record.input_paths.push_back(path);
+      auto digest = build::FileHasher{}.hash_file(input);
+      if (digest) {
+        record.input_hashes.emplace_back(path, cova::to_hex(*digest));
+      }
+    };
     for (const auto& output : action->outputs) {
       record.output_paths.push_back(fs::generic_string(output.path));
     }
     for (const auto& input : action->inputs) {
-      record.input_paths.push_back(fs::generic_string(input.path));
-      auto digest = build::FileHasher{}.hash_file(input.path);
-      if (digest) {
-        record.input_hashes.emplace_back(fs::generic_string(input.path), *digest);
+      add_input(input.path);
+    }
+    if (action->kind == build::ActionKind::Compile && !action->outputs.empty()) {
+      fs::Path depfile = action->outputs.front().path;
+      depfile += ".d";
+      auto parsed = build::Depfile::load(depfile, prepared.project.layout.root);
+      if (parsed) {
+        for (const auto& header : parsed->dependencies) {
+          if (!fs::is_regular_file(header)) {
+            continue;
+          }
+          add_input(header);
+          bool already_an_input = false;
+          for (const auto& input : key_action.inputs) {
+            if (fs::canonical_for_compare(input.path) ==
+                fs::canonical_for_compare(header)) {
+              already_an_input = true;
+              break;
+            }
+          }
+          if (!already_an_input) {
+            key_action.inputs.push_back(build::FileInput{header, "header"});
+          }
+        }
       }
     }
+    record.cache_key = key_action.cache_key(env);
     record.toolchain_fingerprint = env.toolchain_fingerprint;
     record.sysroot_fingerprint = env.sysroot_fingerprint;
     record.completed_at_ns = static_cast<std::uint64_t>(
@@ -287,7 +338,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
 
   if (!ctx.global.quiet) {
     const std::string verb = result->executed == 0 ? "Finished" : "Built";
-    std::string line = verb + " `" + prepared.project.manifest.package.name + "` in " +
+    std::string line = verb + " `" + project_label(prepared.project) + "` in " +
                        format_duration(elapsed);
     if (result->skipped > 0) {
       line += " (" + std::to_string(result->skipped) + " up to date)";
@@ -456,7 +507,7 @@ int cmd_check(CommandContext& ctx) {
     return report_diagnostics(result->diagnostics, ctx);
   }
   if (!ctx.global.quiet) {
-    ctx.ui->info("Checked `" + prepared.project.manifest.package.name + "`");
+    ctx.ui->info("Checked `" + project_label(prepared.project) + "`");
   }
   return 0;
 }
@@ -483,12 +534,16 @@ int cmd_run(CommandContext& ctx) {
     return report_error(invocation.error(), ctx);
   }
 
+  // In an interactive terminal the program should own the terminal streams.
+  // In tests and pipelines Cova captures and relays the output so callers can
+  // assert on it; the process still receives our stdin.
+  const bool interactive = ctx.ui->interactive();
   proc::ProcessSpec spec;
   spec.program = invocation->first;
   spec.args = invocation->second;
   spec.cwd = prepared.project.layout.root;
-  spec.inherit_stdout = true;
-  spec.inherit_stderr = true;
+  spec.inherit_stdout = interactive;
+  spec.inherit_stderr = interactive;
   spec.inherit_stdin = true;
 
   if (!ctx.global.quiet) {
@@ -497,6 +552,14 @@ int cmd_run(CommandContext& ctx) {
   auto result = proc::run(spec);
   if (!result) {
     return report_error(result.error(), ctx);
+  }
+  if (!interactive) {
+    if (!result->stdout_text.empty()) {
+      ctx.ui->out(result->stdout_text);
+    }
+    if (!result->stderr_text.empty()) {
+      ctx.ui->error(result->stderr_text);
+    }
   }
   if (result->timed_out) {
     return report_error(Error::make("cova::run::timeout", "the program timed out"), ctx);
@@ -513,7 +576,7 @@ int cmd_test(CommandContext& ctx) {
     return *early;
   }
   if (prepared.plan.test_binaries.empty() && prepared.plan.graph.empty()) {
-    ctx.ui->info("no tests declared for `" + prepared.project.manifest.package.name + "`");
+    ctx.ui->info("no tests declared for `" + project_label(prepared.project) + "`");
     return 0;
   }
   const int build_code = execute_build(ctx, prepared, /*dry_run=*/false);

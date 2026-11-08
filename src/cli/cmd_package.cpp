@@ -32,8 +32,7 @@ int report_milestone_gap(CommandContext& ctx, std::string_view command,
   diagnostic.line("local `path` dependencies in [dependencies] are declared but not yet "
                   "consumed by the build graph.");
   engine.emit(std::move(diagnostic));
-  engine.render(std::cout, ctx.global.use_color(stdout_is_tty()));
-  return 1;
+  return report_diagnostics(engine, ctx);
 }
 
 // Renders `cova tree` for declared dependencies without resolving them.

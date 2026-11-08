@@ -491,18 +491,17 @@ ParseResult parse(int argc, const char* const* argv) {
   if (!result.error.empty()) {
     return result;
   }
-  if (inv.global.help) {
-    result.handled = true;
-    return result;
-  }
-  if (!inv.global.version_flag.empty()) {
-    result.handled = true;
-    return result;
-  }
 
-  // Resolve the command from the leading positionals.
+  // Resolve the command from the leading positionals. Help and version still
+  // resolve a subcommand when one was named, so `cova build --help` renders the
+  // build help rather than the top-level help.
   if (positionals.empty()) {
-    result.error = "error: a command is required (run `cova --help`)";
+    if (inv.global.help || !inv.global.version_flag.empty()) {
+      result.handled = true;
+      return result;
+    }
+    inv.global.help = true;
+    result.handled = true;
     return result;
   }
   std::string_view first = positionals[0];
@@ -566,6 +565,9 @@ ParseResult parse(int argc, const char* const* argv) {
     result.error = "error: `cova " + std::string(to_string(inv.command)) +
                    "` does not accept arguments after `--`";
     return result;
+  }
+  if (inv.global.help || !inv.global.version_flag.empty()) {
+    result.handled = true;
   }
   return result;
 }

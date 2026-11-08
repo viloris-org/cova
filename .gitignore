@@ -1,8 +1,8 @@
 # Build output
-build/
-.dir/
-out/
-artifacts/
+/build/
+/.dir/
+/out/
+/artifacts/
 
 # Compiled objects and libraries
 *.o
@@ -38,3 +38,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Cova self-hosting artifacts
+/target/
+/cova-toolchain.lock
+/cova.lock

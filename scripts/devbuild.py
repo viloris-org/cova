@@ -183,6 +183,10 @@ def discover_tests() -> dict[str, Path]:
 
 def test_module_of(name: str) -> str:
     base = name[: -len("_test")] if name.endswith("_test") else name
+    # The end-to-end tests live under tests/integration but their filename
+    # prefix does not contain "integration"; link them with the whole tree.
+    if base.startswith("e2e_") or base.startswith("integration_"):
+        return "integration"
     for module in _TEST_MODULE_ORDER:
         if base == module or base.startswith(module + "_"):
             return module
@@ -224,7 +228,7 @@ def render() -> str:
     app_libs = built_modules(closing_link_order(DEPS["app"] + ["app"]))
     libs = " ".join(f"lib/libcova_{m}.a" for m in app_libs)
     lines.append("# --- cova binary\n")
-    lines.append("build bin/cova: link_exe lib/libcova_app.a\n")
+    lines.append("build bin/cova: link_exe " + libs + "\n")
     lines.append("  ldflags = -pthread\n")
     lines.append(f"  libs = {libs}\n")
 
@@ -238,7 +242,7 @@ def render() -> str:
         target = f"bin/{name}"
         test_targets.append(target)
         lines.append(f"# --- test {name} (module {module})\n")
-        lines.append(f"build {target}: link_exe {src}\n")
+        lines.append(f"build {target}: link_exe {src} {libs}\n")
         lines.append(f"  ldflags = -pthread\n")
         lines.append(f"  libs = {libs}\n")
 

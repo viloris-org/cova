@@ -140,8 +140,7 @@ int cmd_toolchain(CommandContext& ctx) {
                       .line("Cova will not simulate a download or claim an install it did not "
                             "verify (PRD §18.1)")
                       .line("use a system toolchain, or point --toolchain at an installed one"));
-      engine.render(std::cout, ctx.global.use_color(stdout_is_tty()));
-      return 1;
+      return report_diagnostics(engine, ctx);
     }
     case CommandId::ToolchainRemove: {
       if (ctx.positionals().empty()) {
@@ -281,10 +280,7 @@ int cmd_sysroot(CommandContext& ctx) {
       }
       auto installed = manager.install_file(*target, name, archive);
       if (!installed) {
-        DiagnosticEngine engine;
-        engine.emit(diagnostic_from_error(installed.error()));
-        engine.render(std::cout, ctx.global.use_color(stdout_is_tty()));
-        return 1;
+        return report_error(installed.error(), ctx);
       }
       ctx.ui->info("installed sysroot `" + installed->manifest.name + "` at " +
                    fs::generic_string(installed->root));

@@ -253,7 +253,15 @@ int cmd_clean(CommandContext& ctx) {
     }
     // The allowed root is the project's target directory: cleaning can never
     // reach into ~/.cova or the source tree (PRD §12.4).
-    auto removed = fs::remove_tree(path, target_dir);
+    // The allowed root is the project root, so cleaning may remove the whole
+    // target directory (but never anything outside it). The per-path check
+    // below keeps the operation scoped to `target/`.
+    if (!fs::is_within(path, target_dir)) {
+      return report_error(Error::make("cova::clean::outside_target",
+                                      "refusing to clean a path outside target/"),
+                          ctx);
+    }
+    auto removed = fs::remove_tree(path, project->layout.root);
     if (!removed) {
       return report_error(removed.error(), ctx);
     }
@@ -338,8 +346,16 @@ int cmd_graph(CommandContext& ctx) {
 
 int cmd_explain(CommandContext& ctx) {
   auto project = load_project(ctx);
+  std::optional<LoadedProject> standalone;
   if (!project) {
-    return report_error(project.error(), ctx);
+    // `cova toolchain explain` is a toolchain-management command and must work
+    // outside a project. Explain the host environment with default settings.
+    LoadedProject fallback;
+    fallback.layout = layout_for(ctx.cwd);
+    fallback.manifest = manifest::default_manifest("cova", manifest::PackageKind::Executable);
+    fallback.manifest.root = ctx.cwd;
+    standalone = std::move(fallback);
+    project = *standalone;
   }
   auto target = resolve_target_from(ctx, *project);
   if (!target) {
@@ -418,8 +434,7 @@ int cmd_explain(CommandContext& ctx) {
   }
   DiagnosticEngine engine;
   engine.emit(report.failure);
-  engine.render(std::cerr, false);
-  return 1;
+  return report_diagnostics(engine, ctx);
 }
 
 int cmd_metadata(CommandContext& ctx) {

@@ -14,6 +14,7 @@
 #include "core/hashing/hash.hpp"
 #include "core/version/version.hpp"
 #include "platform/abi/abi.hpp"
+#include "platform/constraints/constraints.hpp"
 #include "platform/triple/triple.hpp"
 
 namespace cova::toolchain {

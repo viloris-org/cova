@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace cova::test {
@@ -183,24 +184,27 @@ class ScopedEnv {
 
 // Fails the test unless `result` holds a value; returns that value.
 #define COVA_REQUIRE_OK(result)                                                   \
-  ([&]() -> decltype(auto) {                                                      \
+  ([&]() {                                                                        \
     auto cova_result_ = (result);                                                 \
     if (!cova_result_) {                                                          \
       COVA_FAIL_AT("expected success, got error: " +                              \
                        ::cova::test::format_value(cova_result_.error().to_string()),\
                    #result);                                                      \
     }                                                                             \
-    return std::move(*cova_result_);                                              \
+    using CovaRequireValue =                                                      \
+        std::remove_reference_t<decltype(*cova_result_)>;                         \
+    return CovaRequireValue(std::move(*cova_result_));                            \
   }())
 
 // Fails the test unless `result` holds an error; returns that error.
 #define COVA_REQUIRE_ERR(result)                                                  \
-  ([&]() -> decltype(auto) {                                                      \
+  ([&]() {                                                                        \
     auto cova_result_ = (result);                                                 \
     if (cova_result_) {                                                           \
       COVA_FAIL_AT("expected an error but the operation succeeded", #result);     \
     }                                                                             \
-    return cova_result_.error();                                                  \
+    using CovaRequireError = std::remove_reference_t<decltype(cova_result_.error())>;\
+    return CovaRequireError(cova_result_.error());                                \
   }())
 
 // Runs the in-tree test runner.
