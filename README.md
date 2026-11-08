@@ -68,10 +68,10 @@ What deliberately does **not** work yet, by design:
   planner does not emit scans rather than pretending.
 - **No remote execution.** `--runner remote` is rejected explicitly.
 
-## Building Cova
+## Building from source
 
-Cova has no third-party dependencies. Bootstrapping needs a C++26-capable
-compiler (Clang ≥ 17 or GCC ≥ 14), Ninja and Python 3.
+Cova has no third-party dependencies. Building from source requires a
+C++26-capable compiler (Clang ≥ 17 or GCC ≥ 14), Ninja and Python 3.
 
 ```bash
 ./bootstrap/build.sh              # build ./build/bootstrap/bin/cova
