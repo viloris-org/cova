@@ -3,6 +3,7 @@ name = "cova"
 version = "0.1.0"
 edition = "c++26"
 description = "Cova build system, package manager and toolchain manager"
+license = "Apache-2.0"
 
 [build]
 type = "executable"
