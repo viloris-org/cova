@@ -25,9 +25,6 @@ namespace cova::json {
 Value::Value() : storage_(nullptr) {}
 Value::Value(std::nullptr_t) : storage_(nullptr) {}
 Value::Value(bool v) : storage_(v) {}
-Value::Value(int v) : storage_(static_cast<std::int64_t>(v)) {}
-Value::Value(std::int64_t v) : storage_(v) {}
-Value::Value(std::size_t v) : storage_(static_cast<std::int64_t>(v)) {}
 Value::Value(double v) : storage_(v) {}
 Value::Value(const char* v) : storage_(std::string(v == nullptr ? "" : v)) {}
 Value::Value(std::string v) : storage_(std::move(v)) {}

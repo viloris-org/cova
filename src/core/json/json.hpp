@@ -4,6 +4,7 @@
 // --format json` and machine-readable fmt output all use this writer.
 #pragma once
 
+#include <concepts>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -29,9 +30,13 @@ class Value {
   Value();  // null
   Value(std::nullptr_t);
   Value(bool v);
-  Value(int v);
-  Value(std::int64_t v);
-  Value(std::size_t v);
+  // Every integer type, so a caller never has to know whether `uint64_t` is
+  // `unsigned long` or `unsigned long long` on this platform. Keeping separate
+  // int/int64_t/size_t overloads made `uint64_t` ambiguous on macOS, where it
+  // is a distinct type from `size_t`.
+  template <typename T>
+    requires(std::integral<T> && !std::same_as<std::remove_cv_t<T>, bool>)
+  Value(T v) : storage_(static_cast<std::int64_t>(v)) {}
   Value(double v);
   Value(const char* v);
   Value(std::string v);
