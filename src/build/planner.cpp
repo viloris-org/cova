@@ -11,6 +11,7 @@
 
 #include "build/cache/cache.hpp"
 #include "core/filesystem/filesystem.hpp"
+#include "core/json/json.hpp"
 
 namespace cova::build {
 namespace {
@@ -250,7 +251,11 @@ ActionId add_compile_action(BuildGraph& graph, const manifest::Manifest& manifes
     object_name = object_name.substr(0, object_name.size() - extension.size());
   }
   object_name += toolchain.target.object_suffix();
-  object_out = fs::Path(output_root) / "obj" / object_name;
+  fs::Path object_directory = fs::Path(output_root) / "obj";
+  if (!options.object_namespace.empty()) {
+    object_directory /= options.object_namespace;
+  }
+  object_out = object_directory / object_name;
   const fs::Path depfile = fs::Path(object_out.string() + ".d");
 
   const auto* override = target_override_for(manifest, options.target);
@@ -262,7 +267,9 @@ ActionId add_compile_action(BuildGraph& graph, const manifest::Manifest& manifes
   argv.push_back("-MF");
   argv.push_back(fs::generic_string(depfile));
   append(argv, make_includes(manifest));
+  append(argv, options.dependency_include_flags);
   append(argv, make_definitions(manifest, override));
+  append(argv, options.dependency_definition_flags);
   const auto& profile = manifest.profile(options.profile);
   append(argv, profile.cxx_flags());
   append(argv, manifest.build.compile_options);
@@ -381,6 +388,9 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       for (const auto& object : objects) {
         argv.push_back(fs::generic_string(object));
       }
+      for (const auto& artifact : options.dependency_artifacts) {
+        argv.push_back(artifact);
+      }
       argv.push_back("-o");
       argv.push_back(fs::generic_string(final_output));
       if (override != nullptr) {
@@ -408,6 +418,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
     action.outputs.push_back(FileOutput{final_output, true});
     final_action = result.graph.add(std::move(action));
   }
+  result.final_action = final_action;
 
   result.expected_outputs.push_back(final_output);
   if (manifest.build.kind == manifest::PackageKind::Executable) {
@@ -466,6 +477,9 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
         }
         argv.push_back(fs::generic_string(object));
       }
+      for (const auto& artifact : options.dependency_artifacts) {
+        argv.push_back(artifact);
+      }
       argv.push_back("-o");
       argv.push_back(fs::generic_string(binary));
       if (override != nullptr) {
@@ -499,8 +513,6 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
   if (!result.test_binaries.empty() && result.expected_outputs.empty()) {
     result.expected_outputs = result.test_binaries;
   }
-  // Keep final_action referenced for clarity of the graph contract.
-  (void)final_action;
   (void)result.runnable_binary;
   return result;
 }
@@ -509,22 +521,230 @@ Result<PlanResult> plan_workspace(const WorkspaceProject& project,
                                   const toolchain::ResolvedToolchain& toolchain,
                                   const PlanOptions& options, const Path& target_dir) {
   PlanResult combined;
-  std::map<std::string, Result<PlanResult>, std::less<>> per_member;
-  for (const auto& member : project.members) {
-    per_member.emplace(member.package.name,
-                       plan_package(member, toolchain, options, target_dir));
+  if (project.members.empty()) {
+    combined.notes.push_back("the workspace has no buildable members");
+    return combined;
   }
 
-  std::map<std::string, std::pair<ActionId, std::string>, std::less<>> final_actions;
-  // Add each member's actions with an explicit id remap.
-  combined = PlanResult{};
-  final_actions.clear();
+  std::map<std::string, const manifest::Manifest*, std::less<>> by_name;
   for (const auto& member : project.members) {
-    auto it = per_member.find(member.package.name);
-    if (it == per_member.end() || !it->second) {
+    if (member.package.name.empty()) {
+      return fail<PlanResult>(Error::make(
+          "cova::build::package_name", "a package in the build set has no `package.name`"));
+    }
+    if (!by_name.emplace(member.package.name, &member).second) {
+      return fail<PlanResult>(Error::make(
+          "cova::build::duplicate_package",
+          "two packages named `" + member.package.name + "` are in the build set"));
+    }
+  }
+
+  std::set<std::string, std::less<>> roots;
+  if (project.roots.empty()) {
+    for (const auto& [name, manifest] : by_name) {
+      (void)manifest;
+      roots.insert(name);
+    }
+  } else {
+    for (const auto& name : project.roots) {
+      if (!by_name.contains(name)) {
+        return fail<PlanResult>(Error::make("cova::build::unknown_package",
+                                            "no package named `" + name +
+                                                "` is in the build set"));
+      }
+      roots.insert(name);
+    }
+  }
+
+  // Direct dependency edges, resolved to package names. An unresolvable
+  // declaration is reported by the dependency resolver before planning; here it
+  // simply contributes no edge.
+  std::map<std::string, std::vector<std::string>, std::less<>> direct;
+  for (const auto& [name, manifest] : by_name) {
+    std::vector<std::string> dependencies;
+    for (const auto* spec : manifest->target_dependencies(options.target)) {
+      if (spec->dev && !options.include_tests) {
+        continue;
+      }
+      std::optional<std::string> resolved;
+      if (spec->path) {
+        const std::string wanted = fs::generic_string(fs::absolute_normalized(*spec->path));
+        for (const auto& [candidate_name, candidate] : by_name) {
+          if (fs::generic_string(fs::absolute_normalized(candidate->root)) == wanted) {
+            resolved = candidate_name;
+            break;
+          }
+        }
+      }
+      if (!resolved && by_name.contains(spec->name)) {
+        resolved = spec->name;
+      }
+      if (resolved && *resolved != name) {
+        dependencies.push_back(*resolved);
+      }
+    }
+    std::sort(dependencies.begin(), dependencies.end());
+    dependencies.erase(std::unique(dependencies.begin(), dependencies.end()), dependencies.end());
+    direct[name] = std::move(dependencies);
+  }
+
+  // Transitively reachable packages and the closure each package needs.
+  // The traversal doubles as cycle detection: a clear error beats a planner that
+  // silently drops an edge.
+  std::map<std::string, int, std::less<>> state;  // 0 unvisited, 1 visiting, 2 done
+  std::vector<std::string> stack;
+  std::vector<std::string> order;
+  std::map<std::string, std::vector<std::string>, std::less<>> transitive;
+  std::function<Status(const std::string&)> visit = [&](const std::string& name) -> Status {
+    int& current = state[name];
+    if (current == 2) {
+      return ok();
+    }
+    if (current == 1) {
+      std::string chain;
+      auto start = std::find(stack.begin(), stack.end(), name);
+      for (auto it = start; it != stack.end(); ++it) {
+        chain += *it;
+        chain += " -> ";
+      }
+      chain += name;
+      return fail(Error::make("cova::build::dependency_cycle",
+                              "dependency cycle detected: " + chain)
+                      .with("packages must form a directed acyclic graph"));
+    }
+    current = 1;
+    stack.push_back(name);
+    std::vector<std::string> collected;
+    auto edge = direct.find(name);
+    if (edge != direct.end()) {
+      for (const auto& dependency : edge->second) {
+        auto status = visit(dependency);
+        if (!status) {
+          return status;
+        }
+        auto nested = transitive.find(dependency);
+        if (nested != transitive.end()) {
+          collected.insert(collected.end(), nested->second.begin(), nested->second.end());
+        }
+        collected.push_back(dependency);
+      }
+    }
+    std::vector<std::string> unique;
+    std::set<std::string, std::less<>> seen;
+    for (const auto& name_of_dependency : collected) {
+      if (seen.insert(name_of_dependency).second) {
+        unique.push_back(name_of_dependency);
+      }
+    }
+    transitive[name] = std::move(unique);
+    stack.pop_back();
+    current = 2;
+    order.push_back(name);
+    return ok();
+  };
+
+  for (const auto& [name, manifest] : by_name) {
+    (void)manifest;
+    auto status = visit(name);
+    if (!status) {
+      return fail<PlanResult>(status.error());
+    }
+  }
+
+  // Only packages reachable from a selected root are built.
+  std::set<std::string, std::less<>> reachable;
+  std::vector<std::string> pending(roots.begin(), roots.end());
+  while (!pending.empty()) {
+    const std::string name = pending.back();
+    pending.pop_back();
+    if (!reachable.insert(name).second) {
       continue;
     }
-    const auto& plan = *it->second;
+    auto edge = direct.find(name);
+    if (edge != direct.end()) {
+      for (const auto& dependency : edge->second) {
+        pending.push_back(dependency);
+      }
+    }
+  }
+
+  // Plan dependency-first so a package's link line can name the exact artifacts
+  // its dependencies produced.
+  std::map<std::string, PlanResult, std::less<>> plans;
+  for (const auto& name : order) {
+    if (!reachable.contains(name)) {
+      continue;
+    }
+    auto manifest_it = by_name.find(name);
+    if (manifest_it == by_name.end()) {
+      continue;
+    }
+    const manifest::Manifest& manifest = *manifest_it->second;
+
+    PlanOptions member_options = options;
+    member_options.object_namespace = name;
+    member_options.include_tests = options.include_tests && roots.contains(name);
+    std::set<std::string, std::less<>> seen_flags;
+    std::set<std::string, std::less<>> seen_artifacts;
+    auto closure = transitive.find(name);
+    if (closure != transitive.end()) {
+      for (const auto& dependency_name : closure->second) {
+        auto dependency_it = by_name.find(dependency_name);
+        if (dependency_it == by_name.end()) {
+          continue;
+        }
+        const manifest::Manifest& dependency = *dependency_it->second;
+        for (const auto& directory : dependency.build.public_includes) {
+          const std::string flag = "-I" + fs::generic_string(dependency.root / directory);
+          if (seen_flags.insert(flag).second) {
+            member_options.dependency_include_flags.push_back(flag);
+          }
+        }
+        for (const auto& definition : dependency.build.public_definitions) {
+          const std::string flag = "-D" + definition;
+          if (seen_flags.insert(flag).second) {
+            member_options.dependency_definition_flags.push_back(flag);
+          }
+        }
+      }
+      // Static linkers resolve left to right, so a dependent library must be
+      // named before the libraries it needs: reverse of the dependency-first
+      // closure.
+      for (auto it = closure->second.rbegin(); it != closure->second.rend(); ++it) {
+        auto dependency_it = by_name.find(*it);
+        if (dependency_it == by_name.end() ||
+            dependency_it->second->build.kind == manifest::PackageKind::Executable) {
+          continue;
+        }
+        auto planned = plans.find(*it);
+        if (planned != plans.end() && !planned->second.expected_outputs.empty()) {
+          const std::string artifact =
+              fs::generic_string(planned->second.expected_outputs.front());
+          if (seen_artifacts.insert(artifact).second) {
+            member_options.dependency_artifacts.push_back(artifact);
+          }
+        }
+      }
+    }
+
+    auto plan = plan_package(manifest, toolchain, member_options, target_dir);
+    if (!plan) {
+      return fail<PlanResult>(plan.error());
+    }
+    plans.emplace(name, std::move(*plan));
+  }
+
+  // Merge the per-package graphs with explicit id remapping.
+  std::map<std::string, ActionId, std::less<>> final_actions;
+  for (const auto& name : order) {
+    if (!reachable.contains(name)) {
+      continue;
+    }
+    auto plan_it = plans.find(name);
+    if (plan_it == plans.end()) {
+      continue;
+    }
+    const PlanResult& plan = plan_it->second;
     std::map<std::uint64_t, ActionId> local;
     for (const auto* action : plan.graph.actions_in_order()) {
       Action clone = *action;
@@ -538,155 +758,75 @@ Result<PlanResult> plan_workspace(const WorkspaceProject& project,
       const ActionId id = combined.graph.add(std::move(clone));
       local[action->id.value] = id;
     }
-    if (!plan.expected_outputs.empty()) {
-      combined.expected_outputs.push_back(plan.expected_outputs.front());
-    }
-    if (plan.runnable_binary) {
-      if (!combined.runnable_binary) {
-        combined.runnable_binary = plan.runnable_binary;
+    if (plan.final_action) {
+      auto mapped = local.find(plan.final_action->value);
+      if (mapped != local.end()) {
+        final_actions[name] = mapped->second;
       }
     }
-    combined.test_binaries.insert(combined.test_binaries.end(), plan.test_binaries.begin(),
-                                  plan.test_binaries.end());
     for (const auto& note : plan.notes) {
-      combined.notes.push_back(member.package.name + ": " + note);
-    }
-    // Remember the member's final action so intra-workspace dependencies can be
-    // wired after all members are present.
-    if (!combined.graph.actions().empty()) {
-      const auto& last = combined.graph.actions().back();
-      final_actions[member.package.name] = {last.id, member.package.name};
+      combined.notes.push_back(name + ": " + note);
     }
   }
 
-  // Wire member dependencies: a dependency on another member contributes build
-  // order, public include directories and the dependency's final artifact.
-  std::map<std::string, const manifest::Manifest*, std::less<>> manifests;
-  for (const auto& member : project.members) {
-    manifests[member.package.name] = &member;
-  }
-
-  auto member_for_dependency = [&](const manifest::DependencySpec& dependency)
-      -> std::optional<std::string> {
-    if (dependency.path) {
-      for (const auto& member : project.members) {
-        if (fs::absolute_normalized(member.root) == fs::absolute_normalized(*dependency.path)) {
-          return member.package.name;
-        }
-      }
-    }
-    if (manifests.contains(dependency.name)) {
-      return dependency.name;
-    }
-    return std::nullopt;
-  };
-
-  auto collect_archives = [&](const std::string& root_name) {
-    std::vector<std::string> archives;
-    std::set<std::string> seen;
-    std::function<void(const std::string&)> visit = [&](const std::string& name) {
-      if (!seen.insert(name).second) {
-        return;
-      }
-      auto manifest_it = manifests.find(name);
-      if (manifest_it == manifests.end()) {
-        return;
-      }
-      for (const auto& dependency : manifest_it->second->dependencies) {
-        auto target = member_for_dependency(dependency);
-        if (target && *target != root_name) {
-          visit(*target);
-        }
-      }
-      if (name == root_name) {
-        return;
-      }
-      if (manifest_it->second->build.kind == manifest::PackageKind::Executable) {
-        return;
-      }
-      auto plan_it = per_member.find(name);
-      if (plan_it != per_member.end() && plan_it->second &&
-          !plan_it->second->expected_outputs.empty()) {
-        const std::string output = fs::generic_string(plan_it->second->expected_outputs.front());
-        if (std::find(archives.begin(), archives.end(), output) == archives.end()) {
-          archives.push_back(output);
-        }
-      }
-    };
-    visit(root_name);
-    return archives;
-  };
-
-  for (const auto& member : project.members) {
-    auto member_it = final_actions.find(member.package.name);
-    if (member_it == final_actions.end()) {
+  // Every link (including test links) needs its package's direct dependencies
+  // built first. Archive actions get the same edge for a deterministic order.
+  for (const auto& name : order) {
+    if (!reachable.contains(name)) {
       continue;
     }
-    std::vector<std::string> include_flags;
-    std::vector<std::string> definition_flags;
-    std::set<std::string> seen_flags;
-    for (const auto& dependency : member.dependencies) {
-      auto target = member_for_dependency(dependency);
-      if (!target) {
-        continue;
-      }
-      auto dependency_manifest = manifests.find(*target);
-      if (dependency_manifest != manifests.end()) {
-        for (const auto& directory : dependency_manifest->second->build.public_includes) {
-          const std::string flag = "-I" + fs::generic_string(dependency_manifest->second->root /
-                                                             directory);
-          if (seen_flags.insert(flag).second) {
-            include_flags.push_back(flag);
-          }
-        }
-        for (const auto& definition : dependency_manifest->second->build.public_definitions) {
-          const std::string flag = "-D" + definition;
-          if (seen_flags.insert(flag).second) {
-            definition_flags.push_back(flag);
-          }
-        }
-      }
-      auto dependency_it = final_actions.find(*target);
-      if (dependency_it != final_actions.end()) {
-        for (auto* action : [&] {
-               std::vector<Action*> links;
-               for (auto& candidate : combined.graph.actions()) {
-                 if (candidate.package == member.package.name &&
-                     candidate.kind == ActionKind::Link) {
-                   links.push_back(&candidate);
-                 }
-               }
-               return links;
-             }()) {
-          action->dependencies.push_back(dependency_it->second.first);
-        }
-      }
-      combined.notes.push_back(member.package.name + " depends on " + *target);
+    auto edge = direct.find(name);
+    if (edge == direct.end()) {
+      continue;
     }
-
-    // Apply the dependency interface to every compile action of the member.
+    std::vector<ActionId> dependency_actions;
+    for (const auto& dependency : edge->second) {
+      auto mapped = final_actions.find(dependency);
+      if (mapped != final_actions.end()) {
+        dependency_actions.push_back(mapped->second);
+      }
+    }
+    if (dependency_actions.empty()) {
+      continue;
+    }
     for (auto& action : combined.graph.actions()) {
-      if (action.package != member.package.name || action.kind != ActionKind::Compile) {
+      if (action.package != name) {
         continue;
       }
-      for (const auto& flag : include_flags) {
-        action.argv.insert(action.argv.end() - 4, flag);
+      if (action.kind != ActionKind::Link && action.kind != ActionKind::Archive) {
+        continue;
       }
-      for (const auto& flag : definition_flags) {
-        action.argv.insert(action.argv.end() - 4, flag);
+      std::set<std::uint64_t> existing;
+      for (const auto& dependency : action.dependencies) {
+        existing.insert(dependency.value);
+      }
+      for (const auto& dependency : dependency_actions) {
+        if (existing.insert(dependency.value).second) {
+          action.dependencies.push_back(dependency);
+        }
       }
     }
+  }
 
-    // Attach dependency archives to link actions of the member.
-    const auto archives = collect_archives(member.package.name);
-    for (auto& action : combined.graph.actions()) {
-      if (action.package != member.package.name || action.kind != ActionKind::Link) {
-        continue;
-      }
-      auto output = std::find(action.argv.begin(), action.argv.end(), "-o");
-      const auto position = output == action.argv.end() ? action.argv.end() : output;
-      action.argv.insert(position, archives.begin(), archives.end());
+  // Only the requested roots contribute reported artifacts and runnable/test
+  // programs; dependencies exist to serve them.
+  for (const auto& name : order) {
+    if (!reachable.contains(name) || !roots.contains(name)) {
+      continue;
     }
+    auto plan_it = plans.find(name);
+    if (plan_it == plans.end()) {
+      continue;
+    }
+    for (const auto& output : plan_it->second.expected_outputs) {
+      combined.expected_outputs.push_back(output);
+    }
+    if (!combined.runnable_binary && plan_it->second.runnable_binary) {
+      combined.runnable_binary = plan_it->second.runnable_binary;
+    }
+    combined.test_binaries.insert(combined.test_binaries.end(),
+                                  plan_it->second.test_binaries.begin(),
+                                  plan_it->second.test_binaries.end());
   }
 
   if (combined.graph.empty()) {
@@ -697,6 +837,42 @@ Result<PlanResult> plan_workspace(const WorkspaceProject& project,
       std::unique(combined.expected_outputs.begin(), combined.expected_outputs.end()),
       combined.expected_outputs.end());
   return combined;
+}
+
+std::string compile_commands_json(const PlanResult& plan) {
+  std::vector<const Action*> compiles;
+  for (const auto* action : plan.graph.actions_in_order()) {
+    if (action->kind == ActionKind::Compile) {
+      compiles.push_back(action);
+    }
+  }
+  auto source_of = [](const Action& action) -> std::string {
+    for (const auto& input : action.inputs) {
+      if (input.role == "source") {
+        return fs::generic_string(input.path);
+      }
+    }
+    return action.inputs.empty() ? std::string() : fs::generic_string(action.inputs.front().path);
+  };
+  std::sort(compiles.begin(), compiles.end(),
+            [&](const Action* a, const Action* b) { return source_of(*a) < source_of(*b); });
+
+  json::Value database = json::Value::array();
+  for (const auto* action : compiles) {
+    json::Value entry = json::Value::object();
+    entry.set("directory", fs::generic_string(action->working_dir));
+    entry.set("file", source_of(*action));
+    if (!action->outputs.empty()) {
+      entry.set("output", fs::generic_string(action->outputs.front().path));
+    }
+    json::Value arguments = json::Value::array();
+    for (const auto& argument : action->argv) {
+      arguments.push(argument);
+    }
+    entry.set("arguments", std::move(arguments));
+    database.push(std::move(entry));
+  }
+  return database.dump(2) + "\n";
 }
 
 }  // namespace cova::build

@@ -52,6 +52,76 @@ cova::toolchain::ResolvedToolchain dummy_toolchain(const std::string& archiver) 
   return resolved;
 }
 
+// Writes base <- math <- app into temp and returns the loaded manifests.
+struct PathDependencyFixture {
+  std::filesystem::path root;
+  cova::manifest::Manifest base;
+  cova::manifest::Manifest math;
+  cova::manifest::Manifest app;
+};
+
+PathDependencyFixture make_path_dependency_fixture(const std::filesystem::path& root) {
+  PathDependencyFixture fixture;
+  fixture.root = root;
+  const auto base_root = root / "deps" / "base";
+  const auto math_root = root / "deps" / "math";
+  const auto app_root = root / "app";
+  COVA_CHECK(cova::fs::create_directories(base_root / "src").has_value());
+  COVA_CHECK(cova::fs::create_directories(base_root / "include").has_value());
+  COVA_CHECK(cova::fs::create_directories(math_root / "src").has_value());
+  COVA_CHECK(cova::fs::create_directories(math_root / "include").has_value());
+  COVA_CHECK(cova::fs::create_directories(app_root / "src").has_value());
+  COVA_CHECK(cova::fs::write_file(base_root / "cova.toml", R"(
+[package]
+name = "base"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/*.cpp"]
+public-includes = ["include"]
+public-definitions = ["BASE_PUBLIC=1"]
+)")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(math_root / "cova.toml", R"(
+[package]
+name = "math"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/*.cpp"]
+public-includes = ["include"]
+private-includes = ["src"]
+private-definitions = ["MATH_PRIVATE=1"]
+[dependencies]
+base = { path = "../base" }
+)")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(app_root / "cova.toml", R"(
+[package]
+name = "app"
+version = "0.1.0"
+[build]
+type = "executable"
+sources = ["src/*.cpp"]
+[dependencies]
+math = { path = "../deps/math" }
+)")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(base_root / "src" / "base.cpp",
+                                  "int base_value() { return 1; }\n")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(math_root / "src" / "math.cpp",
+                                  "int math_value() { return 2; }\n")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(app_root / "src" / "main.cpp",
+                                  "int main() { return 0; }\n")
+                 .has_value());
+  fixture.base = COVA_REQUIRE_OK(cova::manifest::load_from_root(base_root)).manifest;
+  fixture.math = COVA_REQUIRE_OK(cova::manifest::load_from_root(math_root)).manifest;
+  fixture.app = COVA_REQUIRE_OK(cova::manifest::load_from_root(app_root)).manifest;
+  return fixture;
+}
+
 }  // namespace
 
 COVA_TEST_NAMED(build, graph_orders_dependencies) {
@@ -263,6 +333,232 @@ math = { path = "../math" }
   }
   COVA_CHECK(app_has_math_include);
   COVA_CHECK(app_links_math);
+}
+
+
+COVA_TEST_NAMED(build, planner_propagates_public_interfaces_and_link_order) {
+  cova::test::TempDir temp;
+  auto fixture = make_path_dependency_fixture(temp.path());
+  cova::build::WorkspaceProject project;
+  project.members = {fixture.base, fixture.math, fixture.app};
+  project.roots = {"app"};
+
+  cova::build::PlanOptions options;
+  options.target = cova::platform::host_triple();
+  options.profile = "dev";
+  auto plan = COVA_REQUIRE_OK(cova::build::plan_workspace(
+      project, dummy_toolchain("/usr/bin/ar"), options,
+      std::filesystem::path(temp.path()) / "target"));
+
+  bool saw_app_compile = false;
+  bool leaked_private = false;
+  bool has_transitive_include = false;
+  bool has_transitive_definition = false;
+  bool saw_link = false;
+  std::ptrdiff_t math_position = -1;
+  std::ptrdiff_t base_position = -1;
+  for (const auto& action : plan.graph.actions()) {
+    if (action.package != "app") {
+      continue;
+    }
+    if (action.kind == cova::build::ActionKind::Compile) {
+      saw_app_compile = true;
+      bool app_include = false;
+      bool dep_include = false;
+      bool base_include = false;
+      for (const auto& argument : action.argv) {
+        if (argument.find("app/src") != std::string::npos && argument.rfind("-I", 0) == 0) {
+          app_include = true;
+        }
+        if (argument.find("deps/math/include") != std::string::npos) {
+          dep_include = true;
+        }
+        if (argument.find("deps/base/include") != std::string::npos) {
+          base_include = true;
+        }
+        if (argument.find("MATH_PRIVATE") != std::string::npos ||
+            argument.find("deps/math/src") != std::string::npos) {
+          leaked_private = true;
+        }
+        if (argument == "-DBASE_PUBLIC=1") {
+          has_transitive_definition = true;
+        }
+      }
+      (void)app_include;
+      has_transitive_include = dep_include && base_include;
+    }
+    if (action.kind == cova::build::ActionKind::Link) {
+      saw_link = true;
+      for (std::size_t index = 0; index < action.argv.size(); ++index) {
+        if (action.argv[index].find("libmath.a") != std::string::npos) {
+          math_position = static_cast<std::ptrdiff_t>(index);
+        }
+        if (action.argv[index].find("libbase.a") != std::string::npos) {
+          base_position = static_cast<std::ptrdiff_t>(index);
+        }
+      }
+    }
+  }
+  COVA_CHECK(saw_app_compile);
+  COVA_CHECK(saw_link);
+  COVA_CHECK(has_transitive_include);
+  COVA_CHECK(has_transitive_definition);
+  COVA_CHECK(!leaked_private);
+  // Static archives must be named dependents-first.
+  COVA_CHECK(math_position >= 0);
+  COVA_CHECK(base_position > math_position);
+
+  COVA_CHECK(plan.runnable_binary.has_value());
+  COVA_CHECK_EQ(plan.runnable_binary->filename().string(), std::string("app"));
+  // Only the root contributes reported artifacts.
+  COVA_CHECK_EQ(plan.expected_outputs.size(), std::size_t{1});
+  COVA_CHECK(plan.expected_outputs.front().filename() == "app");
+}
+
+COVA_TEST_NAMED(build, dev_dependencies_are_only_wired_for_test_plans) {
+  cova::test::TempDir temp;
+  const auto math_root = std::filesystem::path(temp.path()) / "math";
+  const auto app_root = std::filesystem::path(temp.path()) / "app";
+  COVA_CHECK(cova::fs::create_directories(math_root / "src").has_value());
+  COVA_CHECK(cova::fs::create_directories(math_root / "include").has_value());
+  COVA_CHECK(cova::fs::create_directories(app_root / "src").has_value());
+  COVA_CHECK(cova::fs::write_file(math_root / "cova.toml", R"(
+[package]
+name = "math"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/*.cpp"]
+public-includes = ["include"]
+)")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(app_root / "cova.toml", R"(
+[package]
+name = "app"
+version = "0.1.0"
+[build]
+type = "executable"
+sources = ["src/*.cpp"]
+[dev-dependencies]
+math = { path = "../math" }
+)")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(math_root / "src" / "math.cpp", "int m();\n").has_value());
+  COVA_CHECK(cova::fs::write_file(app_root / "src" / "main.cpp", "int main() { return 0; }\n")
+                 .has_value());
+  auto math = COVA_REQUIRE_OK(cova::manifest::load_from_root(math_root)).manifest;
+  auto app = COVA_REQUIRE_OK(cova::manifest::load_from_root(app_root)).manifest;
+
+  cova::build::WorkspaceProject project;
+  project.members = {math, app};
+  project.roots = {"app"};
+  cova::build::PlanOptions options;
+  options.target = cova::platform::host_triple();
+
+  auto plain = COVA_REQUIRE_OK(cova::build::plan_workspace(
+      project, dummy_toolchain("/usr/bin/ar"), options,
+      std::filesystem::path(temp.path()) / "target"));
+  for (const auto& action : plain.graph.actions()) {
+    for (const auto& argument : action.argv) {
+      COVA_CHECK(argument.find("math/include") == std::string::npos);
+      COVA_CHECK(argument.find("libmath.a") == std::string::npos);
+    }
+  }
+
+  options.include_tests = true;
+  auto with_tests = COVA_REQUIRE_OK(cova::build::plan_workspace(
+      project, dummy_toolchain("/usr/bin/ar"), options,
+      std::filesystem::path(temp.path()) / "target"));
+  bool wired = false;
+  for (const auto& action : with_tests.graph.actions()) {
+    for (const auto& argument : action.argv) {
+      if (argument.find("math/include") != std::string::npos ||
+          argument.find("libmath.a") != std::string::npos) {
+        wired = true;
+      }
+    }
+  }
+  COVA_CHECK(wired);
+}
+
+COVA_TEST_NAMED(build, planner_rejects_dependency_cycles) {
+  cova::test::TempDir temp;
+  const auto first_root = std::filesystem::path(temp.path()) / "first";
+  const auto second_root = std::filesystem::path(temp.path()) / "second";
+  COVA_CHECK(cova::fs::create_directories(first_root / "src").has_value());
+  COVA_CHECK(cova::fs::create_directories(second_root / "src").has_value());
+  COVA_CHECK(cova::fs::write_file(first_root / "cova.toml", R"(
+[package]
+name = "first"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/*.cpp"]
+[dependencies]
+second = { path = "../second" }
+)")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(second_root / "cova.toml", R"(
+[package]
+name = "second"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/*.cpp"]
+[dependencies]
+first = { path = "../first" }
+)")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(first_root / "src" / "a.cpp", "int a();\\n").has_value());
+  COVA_CHECK(cova::fs::write_file(second_root / "src" / "b.cpp", "int b();\\n").has_value());
+  auto first = COVA_REQUIRE_OK(cova::manifest::load_from_root(first_root)).manifest;
+  auto second = COVA_REQUIRE_OK(cova::manifest::load_from_root(second_root)).manifest;
+
+  cova::build::WorkspaceProject project;
+  project.members = {first, second};
+  project.roots = {"first"};
+  cova::build::PlanOptions options;
+  options.target = cova::platform::host_triple();
+  auto error = COVA_REQUIRE_ERR(cova::build::plan_workspace(
+      project, dummy_toolchain("/usr/bin/ar"), options,
+      std::filesystem::path(temp.path()) / "target"));
+  COVA_CHECK_EQ(error.code, std::string("cova::build::dependency_cycle"));
+}
+
+COVA_TEST_NAMED(build, planner_builds_dependencies_for_the_requested_target) {
+  cova::test::TempDir temp;
+  auto fixture = make_path_dependency_fixture(temp.path());
+  cova::build::WorkspaceProject project;
+  project.members = {fixture.base, fixture.math, fixture.app};
+  project.roots = {"app"};
+
+  auto target = COVA_REQUIRE_OK(cova::platform::Triple::parse("aarch64-unknown-linux-gnu"));
+  cova::build::PlanOptions options;
+  options.target = target;
+  options.profile = "dev";
+  auto toolchain = dummy_toolchain("/usr/bin/aarch64-linux-gnu-ar");
+  toolchain.descriptor.family = "clang";
+  auto plan = COVA_REQUIRE_OK(cova::build::plan_workspace(
+      project, toolchain, options, std::filesystem::path(temp.path()) / "target"));
+
+  bool saw_base_compile = false;
+  for (const auto* action : plan.graph.actions_in_order()) {
+    if (action->kind != cova::build::ActionKind::Compile) {
+      continue;
+    }
+    // Every package, including transitive dependencies, targets the request.
+    COVA_CHECK_MSG(action->argv.size() > 2, action->label);
+    bool has_target_flag = false;
+    for (const auto& argument : action->argv) {
+      has_target_flag = has_target_flag || argument == "--target=aarch64-unknown-linux-gnu";
+    }
+    COVA_CHECK_MSG(has_target_flag, action->label);
+    COVA_CHECK(action->outputs.front().path.string().find("aarch64") != std::string::npos);
+    if (action->package == "base") {
+      saw_base_compile = true;
+    }
+  }
+  COVA_CHECK(saw_base_compile);
 }
 
 COVA_TEST_MAIN()

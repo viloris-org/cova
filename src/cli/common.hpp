@@ -17,6 +17,7 @@
 #include "core/config/config.hpp"
 #include "core/diagnostics/diagnostic.hpp"
 #include "manifest/manifest.hpp"
+#include "package/dependency/dependency.hpp"
 #include "package/lockfile/lockfile.hpp"
 #include "platform/triple/triple.hpp"
 #include "toolchain/descriptor.hpp"
@@ -80,11 +81,40 @@ Status store_toolchain_lock(const LoadedProject& project, const LockState& state
 // The effective configuration for this invocation.
 Result<config::EffectiveConfig> effective_config(CommandContext& ctx);
 
+// Local dependency resolution plus the shared `cova.lock`.
+struct DependencyState {
+  package::DependencyGraph graph;
+  // Packages to build, dependency-first: the selected roots and everything they
+  // reach through target-active dependency edges.
+  std::vector<manifest::Manifest> build_packages;
+  std::vector<std::string> roots;
+  stdfs::path lockfile;
+  bool lock_written = false;
+  bool lock_up_to_date = false;
+};
+
+// Resolves every local path dependency reachable from the selected roots.
+// `apply_lock` enforces `--locked` and writes `cova.lock` when it is stale;
+// read-only callers (`cova graph`) pass false and never touch the file.
+Result<DependencyState> resolve_dependencies(CommandContext& ctx, const LoadedProject& project,
+                                             const platform::Triple& target, bool apply_lock,
+                                             bool include_dev);
+
 // Plans the build for this invocation. `include_tests` controls whether test
 // actions are part of the graph.
 Result<build::PlanResult> plan_for(CommandContext& ctx, const LoadedProject& project,
                                    const toolchain::ResolvedToolchain& tc,
                                    const platform::Triple& target, bool include_tests);
+
+// Plans a resolved dependency graph. The toolchain is already frozen.
+Result<build::PlanResult> plan_with_dependencies(CommandContext& ctx, const LoadedProject& project,
+                                                 const DependencyState& dependencies,
+                                                 const toolchain::ResolvedToolchain& tc,
+                                                 const platform::Triple& target, bool include_tests);
+
+// Writes the compilation database for a plan. Returns the path written.
+Result<stdfs::path> write_compile_commands(const LoadedProject& project,
+                                           const build::PlanResult& plan);
 
 // Profile name selected by CLI flags (--release wins over --profile).
 std::string selected_profile(const CommandContext& ctx);

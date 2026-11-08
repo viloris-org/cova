@@ -28,6 +28,7 @@ The resolver is usable without a project build (`cova explain`, `cova doctor`).
 | `cova build`, `run`, `test`, `check`, `clean` | `src/cli/cmd_build.cpp` | `e2e_cli_test` |
 | `cova fmt` | `src/formatter` | `e2e_cli_test`, `formatter_test` |
 | Diagnostics in the requested stream | `src/cli/common.cpp` | `e2e_cli_test` |
+| Compilation database | `compile_commands_json` in `src/build/planner` | `e2e_cli_test` |
 
 ## Milestone 2 — Cross-compilation foundation (delivered)
 
@@ -51,14 +52,25 @@ and record their SHA-256. A host without a compatible system cross compiler,
 system sysroot or installed managed component still fails with the
 missing-sysroot/target diagnostic rather than producing the wrong binary.
 
-## Milestone 3 — Package management (command surface only)
+## Milestone 3 — Package management (local path dependencies delivered)
 
-`cova add` / `remove` edit path and version declarations. `tree` and `vendor`
-are local-only. `fetch`, `update`, remote `add` and `vendor` of remote
-dependencies fail explicitly because there is no trusted registry or verified
-source fetcher (PRD §18.1, OD-003). Workspace path dependencies are consumed by
-the multi-package planner (include interface + archive linking); standalone path
-dependencies outside a workspace are declared but not yet consumed.
+`cova add` / `remove` edit path and version declarations. Local path dependencies
+are resolved transitively by `build`, `check`, `run`, `test` and `fetch`, inside
+or outside a workspace: public includes and definitions propagate transitively,
+private settings stay private, dependency cycles are rejected with the offending
+chain, and every package is rebuilt for the requested `--target`. Their artifacts
+are linked into the dependent.
+
+Dependency resolution writes `cova.lock`. `--locked` fails when the lockfile is
+missing, stale or would change, and never rewrites it; `--frozen` implies
+`--offline --locked` (PRD §15.2). Unit tests: `package_dependency_test`; end-to-end
+coverage: `path_dependency_outside_a_workspace_builds_and_links`,
+`lockfile_is_written_and_enforced`.
+
+Remote dependency management (registry and git sources), `cova update` and
+vendoring of remote dependencies remain unimplemented and fail explicitly because
+there is no trusted registry or verified source fetcher (PRD §18.1, OD-003). A
+regular build skips remote development dependencies, which it does not need.
 
 ## Milestone 4 — Workspace and self-hosting (workspace delivered)
 

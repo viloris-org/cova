@@ -67,6 +67,19 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
   }
   out.target = *target;
 
+  // Resolve local dependencies and enforce the shared lockfile before any
+  // expensive toolchain probing.
+  auto dependencies =
+      resolve_dependencies(ctx, out.project, out.target, /*apply_lock=*/true, include_tests);
+  if (!dependencies) {
+    return report_error(dependencies.error(), ctx);
+  }
+  if (dependencies->lock_written) {
+    ctx.ui->verbose("wrote " + fs::generic_string(dependencies->lockfile));
+  } else if (dependencies->lock_up_to_date) {
+    ctx.ui->verbose(fs::generic_string(dependencies->lockfile) + " is up to date");
+  }
+
   auto config = effective_config(ctx);
   if (!config) {
     return report_error(config.error(), ctx);
@@ -107,11 +120,20 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
   }
   out.toolchain = std::move(*resolved);
 
-  auto plan = plan_for(ctx, out.project, out.toolchain, out.target, include_tests);
+  auto plan = plan_with_dependencies(ctx, out.project, *dependencies, out.toolchain, out.target,
+                                     include_tests);
   if (!plan) {
     return report_error(plan.error(), ctx);
   }
   out.plan = std::move(*plan);
+
+  auto compile_commands = write_compile_commands(out.project, out.plan);
+  if (!compile_commands) {
+    ctx.ui->warn("could not write compile_commands.json: " +
+                 compile_commands.error().message);
+  } else {
+    ctx.ui->verbose("wrote " + fs::generic_string(*compile_commands));
+  }
 
   for (const auto& note : out.plan.notes) {
     ctx.ui->verbose(note);

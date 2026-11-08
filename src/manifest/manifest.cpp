@@ -792,6 +792,13 @@ Result<ManifestLoadResult> parse(std::string_view text, std::string_view source_
         return fail<ManifestLoadResult>(build_script.error());
       }
       manifest.build.build_script = *build_script;
+      if (manifest.build.build_script) {
+        return fail<ManifestLoadResult>(Error::make(
+            "cova::manifest::build_script_unsupported",
+            "`build-script = true` is not supported: Cova does not implement build scripts")
+            .with("the declaration was rejected instead of being silently ignored")
+            .with("remove it, or set `build-script = false`"));
+      }
       auto target = read_string(table, "target", context("build"));
       if (!target) {
         return fail<ManifestLoadResult>(target.error());
@@ -1294,6 +1301,12 @@ Result<std::vector<std::string>> validate(const Manifest& manifest) {
     if (manifest.build.kind == PackageKind::Executable && !manifest.build.entry_point.empty()) {
       // An explicit entry point is allowed to live outside the source glob.
     }
+  }
+  if (!manifest.is_workspace_root() && manifest.build.build_script) {
+    return fail<std::vector<std::string>>(Error::make(
+        "cova::manifest::build_script_unsupported",
+        "`build-script = true` is not supported: Cova does not implement build scripts")
+        .with("the declaration was rejected instead of being silently ignored"));
   }
   if (!manifest.build.target.empty()) {
     auto parsed = platform::Triple::parse(manifest.build.target);

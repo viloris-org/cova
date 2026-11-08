@@ -29,8 +29,8 @@ int report_milestone_gap(CommandContext& ctx, std::string_view command,
       "Cova's package manager needs a trusted registry and a verified fetcher; neither "
       "exists yet. Rather than simulate them, this command fails explicitly (PRD §18.1, "
       "OD-003).");
-  diagnostic.line("local `path` dependencies in [dependencies] are declared but not yet "
-                  "consumed by the build graph.");
+  diagnostic.line("remote dependency management is not implemented yet; only local path "
+                  "dependencies are resolved and built.");
   engine.emit(std::move(diagnostic));
   return report_diagnostics(engine, ctx);
 }
@@ -104,7 +104,8 @@ int cmd_add(CommandContext& ctx) {
     return report_error(status.error(), ctx);
   }
   ctx.ui->info("added path dependency `" + name + "`");
-  ctx.ui->verbose("note: the build graph does not consume dependencies yet in this milestone");
+  ctx.ui->verbose("note: `cova build` compiles and links local path dependencies; remote "
+                  "dependency management is not implemented yet");
   return 0;
 }
 
@@ -141,18 +142,34 @@ int cmd_fetch(CommandContext& ctx) {
   if (!project) {
     return report_error(project.error(), ctx);
   }
-  bool has_remote = false;
-  for (const auto& dependency : project->manifest.dependencies) {
-    if (!dependency.is_local()) {
-      has_remote = true;
-      break;
+  auto target = resolve_target_from(ctx, *project);
+  if (!target) {
+    return report_error(target.error(), ctx);
+  }
+  // Fetching a path dependency means loading its manifest and recording the
+  // resolution; no network transport exists, so remote declarations are
+  // rejected by the resolver.
+  auto dependencies = resolve_dependencies(ctx, *project, *target, /*apply_lock=*/true,
+                                           /*include_dev=*/true);
+  if (!dependencies) {
+    return report_error(dependencies.error(), ctx);
+  }
+  if (dependencies->lock_written) {
+    ctx.ui->info("wrote " + display_path(dependencies->lockfile, project->layout.root));
+  }
+  std::size_t remote_free = 0;
+  for (const auto& package : dependencies->graph.packages) {
+    if (!package.root) {
+      ++remote_free;
     }
   }
-  if (!has_remote) {
-    ctx.ui->info("no remote dependencies to fetch");
-    return 0;
+  if (remote_free == 0) {
+    ctx.ui->info("no dependencies to fetch");
+  } else {
+    ctx.ui->info("resolved " + std::to_string(remote_free) +
+                 " local path dependency package(s); nothing to download");
   }
-  return report_milestone_gap(ctx, "fetch", "a verified source fetcher and registry protocol");
+  return 0;
 }
 
 int cmd_update(CommandContext& ctx) {
@@ -239,8 +256,8 @@ int cmd_tree(CommandContext& ctx) {
 
   if (!manifest.dependencies.empty()) {
     ctx.ui->warn(
-        "dependencies are declared but not yet resolved or built in this milestone; "
-        "transitive dependencies are unknown");
+        "`cova tree` lists declared dependencies only; local path dependencies are resolved "
+        "and built by `cova build`, remote dependency management is not implemented yet");
   }
   return 0;
 }

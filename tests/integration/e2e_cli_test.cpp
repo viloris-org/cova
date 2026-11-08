@@ -17,6 +17,7 @@
 #include "cli/common.hpp"
 #include "core/filesystem/filesystem.hpp"
 #include "core/hashing/hash.hpp"
+#include "core/json/json.hpp"
 #include "core/process/process.hpp"
 #include "manifest/manifest.hpp"
 #include "platform/triple/triple.hpp"
@@ -483,6 +484,337 @@ COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) 
   COVA_CHECK(!built.ok());
   COVA_CHECK(contains(built.combined(), "cannot inspect") ||
              contains(built.combined(), "artifact"));
+}
+
+
+namespace {
+
+// Writes a tiny static-library dependency tree: base <- math <- app.
+struct DependencyFixture {
+  stdfs::path root;
+  stdfs::path base;
+  stdfs::path math;
+  stdfs::path app;
+};
+
+DependencyFixture write_dependency_fixture(const stdfs::path& root) {
+  DependencyFixture fixture;
+  fixture.root = root;
+  fixture.base = root / "deps" / "base";
+  fixture.math = root / "deps" / "math";
+  fixture.app = root / "app";
+
+  write_text(fixture.base / "cova.toml", R"(
+[package]
+name = "base"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/**/*.cpp"]
+public-includes = ["include"]
+public-definitions = ["BASE_PUBLIC=1"]
+)");
+  write_text(fixture.base / "include" / "base.hpp", "#pragma once\nint base_value();\n");
+  write_text(fixture.base / "src" / "base.cpp",
+             "#include \"base.hpp\"\nint base_value() { return 7; }\n");
+
+  write_text(fixture.math / "cova.toml", R"(
+[package]
+name = "math"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/**/*.cpp"]
+public-includes = ["include"]
+private-includes = ["src"]
+private-definitions = ["MATH_PRIVATE=1"]
+[dependencies]
+base = { path = "../base" }
+)");
+  write_text(fixture.math / "include" / "math.hpp",
+             "#pragma once\n#include \"base.hpp\"\nint math_value();\n");
+  write_text(fixture.math / "src" / "math.cpp",
+             "#include \"math.hpp\"\nint math_value() { return base_value() + 1; }\n");
+
+  write_text(fixture.app / "cova.toml", R"(
+[package]
+name = "app"
+version = "0.1.0"
+[build]
+type = "executable"
+sources = ["src/**/*.cpp"]
+)");
+  write_text(fixture.app / "src" / "main.cpp", R"(#include <cstdio>
+#include "math.hpp"
+int main() {
+  std::printf("math=%d\n", math_value());
+  return math_value() == 8 ? 0 : 1;
+}
+)");
+  return fixture;
+}
+
+const cova::json::Value* object_field(const cova::json::Value& value, std::string_view key) {
+  const auto* object = value.as_object();
+  if (object == nullptr) {
+    return nullptr;
+  }
+  auto it = object->find(key);
+  return it == object->end() ? nullptr : &it->second;
+}
+
+bool arguments_contain(const cova::json::Value& entry, std::string_view needle) {
+  const auto* arguments = object_field(entry, "arguments");
+  if (arguments == nullptr || arguments->as_array() == nullptr) {
+    return false;
+  }
+  for (const auto& argument : *arguments->as_array()) {
+    if (argument.as_string().find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+COVA_TEST_NAMED(integration, path_dependency_outside_a_workspace_builds_and_links) {
+  COVA_SKIP_UNLESS_TOOL("g++");
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const auto fixture = write_dependency_fixture(stdfs::path(temp.path()));
+
+  ScopedCwd cwd(fixture.app);
+  auto added = run_cli({"add", "math", "--path", "../deps/math"});
+  COVA_CHECK_MSG(added.ok(), added.combined());
+
+  auto built = run_cli({"build"});
+  COVA_CHECK_MSG(built.ok(), built.combined());
+
+  auto run = run_cli({"run"});
+  COVA_CHECK_MSG(run.ok(), run.combined());
+  COVA_CHECK(contains(run.out, "math=8"));
+
+  // The resolved graph is recorded in a lockfile.
+  COVA_CHECK(cova::fs::is_regular_file(fixture.app / "cova.lock"));
+  const std::string lock = read_text(fixture.app / "cova.lock");
+  COVA_CHECK(contains(lock, "name = \"math\""));
+  COVA_CHECK(contains(lock, "name = \"base\""));
+  COVA_CHECK(contains(lock, "path = \"../deps/math\""));
+
+  // One compilation database entry per compile action, with exact arguments.
+  const auto database_path = fixture.app / "compile_commands.json";
+  COVA_CHECK(cova::fs::is_regular_file(database_path));
+  auto parsed = cova::json::Value::parse(read_text(database_path));
+  COVA_CHECK_MSG(parsed.has_value(), parsed ? "" : parsed.error().to_string());
+  const auto* entries = parsed->as_array();
+  COVA_CHECK(entries != nullptr);
+
+  bool saw_app_source = false;
+  bool leaked_private_flag = false;
+  bool has_transitive_include = false;
+  bool has_transitive_definition = false;
+  bool has_exact_compile = false;
+  for (const auto& entry : *entries) {
+    const auto* file = object_field(entry, "file");
+    if (file == nullptr || file->as_string().find("app/src/main.cpp") == std::string::npos) {
+      continue;
+    }
+    saw_app_source = true;
+    has_transitive_include = arguments_contain(entry, "deps/math/include") &&
+                             arguments_contain(entry, "deps/base/include");
+    has_transitive_definition = arguments_contain(entry, "-DBASE_PUBLIC=1");
+    leaked_private_flag = arguments_contain(entry, "MATH_PRIVATE") ||
+                          arguments_contain(entry, "path/deps/math/src") ||
+                          arguments_contain(entry, "deps/math/src");
+    has_exact_compile = arguments_contain(entry, "-c") && arguments_contain(entry, "app/src/main.cpp");
+  }
+  COVA_CHECK(saw_app_source);
+  COVA_CHECK(has_transitive_include);
+  COVA_CHECK(has_transitive_definition);
+  COVA_CHECK(!leaked_private_flag);
+  COVA_CHECK(has_exact_compile);
+
+  // `cova check` re-emits the database too.
+  COVA_CHECK(cova::fs::remove_file(database_path).has_value());
+  auto checked = run_cli({"check"});
+  COVA_CHECK_MSG(checked.ok(), checked.combined());
+  COVA_CHECK(cova::fs::is_regular_file(database_path));
+}
+
+COVA_TEST_NAMED(integration, lockfile_is_written_and_enforced) {
+  COVA_SKIP_UNLESS_TOOL("g++");
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const auto fixture = write_dependency_fixture(stdfs::path(temp.path()));
+  COVA_CHECK(cova::fs::write_file(fixture.app / "cova.toml", R"(
+[package]
+name = "app"
+version = "0.1.0"
+[build]
+type = "executable"
+sources = ["src/**/*.cpp"]
+[dependencies]
+math = { path = "../deps/math" }
+)")
+                 .has_value());
+  const auto lock_path = fixture.app / "cova.lock";
+
+  ScopedCwd cwd(fixture.app);
+  auto first = run_cli({"build"});
+  COVA_CHECK_MSG(first.ok(), first.combined());
+  COVA_CHECK(cova::fs::is_regular_file(lock_path));
+
+  auto locked = run_cli({"build", "--locked"});
+  COVA_CHECK_MSG(locked.ok(), locked.combined());
+
+  // Missing lockfile in locked mode fails and is not silently created.
+  COVA_CHECK(cova::fs::remove_file(lock_path).has_value());
+  auto missing = run_cli({"build", "--locked"});
+  COVA_CHECK(!missing.ok());
+  COVA_CHECK(contains(missing.combined(), "cova.lock"));
+  COVA_CHECK(!cova::fs::is_regular_file(lock_path));
+
+  // Unlocked mode writes it again.
+  auto recreated = run_cli({"build"});
+  COVA_CHECK_MSG(recreated.ok(), recreated.combined());
+  COVA_CHECK(cova::fs::is_regular_file(lock_path));
+
+  // A changed manifest makes the lockfile stale; locked mode reports the drift
+  // and leaves the file untouched.
+  const std::string before = read_text(lock_path);
+  COVA_CHECK(cova::fs::write_file(fixture.app / "cova.toml", R"(
+[package]
+name = "app"
+version = "0.2.0"
+[build]
+type = "executable"
+sources = ["src/**/*.cpp"]
+[dependencies]
+math = { path = "../deps/math" }
+)")
+                 .has_value());
+  auto stale = run_cli({"build", "--locked"});
+  COVA_CHECK(!stale.ok());
+  COVA_CHECK(contains(stale.combined(), "out of date") ||
+             contains(stale.combined(), "cova.lock"));
+  const std::string after = read_text(lock_path);
+  COVA_CHECK_EQ(after, before);
+
+  // `--frozen` implies `--locked`: it fails without a lockfile.
+  COVA_CHECK(cova::fs::remove_file(lock_path).has_value());
+  auto frozen_missing = run_cli({"build", "--frozen"});
+  COVA_CHECK(!frozen_missing.ok());
+  auto refreshed = run_cli({"build"});
+  COVA_CHECK_MSG(refreshed.ok(), refreshed.combined());
+  auto frozen = run_cli({"build", "--frozen"});
+  COVA_CHECK_MSG(frozen.ok(), frozen.combined());
+}
+
+COVA_TEST_NAMED(integration, workspace_emits_one_compile_database) {
+  COVA_SKIP_UNLESS_TOOL("g++");
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path root = stdfs::path(temp.path()) / "ws";
+  write_text(root / "cova.toml", "[workspace]\nmembers = [\"packages/*\"]\n");
+  write_text(root / "packages" / "math" / "cova.toml", R"(
+[package]
+name = "math"
+version = "0.1.0"
+[build]
+type = "static-library"
+sources = ["src/**/*.cpp"]
+public-includes = ["include"]
+)");
+  write_text(root / "packages" / "math" / "include" / "math.hpp",
+             "#pragma once\nint math_value();\n");
+  write_text(root / "packages" / "math" / "src" / "math.cpp",
+             "#include \"math.hpp\"\nint math_value() { return 42; }\n");
+  write_text(root / "packages" / "app" / "cova.toml", R"(
+[package]
+name = "app"
+version = "0.1.0"
+[build]
+type = "executable"
+sources = ["src/**/*.cpp"]
+[dependencies]
+math = { path = "../math" }
+)");
+  write_text(root / "packages" / "app" / "src" / "main.cpp",
+             "#include \"math.hpp\"\nint main() { return math_value() == 42 ? 0 : 1; }\n");
+
+  ScopedCwd cwd(root);
+  auto built = run_cli({"build"});
+  COVA_CHECK_MSG(built.ok(), built.combined());
+
+  COVA_CHECK(cova::fs::is_regular_file(root / "compile_commands.json"));
+  COVA_CHECK(!cova::fs::is_regular_file(root / "packages" / "math" /
+                                        "compile_commands.json"));
+  auto parsed = cova::json::Value::parse(read_text(root / "compile_commands.json"));
+  COVA_CHECK_MSG(parsed.has_value(), parsed ? "" : parsed.error().to_string());
+  const auto* entries = parsed->as_array();
+  COVA_CHECK(entries != nullptr);
+  bool saw_math = false;
+  bool saw_app = false;
+  for (const auto& entry : *entries) {
+    const auto* file = object_field(entry, "file");
+    if (file == nullptr) {
+      continue;
+    }
+    const std::string text = file->as_string();
+    saw_math = saw_math || text.find("packages/math/src/math.cpp") != std::string::npos;
+    saw_app = saw_app || text.find("packages/app/src/main.cpp") != std::string::npos;
+  }
+  COVA_CHECK(saw_math);
+  COVA_CHECK(saw_app);
+
+  auto run = run_cli({"run"});
+  COVA_CHECK_MSG(run.ok(), run.combined());
+}
+
+COVA_TEST_NAMED(integration, build_script_true_is_rejected) {
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "scripts"}).ok());
+  }
+  const stdfs::path root = stdfs::path(temp.path()) / "scripts";
+  std::string manifest = read_text(root / "cova.toml");
+  const std::string anchor = "type = \"executable\"";
+  const auto position = manifest.find(anchor);
+  COVA_CHECK(position != std::string::npos);
+  manifest.insert(position + anchor.size(), "\nbuild-script = true");
+  write_text(root / "cova.toml", manifest);
+
+  ScopedCwd cwd(root);
+  auto built = run_cli({"build"});
+  COVA_CHECK(!built.ok());
+  COVA_CHECK(contains(built.combined(), "build-script"));
+  COVA_CHECK(contains(built.combined(), "not supported") ||
+             contains(built.combined(), "does not implement"));
+}
+
+COVA_TEST_NAMED(integration, sysroot_gc_reclaims_unreferenced_store_entries) {
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path orphan = stdfs::path(temp.path()) / "covahome" / "store" / "orphan";
+  write_text(orphan / "payload.txt", "unused\n");
+
+  auto dry = run_cli({"sysroot", "gc", "--dry-run", "--json"});
+  COVA_CHECK_MSG(dry.ok(), dry.combined());
+  COVA_CHECK(contains(dry.out, "reclaimable_bytes"));
+  COVA_CHECK(cova::fs::is_directory(orphan));
+
+  auto collected = run_cli({"sysroot", "gc", "--yes", "--json"});
+  COVA_CHECK_MSG(collected.ok(), collected.combined());
+  COVA_CHECK(contains(collected.out, "reclaimed_bytes"));
+  COVA_CHECK(!cova::fs::exists(orphan));
+
+  // `sysroot gc` is not an alias for `sysroot verify`.
+  auto verify = run_cli({"sysroot", "verify"});
+  COVA_CHECK_MSG(verify.ok(), verify.combined());
+  COVA_CHECK(contains(verify.combined(), "no sysroots to verify"));
 }
 
 COVA_TEST_MAIN()

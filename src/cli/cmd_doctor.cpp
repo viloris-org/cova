@@ -366,6 +366,64 @@ int cmd_sysroot(CommandContext& ctx) {
       }
       return all_ok ? 0 : 1;
     }
+    case CommandId::SysrootGc: {
+      // Garbage collection over store entries no installed sysroot references.
+      // Installed sysroots themselves are never candidates; remove those with
+      // `cova sysroot remove`.
+      auto plan = manager.plan_gc();
+      if (!plan) {
+        return report_error(plan.error(), ctx);
+      }
+      const bool dry_run = ctx.flags.boolean("dry-run");
+      if (plan->removable.empty()) {
+        ctx.ui->info("nothing to reclaim in the sysroot store");
+        return 0;
+      }
+      if (ctx.global.json) {
+        json::Value out = json::Value::object();
+        out.set("dry_run", dry_run);
+        out.set("reclaimable_bytes", static_cast<std::int64_t>(plan->reclaimable_bytes));
+        auto entries = json::Value::array();
+        for (const auto& path : plan->removable) {
+          entries.push(fs::generic_string(path));
+        }
+        out.set("removable", std::move(entries));
+        if (!dry_run) {
+          auto applied = manager.apply_gc(*plan);
+          if (!applied) {
+            return report_error(applied.error(), ctx);
+          }
+          out.set("reclaimed_bytes", static_cast<std::int64_t>(plan->reclaimable_bytes));
+        }
+        ctx.ui->out(out.dump(2));
+        return 0;
+      }
+      ctx.ui->out("unreferenced sysroot store entries:");
+      for (const auto& path : plan->removable) {
+        ctx.ui->out("  " + fs::generic_string(path));
+      }
+      if (dry_run) {
+        ctx.ui->info("dry run: would reclaim " + human_bytes(plan->reclaimable_bytes));
+        return 0;
+      }
+      if (!ctx.flags.boolean("yes")) {
+        const std::string question =
+            "Remove " + std::to_string(plan->removable.size()) +
+            " unreferenced store entr" + (plan->removable.size() == 1 ? "y" : "ies") + " (" +
+            human_bytes(plan->reclaimable_bytes) + ")?";
+        if (!ctx.ui->confirm(question, false)) {
+          ctx.ui->info("nothing was removed");
+          return 0;
+        }
+      }
+      auto applied = manager.apply_gc(*plan);
+      if (!applied) {
+        return report_error(applied.error(), ctx);
+      }
+      ctx.ui->info("reclaimed " + human_bytes(plan->reclaimable_bytes) +
+                   " from the sysroot store");
+      return 0;
+    }
     default:
       ctx.ui->error("unknown sysroot subcommand");
       return 2;

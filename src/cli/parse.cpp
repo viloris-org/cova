@@ -168,7 +168,7 @@ constexpr std::array kCommandNames = {
     CommandName{"sysroot", "list", CommandId::SysrootList},
     CommandName{"sysroot", "install", CommandId::SysrootInstall},
     CommandName{"sysroot", "verify", CommandId::SysrootVerify},
-    CommandName{"sysroot", "gc", CommandId::SysrootVerify},
+    CommandName{"sysroot", "gc", CommandId::SysrootGc},
     CommandName{"target", "list", CommandId::TargetList},
     CommandName{"cache", "gc", CommandId::CacheGc},
 };
@@ -255,6 +255,8 @@ std::string_view to_string(CommandId id) {
       return "sysroot install";
     case CommandId::SysrootVerify:
       return "sysroot verify";
+    case CommandId::SysrootGc:
+      return "sysroot gc";
     case CommandId::TargetList:
       return "target list";
     case CommandId::CacheGc:
@@ -620,6 +622,7 @@ std::string top_level_help() {
          "  sysroot list           List installed sysroots\n"
          "  sysroot install        Install a sysroot\n"
          "  sysroot verify         Verify an installed sysroot\n"
+         "  sysroot gc             Reclaim unreferenced sysroot store content\n"
          "  target list            List supported targets\n"
          "  doctor                 Diagnose the development environment\n"
          "\n"
@@ -747,12 +750,13 @@ std::string help_text(std::string_view topic) {
                        "  cova toolchain gc [--dry-run]       Reclaim unused components\n");
   }
   if (topic == "sysroot") {
-    return usage_block("sysroot", "<list|install|verify> [options]",
+    return usage_block("sysroot", "<list|install|verify|gc> [options]",
                        "Manage sysroots (§8).\n\n"
                        "  cova sysroot list [--json]              List installed sysroots\n"
                        "  cova sysroot install --target T [--from <archive>]\n"
                        "                                    [--registry <dir>]\n"
-                       "  cova sysroot verify [<id>]              Verify integrity\n");
+                       "  cova sysroot verify [<id>]              Verify integrity\n"
+                       "  cova sysroot gc [--dry-run] [--yes]     Reclaim unreferenced store content\n");
   }
   if (topic == "target") {
     return usage_block("target", "list [--json]",

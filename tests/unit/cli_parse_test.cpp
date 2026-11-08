@@ -55,6 +55,12 @@ COVA_TEST_NAMED(cli, parses_command_groups) {
   auto sysroot = parse_args({"cova", "sysroot", "verify"});
   COVA_CHECK(sysroot.invocation.command == CommandId::SysrootVerify);
 
+  // `gc` is a distinct command; it must not silently run `verify`.
+  auto sysroot_gc = parse_args({"cova", "sysroot", "gc"});
+  COVA_CHECK(sysroot_gc.error.empty());
+  COVA_CHECK(sysroot_gc.invocation.command == CommandId::SysrootGc);
+  COVA_CHECK(sysroot_gc.invocation.command != CommandId::SysrootVerify);
+
   auto targets = parse_args({"cova", "target", "list"});
   COVA_CHECK(targets.invocation.command == CommandId::TargetList);
 }

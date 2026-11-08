@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -387,9 +388,143 @@ Status store_toolchain_lock(const LoadedProject& project, const LockState& state
   return lock.save(project.layout.toolchain_lock);
 }
 
-Result<build::PlanResult> plan_for(CommandContext& ctx, const LoadedProject& project,
-                                   const toolchain::ResolvedToolchain& tc,
-                                   const platform::Triple& target, bool include_tests) {
+namespace {
+
+stdfs::path project_lock_root(const LoadedProject& project) {
+  if (project.workspace) {
+    return project.workspace->root_dir;
+  }
+  return project.layout.root;
+}
+
+// Loads every workspace member manifest, in workspace order.
+Result<std::vector<manifest::Manifest>> load_member_manifests(const LoadedProject& project) {
+  std::vector<manifest::Manifest> members;
+  if (!project.workspace) {
+    return members;
+  }
+  members.reserve(project.workspace->members.size());
+  for (const auto& entry : project.workspace->members) {
+    auto loaded = manifest::load(entry.root / "cova.toml");
+    if (!loaded) {
+      return fail<std::vector<manifest::Manifest>>(loaded.error());
+    }
+    members.push_back(std::move(loaded->manifest));
+  }
+  return members;
+}
+
+// The packages a command acts on. In a workspace, a bare `cova build` at the
+// root acts on every member, a `--package` selection narrows it, and a command
+// run inside a member acts on that member.
+std::vector<std::string> selected_roots(CommandContext& ctx, const LoadedProject& project,
+                                        const std::vector<manifest::Manifest>& members) {
+  std::vector<std::string> selected;
+  if (!project.workspace) {
+    selected.push_back(project.manifest.package.name);
+    return selected;
+  }
+  const bool workspace_wide = ctx.flags.boolean("workspace") ||
+                              (project.is_workspace_root && !ctx.flags.has("package"));
+  if (workspace_wide) {
+    for (const auto& member : members) {
+      selected.push_back(member.package.name);
+    }
+    return selected;
+  }
+  if (auto package = ctx.flags.get("package"); package && !package->empty()) {
+    selected.push_back(*package);
+    return selected;
+  }
+  const std::string loaded_root =
+      fs::generic_string(fs::absolute_normalized(project.manifest.root));
+  for (const auto& member : members) {
+    if (fs::generic_string(fs::absolute_normalized(member.root)) == loaded_root) {
+      selected.push_back(member.package.name);
+      return selected;
+    }
+  }
+  selected.push_back(project.manifest.package.name);
+  return selected;
+}
+
+}  // namespace
+
+Result<DependencyState> resolve_dependencies(CommandContext& ctx, const LoadedProject& project,
+                                             const platform::Triple& target, bool apply_lock,
+                                             bool include_dev) {
+  auto members = load_member_manifests(project);
+  if (!members) {
+    return fail<DependencyState>(members.error());
+  }
+
+  package::ResolveRequest request;
+  request.target = target;
+  request.include_dev = include_dev;
+  request.workspace_members = *members;
+  request.lock_root = project_lock_root(project);
+  if (project.workspace) {
+    // One shared lockfile: every member participates in resolution even when
+    // this command builds only one of them.
+    request.roots = *members;
+  } else {
+    request.roots.push_back(project.manifest);
+  }
+
+  auto graph = package::resolve(request);
+  if (!graph) {
+    return fail<DependencyState>(graph.error());
+  }
+
+  DependencyState state;
+  state.graph = std::move(*graph);
+  state.roots = selected_roots(ctx, project, *members);
+  state.lockfile = request.lock_root / "cova.lock";
+  for (const auto& name : state.roots) {
+    if (state.graph.find(name) == nullptr) {
+      return fail<DependencyState>(Error::make("cova::cli::unknown_package",
+                                               "no package named `" + name + "` was resolved"));
+    }
+  }
+
+  if (apply_lock) {
+    auto outcome =
+        package::enforce_lock(state.graph, state.lockfile, ctx.global.locked_mode());
+    if (!outcome) {
+      return fail<DependencyState>(outcome.error());
+    }
+    state.lock_written = outcome->wrote;
+    state.lock_up_to_date = outcome->up_to_date;
+  }
+
+  std::set<std::string> reachable(state.roots.begin(), state.roots.end());
+  std::vector<std::string> pending(state.roots.begin(), state.roots.end());
+  while (!pending.empty()) {
+    const std::string name = pending.back();
+    pending.pop_back();
+    const auto* resolved = state.graph.find(name);
+    if (resolved == nullptr) {
+      continue;
+    }
+    for (const auto& dependency : resolved->build_dependencies) {
+      if (reachable.insert(dependency).second) {
+        pending.push_back(dependency);
+      }
+    }
+  }
+  for (const auto& package : state.graph.packages) {
+    if (reachable.contains(package.manifest.package.name)) {
+      state.build_packages.push_back(package.manifest);
+    }
+  }
+  return state;
+}
+
+Result<build::PlanResult> plan_with_dependencies(CommandContext& ctx, const LoadedProject& project,
+                                                 const DependencyState& dependencies,
+                                                 const toolchain::ResolvedToolchain& tc,
+                                                 const platform::Triple& target,
+                                                 bool include_tests) {
   build::PlanOptions options;
   options.target = target;
   options.profile = selected_profile(ctx);
@@ -399,19 +534,39 @@ Result<build::PlanResult> plan_for(CommandContext& ctx, const LoadedProject& pro
   options.explain = ctx.global.verbose;
   options.workspace = ctx.flags.boolean("workspace") || project.is_workspace_root;
 
-  if (project.workspace && options.workspace) {
-    build::WorkspaceProject ws_project;
-    ws_project.root_manifest = project.workspace->root;
-    for (const auto& member : project.workspace->members) {
-      auto member_manifest = manifest::load(member.root / "cova.toml");
-      if (!member_manifest) {
-        return fail<build::PlanResult>(member_manifest.error());
-      }
-      ws_project.members.push_back(std::move(member_manifest->manifest));
-    }
-    return build::plan_workspace(ws_project, tc, options, project.layout.target_dir);
+  if (dependencies.build_packages.size() == 1) {
+    return build::plan_package(dependencies.build_packages.front(), tc, options,
+                               project.layout.target_dir);
   }
-  return build::plan_package(project.manifest, tc, options, project.layout.target_dir);
+  build::WorkspaceProject ws_project;
+  if (project.workspace) {
+    ws_project.root_manifest = project.workspace->root;
+  }
+  ws_project.members = dependencies.build_packages;
+  ws_project.roots = dependencies.roots;
+  return build::plan_workspace(ws_project, tc, options, project.layout.target_dir);
+}
+
+Result<build::PlanResult> plan_for(CommandContext& ctx, const LoadedProject& project,
+                                   const toolchain::ResolvedToolchain& tc,
+                                   const platform::Triple& target, bool include_tests) {
+  auto dependencies = resolve_dependencies(ctx, project, target, /*apply_lock=*/false,
+                                            include_tests);
+  if (!dependencies) {
+    return fail<build::PlanResult>(dependencies.error());
+  }
+  return plan_with_dependencies(ctx, project, *dependencies, tc, target, include_tests);
+}
+
+Result<stdfs::path> write_compile_commands(const LoadedProject& project,
+                                           const build::PlanResult& plan) {
+  const stdfs::path root = project.workspace ? project.workspace->root_dir : project.layout.root;
+  const stdfs::path path = root / "compile_commands.json";
+  auto status = fs::write_file_atomic(path, build::compile_commands_json(plan));
+  if (!status) {
+    return fail<stdfs::path>(status.error());
+  }
+  return path;
 }
 
 }  // namespace cova::cli
