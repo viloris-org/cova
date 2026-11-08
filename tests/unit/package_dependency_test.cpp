@@ -120,10 +120,16 @@ COVA_TEST_NAMED(package, target_filters_change_the_build_edges_not_the_lock) {
   cova::test::TempDir temp;
   const auto math_root = stdfs::path(temp.path()) / "math";
   const auto app_root = stdfs::path(temp.path()) / "app";
+  // A target that is not this host, so the filter really excludes the edge on
+  // both x86_64 and aarch64 runners.
+  const std::string other_target =
+      cova::platform::host_triple().arch == cova::platform::Arch::Aarch64
+          ? "x86_64-unknown-linux-gnu"
+          : "aarch64-unknown-linux-gnu";
   write_project(math_root, "math", "static-library");
   write_project(app_root, "app", "executable",
-                "[dependencies]\nmath = { path = \"../math\", target = "
-                "[\"aarch64-unknown-linux-gnu\"] }\n");
+                "[dependencies]\nmath = { path = \"../math\", target = [\"" + other_target +
+                    "\"] }\n");
 
   auto graph = COVA_REQUIRE_OK(
       cova::package::resolve(request_for({load_manifest(app_root)}, app_root)));

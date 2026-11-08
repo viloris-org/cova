@@ -69,7 +69,7 @@ CliRun run_cli(const std::vector<std::string>& args) {
 // installs `g++-15` rather than a `g++` alias, and a test that silently skipped
 // on such a host would hide real breakage.
 bool has_cxx_driver() {
-  for (const std::string& name : {"g++", "clang++", "c++"}) {
+  for (const std::string_view name : {"g++", "clang++", "c++"}) {
     if (cova::fs::find_in_path(name).has_value()) {
       return true;
     }
@@ -87,6 +87,20 @@ bool has_cxx_driver() {
     }
   }
   return false;
+}
+
+// A Linux target that is not this host, so a cross build stays cross on both
+// x86_64 and aarch64 runners.
+std::string non_host_linux_target() {
+  return cova::platform::host_triple().arch == cova::platform::Arch::Aarch64
+             ? "x86_64-unknown-linux-gnu"
+             : "aarch64-unknown-linux-gnu";
+}
+
+std::string non_host_driver_prefix() {
+  return cova::platform::host_triple().arch == cova::platform::Arch::Aarch64
+             ? "x86_64-linux-gnu"
+             : "aarch64-linux-gnu";
 }
 
 #define COVA_SKIP_UNLESS_CXX_DRIVER()                                                              \
@@ -472,6 +486,8 @@ COVA_TEST_NAMED(integration, shell_escapes_are_never_interpreted) {
 
 COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) {
   COVA_SKIP_UNLESS_TOOL("tar");
+  const std::string target_text = non_host_linux_target();
+  const std::string driver = non_host_driver_prefix() + "-g++";
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
   const stdfs::path base = temp.path();
@@ -479,13 +495,13 @@ COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) 
   const stdfs::path stage = base / "stage" / "fake-cross";
   const stdfs::path archive = registry / "archives" / "fake-cross.tar.gz";
 
-  write_text(stage / "bin" / "aarch64-linux-gnu-g++", kFakeCompiler);
-  make_executable(stage / "bin" / "aarch64-linux-gnu-g++");
+  write_text(stage / "bin" / driver, kFakeCompiler);
+  make_executable(stage / "bin" / driver);
   write_text(stage / "toolchain.toml", "id = \"fake-cross\"\n"
                                        "family = \"gcc\"\n"
                                        "version = \"14.2.0\"\n"
-                                       "target = \"aarch64-unknown-linux-gnu\"\n"
-                                       "compiler = \"bin/aarch64-linux-gnu-g++\"\n");
+                                       "target = \"" + target_text +
+                                           "\"\ncompiler = \"bin/" + driver + "\"\n");
   stdfs::create_directories(archive.parent_path());
   auto tar = cova::proc::run(
       "tar", {"-czf", archive.string(), "-C", (base / "stage").string(), "fake-cross"});
@@ -496,15 +512,14 @@ COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) 
                                       "id = \"fake-cross\"\n"
                                       "family = \"gcc\"\n"
                                       "version = \"14.2.0\"\n"
-                                      "target = \"aarch64-unknown-linux-gnu\"\n"
-                                      "archive = \"archives/fake-cross.tar.gz\"\n"
+                                      "target = \"" + target_text +
+                                          "\"\narchive = \"archives/fake-cross.tar.gz\"\n"
                                       "sha256 = \"" +
                                           digest +
                                           "\"\n"
                                           "size-bytes = " +
                                           std::to_string(cova::fs::file_size(archive)) +
-                                          "\n"
-                                          "compiler = \"bin/aarch64-linux-gnu-g++\"\n");
+                                          "\ncompiler = \"bin/" + driver + "\"\n");
 
   {
     ScopedCwd cwd(base);
@@ -515,7 +530,7 @@ COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) 
   }
 
   ScopedCwd cwd(base / "fake");
-  auto built = run_cli({"build", "--target", "aarch64-unknown-linux-gnu"});
+  auto built = run_cli({"build", "--target", target_text});
   COVA_CHECK(!built.ok());
   COVA_CHECK(contains(built.combined(), "cannot inspect") ||
              contains(built.combined(), "artifact"));

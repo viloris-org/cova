@@ -532,11 +532,19 @@ COVA_TEST_NAMED(build, planner_builds_dependencies_for_the_requested_target) {
   project.members = {fixture.base, fixture.math, fixture.app};
   project.roots = {"app"};
 
-  auto target = COVA_REQUIRE_OK(cova::platform::Triple::parse("aarch64-unknown-linux-gnu"));
+  // Pick a target that is not the host: a cross build is what emits the
+  // `--target` flag this test asserts on, and on an aarch64 host the usual
+  // fixture target would be native.
+  const bool host_is_aarch64 =
+      cova::platform::host_triple().arch == cova::platform::Arch::Aarch64;
+  const std::string target_text =
+      host_is_aarch64 ? "x86_64-unknown-linux-gnu" : "aarch64-unknown-linux-gnu";
+  const std::string target_short = host_is_aarch64 ? "x86_64" : "aarch64";
+  auto target = COVA_REQUIRE_OK(cova::platform::Triple::parse(target_text));
   cova::build::PlanOptions options;
   options.target = target;
   options.profile = "dev";
-  auto toolchain = dummy_toolchain("/usr/bin/aarch64-linux-gnu-ar");
+  auto toolchain = dummy_toolchain("/usr/bin/" + target_short + "-linux-gnu-ar");
   toolchain.descriptor.family = "clang";
   auto plan = COVA_REQUIRE_OK(cova::build::plan_workspace(
       project, toolchain, options, std::filesystem::path(temp.path()) / "target"));
@@ -550,10 +558,11 @@ COVA_TEST_NAMED(build, planner_builds_dependencies_for_the_requested_target) {
     COVA_CHECK_MSG(action->argv.size() > 2, action->label);
     bool has_target_flag = false;
     for (const auto& argument : action->argv) {
-      has_target_flag = has_target_flag || argument == "--target=aarch64-unknown-linux-gnu";
+      has_target_flag = has_target_flag || argument == "--target=" + target_text;
     }
     COVA_CHECK_MSG(has_target_flag, action->label);
-    COVA_CHECK(action->outputs.front().path.string().find("aarch64") != std::string::npos);
+    COVA_CHECK_MSG(action->outputs.front().path.string().find(target_short) != std::string::npos,
+                   action->outputs.front().path.string());
     if (action->package == "base") {
       saw_base_compile = true;
     }

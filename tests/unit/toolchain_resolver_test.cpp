@@ -30,6 +30,20 @@ void write_cross_driver_script(const std::filesystem::path& path) {
                                std::filesystem::perm_options::add, ec);
 }
 
+// A Linux target that is not this host, so "cross" stays cross on both
+// x86_64 and aarch64 runners.
+std::string non_host_linux_target() {
+  return cova::platform::host_triple().arch == cova::platform::Arch::Aarch64
+             ? "x86_64-unknown-linux-gnu"
+             : "aarch64-unknown-linux-gnu";
+}
+
+std::string non_host_driver_prefix() {
+  return cova::platform::host_triple().arch == cova::platform::Arch::Aarch64
+             ? "x86_64-linux-gnu"
+             : "aarch64-linux-gnu";
+}
+
 cova::toolchain::ToolchainDescriptor
 fake_descriptor(const std::string& family, const std::string& target_text, bool self_contained) {
   const auto target = *cova::platform::Triple::parse(target_text);
@@ -147,7 +161,7 @@ COVA_TEST_NAMED(toolchain, recognises_cross_and_versioned_driver_names) {
 COVA_TEST_NAMED(toolchain, discovery_recognises_prefixed_cross_driver) {
   cova::test::TempDir temp;
   const auto bin = std::filesystem::path(temp.path()) / "bin";
-  write_cross_driver_script(bin / "aarch64-linux-gnu-g++");
+  write_cross_driver_script(bin / (non_host_driver_prefix() + "-g++"));
 
   cova::toolchain::DiscoveryOptions options;
   options.include_system = false;
@@ -163,13 +177,13 @@ COVA_TEST_NAMED(toolchain, discovery_recognises_prefixed_cross_driver) {
   COVA_CHECK_EQ(discovered.front().family, std::string("gcc"));
   COVA_CHECK(discovered.front().self_contained);
   const auto& supported = discovered.front().supported_targets;
-  COVA_CHECK(std::find(supported.begin(), supported.end(), "aarch64-unknown-linux-gnu") !=
+  COVA_CHECK(std::find(supported.begin(), supported.end(), non_host_linux_target()) !=
              supported.end());
 }
 
 COVA_TEST_NAMED(toolchain, host_gcc_cannot_satisfy_a_cross_target) {
   cova::toolchain::ResolutionRequest request;
-  request.target = *cova::platform::Triple::parse("aarch64-unknown-linux-gnu");
+  request.target = *cova::platform::Triple::parse(non_host_linux_target());
   request.allow_install = false;
   request.offline = true;
   request.probe_capabilities = false;
@@ -191,7 +205,7 @@ COVA_TEST_NAMED(toolchain, cross_clang_uses_a_system_sysroot) {
   cova::test::ScopedEnv sysroot_env("COVA_SYSROOT", root.string());
 
   cova::toolchain::ResolutionRequest request;
-  request.target = *cova::platform::Triple::parse("aarch64-unknown-linux-gnu");
+  request.target = *cova::platform::Triple::parse(non_host_linux_target());
   request.allow_install = false;
   request.offline = true;
   request.probe_capabilities = false;
