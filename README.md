@@ -82,6 +82,37 @@ What deliberately does **not** work yet, by design:
   planner does not emit scans rather than pretending.
 - **No remote execution.** `--runner remote` is rejected explicitly.
 
+## Installing a binary
+
+Every published build is a beta. One line, Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/viloris-org/cova/main/install.sh | sh
+```
+
+The script resolves the latest beta from GitHub Releases, verifies the download
+against the release's `SHA256SUMS`, and installs to `/usr/local/bin` (or
+`~/.local/bin` when that is not writable). `COVA_VERSION` pins a specific
+version; `COVA_BIN_DIR` overrides the destination.
+
+Native packages are attached to each release:
+
+| Platform | Assets |
+|---|---|
+| Linux x86_64 / aarch64 | `.deb`, `.rpm`, pacman `.pkg.tar.zst`, `.tar.gz` |
+| macOS Intel + Apple Silicon | universal `.pkg`, `.dmg`, `.tar.gz` |
+
+The Linux binaries are statically linked, so one package works across
+distributions. Windows is not published: its process-execution backend is an
+explicit "unsupported" stub, so a Windows binary could not compile or link
+anything.
+
+### Releasing
+
+Pushing a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml),
+which builds each target on a native runner, packages it, and publishes a
+pre-release with the checksums. See [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Building from source
 
 Cova has no third-party dependencies. Building from source requires a
@@ -232,6 +263,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - [docs/MILESTONES.md](docs/MILESTONES.md) — what is delivered per milestone and how it is verified
 - [docs/TOOLCHAIN-RESOLUTION.md](docs/TOOLCHAIN-RESOLUTION.md) — the resolution chain in detail
 - [docs/REGISTRY.md](docs/REGISTRY.md) — trusted local component registry schema and install rules
+- [docs/RELEASING.md](docs/RELEASING.md) — cutting a release, package formats and signing
 
 ## License
 

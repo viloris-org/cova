@@ -65,6 +65,37 @@ CliRun run_cli(const std::vector<std::string>& args) {
     }                                                                                              \
   } while (false)
 
+// True when any C++ driver is reachable, versioned forms included. Homebrew
+// installs `g++-15` rather than a `g++` alias, and a test that silently skipped
+// on such a host would hide real breakage.
+bool has_cxx_driver() {
+  for (const std::string& name : {"g++", "clang++", "c++"}) {
+    if (cova::fs::find_in_path(name).has_value()) {
+      return true;
+    }
+  }
+  for (const std::filesystem::path& directory : cova::fs::path_entries()) {
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+      const std::string filename = it->path().filename().string();
+      for (const std::string& prefix : {"g++-", "clang++-"}) {
+        if (filename.rfind(prefix, 0) == 0) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+#define COVA_SKIP_UNLESS_CXX_DRIVER()                                                              \
+  do {                                                                                             \
+    if (!has_cxx_driver()) {                                                                       \
+      return;                                                                                      \
+    }                                                                                              \
+  } while (false)
+
 // Restores the working directory on scope exit.
 class ScopedCwd {
 public:
@@ -281,7 +312,7 @@ COVA_TEST_NAMED(integration, build_outside_a_project_fails_clearly) {
 }
 
 COVA_TEST_NAMED(integration, end_to_end_new_build_run) {
-  COVA_SKIP_UNLESS_TOOL("g++");
+  COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
   {
@@ -310,7 +341,7 @@ COVA_TEST_NAMED(integration, end_to_end_new_build_run) {
 }
 
 COVA_TEST_NAMED(integration, incremental_build_rebuilds_nothing_when_unchanged) {
-  COVA_SKIP_UNLESS_TOOL("g++");
+  COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
   {
@@ -337,7 +368,7 @@ COVA_TEST_NAMED(integration, incremental_build_rebuilds_nothing_when_unchanged) 
 }
 
 COVA_TEST_NAMED(integration, clean_removes_artifacts_but_keeps_sources) {
-  COVA_SKIP_UNLESS_TOOL("g++");
+  COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
   {
@@ -583,7 +614,7 @@ bool arguments_contain(const cova::json::Value& entry, std::string_view needle) 
 }  // namespace
 
 COVA_TEST_NAMED(integration, path_dependency_outside_a_workspace_builds_and_links) {
-  COVA_SKIP_UNLESS_TOOL("g++");
+  COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
   const auto fixture = write_dependency_fixture(stdfs::path(temp.path()));
@@ -647,7 +678,7 @@ COVA_TEST_NAMED(integration, path_dependency_outside_a_workspace_builds_and_link
 }
 
 COVA_TEST_NAMED(integration, lockfile_is_written_and_enforced) {
-  COVA_SKIP_UNLESS_TOOL("g++");
+  COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
   const auto fixture = write_dependency_fixture(stdfs::path(temp.path()));
@@ -716,7 +747,7 @@ math = { path = "../deps/math" }
 }
 
 COVA_TEST_NAMED(integration, workspace_emits_one_compile_database) {
-  COVA_SKIP_UNLESS_TOOL("g++");
+  COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
   const stdfs::path root = stdfs::path(temp.path()) / "ws";

@@ -3,6 +3,7 @@
 /.dir/
 /out/
 /artifacts/
+/dist/
 
 # Compiled objects and libraries
 *.o

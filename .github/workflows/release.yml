@@ -1,0 +1,289 @@
+# Cova — release pipeline.
+#
+# Triggered by publishing a `v*` tag, or manually with an existing tag. Every
+# published build is a beta, so the release is always a pre-release (PRD §26.2).
+#
+# Each target is built on a native GitHub-hosted runner rather than
+# cross-compiled, so the packages are produced by the toolchain that ships with
+# the platform they target:
+#
+#   ubuntu-24.04       x86_64 Linux   .deb .rpm pacman .tar.gz
+#   ubuntu-24.04-arm   aarch64 Linux  .deb .rpm pacman .tar.gz
+#   macos-15-intel     x86_64 Mach-O  feeds the universal build
+#   macos-15           arm64 Mach-O   feeds the universal build
+#   macos-15           universal     .pkg .dmg .tar.gz
+#
+# Windows is deliberately absent: its process-execution backend is an explicit
+# "unsupported" stub, so a Windows binary could not compile or link anything.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, e.g. v0.1.0-beta-1'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install build and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build rpm libarchive-tools zstd file
+
+      - name: Build static release binary
+        env:
+          COVA_CXXFLAGS: -O2 -DNDEBUG -static
+          COVA_LDFLAGS: -static
+        run: python3 scripts/devbuild.py build -j "$(nproc)"
+
+      - name: Test
+        env:
+          COVA_CXXFLAGS: -O2 -DNDEBUG -static
+          COVA_LDFLAGS: -static
+        run: python3 scripts/devbuild.py test -j "$(nproc)"
+
+      - name: Strip
+        run: strip build/bin/cova
+
+      - name: Build packages
+        env:
+          COVA_BINARY: ${{ github.workspace }}/build/bin/cova
+        run: |
+          file build/bin/cova
+          bash scripts/package/build-all.sh
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macos-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install toolchain
+        # GCC, not Apple Clang: the C++26 baseline Cova needs (<expected>,
+        # <print>, concepts, ranges, designated initializers) is still ahead of
+        # the Clang that ships with Xcode. The bootstrap probe is the authority.
+        run: |
+          brew install --quiet gcc ninja
+          prefix="$(brew --prefix)"
+          gxx="$(ls -1 "$prefix"/bin/g++-* 2>/dev/null | sort -V | tail -1)"
+          [ -n "$gxx" ] || { echo "::error::Homebrew GCC not found"; exit 1; }
+          echo "COVA_CXX=$gxx" >> "$GITHUB_ENV"
+          "$gxx" --version | head -1
+
+      - name: Build
+        env:
+          COVA_CXXFLAGS: -O2 -DNDEBUG
+          COVA_LDFLAGS: -static-libstdc++ -static-libgcc
+        run: python3 scripts/devbuild.py build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Test
+        env:
+          COVA_CXXFLAGS: -O2 -DNDEBUG
+          COVA_LDFLAGS: -static-libstdc++ -static-libgcc
+        run: python3 scripts/devbuild.py test -j "$(sysctl -n hw.ncpu)"
+
+      - name: Check runtime dependencies
+        # A binary that still points at Homebrew's libstdc++ would not start on
+        # a clean Mac, so fail here instead of shipping it.
+        run: |
+          otool -L build/bin/cova
+          if otool -L build/bin/cova | grep -iE 'homebrew|/opt/local|/usr/local/opt'; then
+            echo "::error::cova links a package-manager library path"
+            exit 1
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cova-macos-${{ matrix.arch }}
+          path: build/bin/cova
+          if-no-files-found: error
+
+  macos-universal:
+    name: macos-universal
+    needs: macos
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download per-architecture binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cova-macos-*
+          path: stage
+
+      - name: Create universal binary
+        run: |
+          mkdir -p dist
+          lipo -create \
+            stage/cova-macos-x86_64/cova \
+            stage/cova-macos-arm64/cova \
+            -output dist/cova
+          chmod +x dist/cova
+          lipo -info dist/cova
+          # lipo drops the signature, and Apple Silicon refuses unsigned
+          # binaries, so re-apply an ad-hoc signature.
+          codesign --force --sign - dist/cova
+          codesign --verify --verbose dist/cova
+          dist/cova --version
+
+      - name: Build .pkg, .dmg and universal tarball
+        env:
+          COVA_BINARY: ${{ github.workspace }}/dist/cova
+          COVA_PACKAGE_ARCH: universal
+          COVA_PACKAGE_OS: macos
+        run: bash scripts/package/build-all.sh
+
+      - name: Upload macOS installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [linux, macos-universal]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          # Per-job SHA256SUMS files are merged in too; drop them so the
+          # published file describes only the installable artifacts.
+          rm -f SHA256SUMS
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          Cova $VERSION — beta.
+
+          Cova is a cross-compilation-first build system, package manager and
+          toolchain manager for C/C++, written in C++26. This is the first
+          tagged beta: the manifest schema and the main CLI are expected to stay
+          compatible from here, and any change to them gets called out in the
+          release notes.
+
+          ## Install
+
+          One line, Linux or macOS:
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/viloris-org/cova/main/install.sh | sh
+          \`\`\`
+
+          The script downloads the latest beta, verifies it against SHA256SUMS
+          and installs to /usr/local/bin (or ~/.local/bin if that is not
+          writable). Set COVA_VERSION to pin a version.
+
+          ## Packages
+
+          | Platform | Assets |
+          |---|---|
+          | Linux x86_64 / aarch64 | \`.deb\`, \`.rpm\`, pacman \`.pkg.tar.zst\`, \`.tar.gz\` |
+          | macOS Intel + Apple Silicon | universal \`.pkg\`, \`.dmg\`, \`.tar.gz\` |
+
+          The Linux binaries are statically linked, so the same package works
+          across distributions. The macOS binaries in the universal packages are
+          signed ad-hoc, not with an Apple Developer ID: Gatekeeper asks for a
+          one-time override, described in the README inside the image.
+
+          Windows is not published in this release. Cova's Windows
+          process-execution backend is an explicit "unsupported" stub, so a
+          Windows build could not compile or link anything.
+
+          ## What works
+
+          See [README.md](https://github.com/viloris-org/cova/blob/main/README.md#status)
+          and [docs/MILESTONES.md](https://github.com/viloris-org/cova/blob/main/docs/MILESTONES.md).
+          In short: project creation, the full manifest, target model, toolchain
+          discovery/resolution, cross compilation, sysroots, managed toolchain
+          install from a trusted local registry, incremental builds, local path
+          dependencies, the lockfile, the compilation database, workspaces, and
+          self-hosting.
+
+          Remote dependency management and network component downloads are not
+          implemented and fail explicitly rather than simulating a fetch.
+          EOF
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          # The release job has no checkout, so GH_REPO names the repository
+          # explicitly instead of relying on a git remote.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --repo "$GH_REPO" \
+              --title "Cova $VERSION" \
+              --prerelease \
+              --notes-file notes.md
+          gh release upload "$TAG" dist/* --repo "$GH_REPO" --clobber
