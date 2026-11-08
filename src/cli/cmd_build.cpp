@@ -16,6 +16,7 @@
 #include "build/planner.hpp"
 #include "build/scheduler/scheduler.hpp"
 #include "cli/common.hpp"
+#include "cli/progress.hpp"
 #include "core/diagnostics/diagnostic.hpp"
 #include "core/filesystem/filesystem.hpp"
 #include "core/json/json.hpp"
@@ -26,6 +27,13 @@ namespace cova::cli {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// Status/progress is for humans: it is suppressed by --quiet and by --json,
+// where stdout must remain a machine-readable document and stderr should stay
+// quiet unless something is wrong.
+bool status_enabled(const CommandContext& ctx) {
+  return !ctx.global.quiet && !ctx.global.json;
+}
 
 std::string project_label(const LoadedProject& project) {
   if (!project.manifest.package.name.empty()) {
@@ -67,13 +75,21 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
   }
   out.target = *target;
 
+  // Preparation can spend seconds probing compilers. Animate the stage on a
+  // terminal; in a pipe each stage still prints one line when it starts.
+  StageProgress stages(*ctx.ui, status_enabled(ctx), ctx.global.verbose,
+                       ctx.global.use_color(stderr_is_tty()));
+
   // Resolve local dependencies and enforce the shared lockfile before any
   // expensive toolchain probing.
+  stages.begin("Resolving dependencies");
   auto dependencies =
       resolve_dependencies(ctx, out.project, out.target, /*apply_lock=*/true, include_tests);
   if (!dependencies) {
+    stages.cancel();
     return report_error(dependencies.error(), ctx);
   }
+  stages.finish();
   if (dependencies->lock_written) {
     ctx.ui->verbose("wrote " + fs::generic_string(dependencies->lockfile));
   } else if (dependencies->lock_up_to_date) {
@@ -114,17 +130,25 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
     out.lock_state = std::move(*lock_state);
   }
 
+  // Resolution runs real compiler probes, which is the slowest and least
+  // observable part of a cold build. Say so before waiting on it.
+  stages.begin("Resolving toolchain for " + out.target.to_string());
   auto resolved = resolve_toolchain_or_report(ctx, request);
   if (!resolved) {
+    stages.cancel();
     return 1;
   }
+  stages.finish();
   out.toolchain = std::move(*resolved);
 
+  stages.begin("Planning build");
   auto plan = plan_with_dependencies(ctx, out.project, *dependencies, out.toolchain, out.target,
                                      include_tests);
   if (!plan) {
+    stages.cancel();
     return report_error(plan.error(), ctx);
   }
+  stages.finish();
   out.plan = std::move(*plan);
 
   auto compile_commands = write_compile_commands(out.project, out.plan);
@@ -262,9 +286,8 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     return local_state.is_up_to_date(action, reason);
   };
 
-  build::Executor executor(prepared.plan.graph, env, options, is_up_to_date);
-
   if (dry_run) {
+    build::Executor executor(prepared.plan.graph, env, options, is_up_to_date);
     auto result = executor.dry_run();
     if (!result) {
       return report_error(result.error(), ctx);
@@ -278,29 +301,47 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     return 0;
   }
 
-  bool printed_progress = false;
-  if (!ctx.global.quiet) {
-    options.on_finish = [&](const build::Action& action, const build::ActionOutcome& outcome) {
-      if (outcome.skipped) {
-        if (ctx.global.verbose) {
-          ctx.ui->verbose(action.label + " (" + outcome.skip_reason + ")");
-        }
-        return;
-      }
-      printed_progress = true;
-      if (outcome.succeeded) {
-        ctx.ui->verbose(action.label + "  " + format_duration(outcome.duration));
-      }
-    };
+  // From here on the build can take minutes. Report each action as it happens;
+  // on a terminal the reporter redraws one line (with a heartbeat), in a pipe
+  // it prints one line per finished action. It also owns the "checking what
+  // needs rebuilding" phase, whose spinner covers the incremental check before
+  // the first action starts.
+  const bool show_status = status_enabled(ctx);
+  ProgressReporter::Options progress;
+  progress.header = "Compiling `" + project_label(prepared.project) + "`";
+  const std::string& version = prepared.project.manifest.package.version;
+  if (!version.empty()) {
+    progress.header += " v" + version;
   }
+  progress.header += " (" + selected_profile(ctx) + ") with " +
+                     prepared.toolchain.descriptor.label() + " for " +
+                     prepared.target.to_string();
+  progress.total = prepared.plan.graph.size();
+  progress.verbose = ctx.global.verbose;
+  progress.use_color = ctx.global.use_color(stderr_is_tty());
+  ProgressReporter reporter(*ctx.ui, std::move(progress), show_status);
 
+  options.on_start = [&reporter](const build::Action& action) {
+    reporter.action_started(action);
+  };
+  options.on_finish = [&](const build::Action& action, const build::ActionOutcome& outcome) {
+    reporter.action_finished(action, outcome);
+    if (!ctx.global.quiet && outcome.skipped && ctx.global.verbose) {
+      ctx.ui->verbose(action.label + " (" + outcome.skip_reason + ")");
+    }
+  };
+
+  // The executor snapshots its options, so the callbacks must be installed
+  // before it is constructed.
+  build::Executor executor(prepared.plan.graph, env, options, is_up_to_date);
   auto result = executor.run();
+  // Clear the transient line before diagnostics or the summary are printed.
+  reporter.stop();
   if (!result) {
     return report_error(result.error(), ctx);
   }
 
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-  (void)printed_progress;
 
   // Persist incremental state for every action whose outputs are current,
   // including ones skipped by this run. Successful compiles additionally record
@@ -561,9 +602,23 @@ int cmd_check(CommandContext& ctx) {
   options.quiet = ctx.global.quiet;
   options.verbose = ctx.global.verbose;
   options.use_color = ctx.global.use_color(stdout_is_tty());
+
+  ProgressReporter::Options progress;
+  progress.header = "Checking `" + project_label(prepared.project) + "` with " +
+                    prepared.toolchain.descriptor.label() + " for " +
+                    prepared.target.to_string();
+  progress.total = prepared.plan.graph.size();
+  progress.verbose = ctx.global.verbose;
+  progress.use_color = ctx.global.use_color(stderr_is_tty());
+  ProgressReporter reporter(*ctx.ui, std::move(progress), status_enabled(ctx));
+
+  options.on_start = [&reporter](const build::Action& action) {
+    reporter.action_started(action);
+  };
   options.on_finish = [&](const build::Action& action, const build::ActionOutcome& outcome) {
-    if (outcome.succeeded && !outcome.skipped && ctx.global.verbose) {
-      ctx.ui->verbose(action.label);
+    reporter.action_finished(action, outcome);
+    if (!ctx.global.quiet && outcome.skipped && ctx.global.verbose) {
+      ctx.ui->verbose(action.label + " (" + outcome.skip_reason + ")");
     }
   };
 
@@ -578,6 +633,7 @@ int cmd_check(CommandContext& ctx) {
         return local_state.is_up_to_date(action, reason);
       });
   auto result = executor.run();
+  reporter.stop();
   if (!result) {
     return report_error(result.error(), ctx);
   }

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "core/diagnostics/diagnostic.hpp"
@@ -33,6 +34,16 @@ void split_compiler_spec(std::string_view spec, std::string& family, std::string
 }  // namespace
 
 bool stdout_is_tty() { return ::isatty(STDOUT_FILENO) != 0; }
+
+bool stderr_is_tty() { return ::isatty(STDERR_FILENO) != 0; }
+
+int terminal_width() {
+  struct winsize size {};
+  if (::ioctl(STDERR_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0) {
+    return static_cast<int>(size.ws_col);
+  }
+  return 80;
+}
 
 std::string format_duration(std::chrono::milliseconds duration) {
   const auto ms = duration.count();

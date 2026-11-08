@@ -143,6 +143,13 @@ cova explain
 cova doctor
 ```
 
+Builds are never silent: resolution stages and per-action progress are printed
+to stderr, and a terminal gets an animated spinner plus a progress bar
+(`━━━━━━────`) carrying the task count, a status label such as
+`compiling`/`linking`, elapsed time and the current target. A long compile
+therefore reads as "still working", not "hung". `--quiet` silences the status
+output and `--json` keeps stdout machine-readable.
+
 ### Managed components from a trusted local registry
 
 Cova installs only what it can verify. A registry is a directory containing an

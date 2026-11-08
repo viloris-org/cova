@@ -140,4 +140,11 @@ std::string display_path(const stdfs::path& path, const stdfs::path& base);
 // True when the terminal attached to stdout is interactive.
 bool stdout_is_tty();
 
+// True when the terminal attached to stderr is interactive. Progress output
+// uses stderr, so this is what decides whether it can redraw in place.
+bool stderr_is_tty();
+
+// Width in columns of the terminal on stderr, or 80 when it cannot be queried.
+int terminal_width();
+
 }  // namespace cova::cli

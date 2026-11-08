@@ -293,6 +293,10 @@ COVA_TEST_NAMED(integration, end_to_end_new_build_run) {
 
   auto built = run_cli({"build"});
   COVA_CHECK_MSG(built.ok(), built.combined());
+  // Progress is reported while the build runs, not only in the final summary
+  // (stderr keeps it out of stdout, which stays machine-readable).
+  COVA_CHECK_MSG(contains(built.err, "Compiling `hello`"), built.err);
+  COVA_CHECK_MSG(contains(built.err, "compile src/main.cpp"), built.err);
 
   // The binary exists and is a real ELF executable.
   const stdfs::path binary = stdfs::path(temp.path()) / "hello" / "target" /

@@ -106,6 +106,7 @@ int run(int argc, char** argv, std::ostream& out_stream, std::ostream& err_strea
 
   StreamUi ui(out_stream, err_stream, color, verbose, quiet);
   ui.set_interactive(::isatty(STDIN_FILENO) != 0);
+  ui.set_progress_live(stderr_is_tty());
 
   CommandContext ctx = make_context(std::move(parsed.invocation), ui);
 

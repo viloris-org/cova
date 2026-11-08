@@ -56,6 +56,29 @@ void StreamUi::info(std::string_view text) {
   write_line(out_, wrap(kAnsiCyan, "  ", color_), text);
 }
 
+void StreamUi::status(std::string_view text) {
+  if (quiet_) {
+    return;
+  }
+  write_line(err_, wrap(kAnsiCyan, "  ", color_), text);
+}
+
+void StreamUi::progress_update(std::string_view text) {
+  if (!progress_live_) {
+    return;
+  }
+  // Carriage return + erase-to-end-of-line keeps the progress on one line even
+  // when the next label is shorter than the current one.
+  err_ << '\r' << text << "\x1b[K" << std::flush;
+}
+
+void StreamUi::progress_end() {
+  if (!progress_live_) {
+    return;
+  }
+  err_ << "\r\x1b[K" << std::flush;
+}
+
 void StreamUi::warn(std::string_view text) {
   if (quiet_) {
     // Warnings are user-relevant; quiet only silences status lines.
@@ -107,6 +130,13 @@ void StringUi::info(std::string_view text) {
   stdout_text.append("  ").append(text);
   if (text.empty() || text.back() != '\n') {
     stdout_text.push_back('\n');
+  }
+}
+
+void StringUi::status(std::string_view text) {
+  stderr_text.append("  ").append(text);
+  if (text.empty() || text.back() != '\n') {
+    stderr_text.push_back('\n');
   }
 }
 

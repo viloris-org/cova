@@ -66,6 +66,10 @@ ActionOutcome Executor::run_action(const Action& action) {
     }
   }
 
+  if (options_.on_start) {
+    options_.on_start(action);
+  }
+
   proc::ProcessSpec spec;
   spec.program = action.argv.front();
   spec.args.assign(action.argv.begin() + 1, action.argv.end());

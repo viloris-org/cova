@@ -132,9 +132,20 @@ class Ui {
   virtual ~Ui() = default;
   virtual void out(std::string_view text) = 0;      // normal output
   virtual void info(std::string_view text) = 0;     // status line
+  // Progress/status destined for stderr. Commands that stream progress use it
+  // so stdout stays machine-readable (`--json`, `cova run` output). `--quiet`
+  // silences it.
+  virtual void status(std::string_view text) = 0;
   virtual void warn(std::string_view text) = 0;
   virtual void error(std::string_view text) = 0;
   virtual void verbose(std::string_view text) = 0;
+  // True when the UI can redraw a single status line in place. Only a terminal
+  // can; pipes and test harnesses fall back to one line per event.
+  virtual bool progress_live() const { return false; }
+  // Replaces the transient progress line (no trailing newline).
+  virtual void progress_update(std::string_view text) {}
+  // Erases the transient progress line.
+  virtual void progress_end() {}
   virtual bool interactive() const = 0;
   // Presents a yes/no question; non-interactive defaults to `fallback`.
   virtual bool confirm(std::string_view question, bool fallback) = 0;
@@ -146,11 +157,16 @@ class StreamUi final : public Ui {
            bool quiet);
   void out(std::string_view text) override;
   void info(std::string_view text) override;
+  void status(std::string_view text) override;
   void warn(std::string_view text) override;
   void error(std::string_view text) override;
   void verbose(std::string_view text) override;
+  bool progress_live() const override { return progress_live_; }
+  void progress_update(std::string_view text) override;
+  void progress_end() override;
   bool interactive() const override { return interactive_; }
   void set_interactive(bool value) { interactive_ = value; }
+  void set_progress_live(bool value) { progress_live_ = value; }
   bool confirm(std::string_view question, bool fallback) override;
 
  private:
@@ -160,6 +176,7 @@ class StreamUi final : public Ui {
   bool verbose_;
   bool quiet_;
   bool interactive_ = false;
+  bool progress_live_ = false;
 };
 
 // Collected output for tests.
@@ -167,6 +184,7 @@ class StringUi final : public Ui {
  public:
   void out(std::string_view text) override;
   void info(std::string_view text) override;
+  void status(std::string_view text) override;
   void warn(std::string_view text) override;
   void error(std::string_view text) override;
   void verbose(std::string_view text) override;

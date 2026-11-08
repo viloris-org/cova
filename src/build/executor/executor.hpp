@@ -39,7 +39,11 @@ struct ExecuteOptions {
   bool verbose = false;
   bool quiet = false;
   bool use_color = false;
-  // Called for every action after it is considered (skipped or run).
+  // Called from a worker thread immediately before an action's command starts.
+  // Skipped actions never call it, so implementations must be thread-safe.
+  std::function<void(const Action&)> on_start;
+  // Called on the executor thread for every action after it is considered
+  // (skipped or run).
   std::function<void(const Action&, const ActionOutcome&)> on_finish;
 };
 
