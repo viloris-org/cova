@@ -11,13 +11,25 @@ same ABI and linking model.
 cova new hello
 cd hello
 
-cova add fmt
 cova build
 cova run
 cova test
 cova fmt
 cova clean
 ```
+
+Local path dependencies are resolved, built and linked, including when they live
+outside the workspace:
+
+```bash
+cova add math --path ../math
+cova build
+```
+
+Remote dependency management is **not implemented yet**: `cova add fmt` without a
+`--path`, and builds or tests that need a registry or git dependency, fail
+explicitly instead of pretending to fetch them. (A regular build skips remote
+development dependencies, because it does not need them.)
 
 Cross compilation is a first-class command, not a configuration project:
 
@@ -52,7 +64,9 @@ What works today:
 | `doctor`, `target list`, `toolchain list/explain`, `sysroot list/verify` | Works |
 | Sysroot installation | Local archive or trusted local registry index; SHA-256 verified |
 | Managed toolchain installation | Trusted local registry index; SHA-256 verified, atomic commit |
-| Dependency manager (`add`, `fetch`, `update`, `vendor`) | Manifest edits; workspace path dependencies are built and linked; no registry fetcher yet (fails honestly) |
+| Dependency manager (`add`, `fetch`, `update`, `vendor`) | Local path dependencies, inside or outside a workspace, are resolved transitively, built for the requested target and linked; `cova.lock` records the resolution. Remote dependency management (registry and git sources) is not implemented yet and fails honestly |
+| Dependency lockfile | `cova.lock` is written on resolution; `--locked` refuses a missing, stale or would-change lockfile and `--frozen` implies `--locked --offline` |
+| Compilation database | Every `build` and `check` emits `compile_commands.json` with the exact compile arguments; a workspace gets one file covering its members |
 | Workspace | Discovery, ordering, shared settings and multi-package builds |
 | Self-hosting | A root `cova.toml` lets a built Cova build, test and run itself (Stage 1) |
 
@@ -164,7 +178,7 @@ Every command honours the same set (PRD §4.2):
 | `--compiler <family[@ver]>` | Compiler family with optional version requirement |
 | `--toolchain <id>` | Pin a specific toolchain identity |
 | `--offline` | Forbid network access |
-| `--locked` | Refuse to change the lockfile |
+| `--locked` | Fail instead of rewriting `cova.lock` or `cova-toolchain.lock` |
 | `--frozen` | `--offline --locked` |
 | `--no-install` | Never install new components |
 | `-j, --jobs <n>` | Parallel jobs |

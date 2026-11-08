@@ -106,4 +106,21 @@ COVA_TEST_NAMED(manifest, workspace_manifest_has_no_package_requirement) {
   COVA_CHECK(!manifest.workspace->members.empty());
 }
 
+COVA_TEST_NAMED(manifest, rejects_unimplemented_build_scripts) {
+  cova::test::TempDir temp;
+  auto error = COVA_REQUIRE_ERR(cova::manifest::parse(R"(
+[package]
+name = "scripted"
+version = "0.1.0"
+
+[build]
+type = "executable"
+sources = ["src/*.cpp"]
+build-script = true
+)",
+                                                       "cova.toml", temp.path()));
+  COVA_CHECK_EQ(error.code, std::string("cova::manifest::build_script_unsupported"));
+  COVA_CHECK(error.message.find("build-script") != std::string::npos);
+}
+
 COVA_TEST_MAIN()

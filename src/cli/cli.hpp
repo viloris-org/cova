@@ -75,6 +75,7 @@ enum class CommandId {
   SysrootList,
   SysrootInstall,
   SysrootVerify,
+  SysrootGc,
   TargetList,
   CacheGc,
   Workspace,

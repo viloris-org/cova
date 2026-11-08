@@ -91,6 +91,7 @@ int main() {
 std::string gitignore_contents() {
   return R"(# Cova build output
 /target/
+/compile_commands.json
 
 # Editor and OS noise
 .DS_Store

@@ -60,6 +60,7 @@ const std::map<CommandId, CommandFn, std::less<>>& command_table() {
       {CommandId::SysrootList, cmd_sysroot},
       {CommandId::SysrootInstall, cmd_sysroot},
       {CommandId::SysrootVerify, cmd_sysroot},
+      {CommandId::SysrootGc, cmd_sysroot},
       {CommandId::TargetList, cmd_target},
       {CommandId::CacheGc, cmd_cache},
       {CommandId::Workspace, cmd_workspace},

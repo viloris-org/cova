@@ -59,7 +59,7 @@ core  (common, diagnostics, filesystem, process, hashing, version, json, toml, c
  │    │    └── workspace         (multi-package discovery)
  │    ├── build                 (graph IR, planner, scheduler, executor, cache)
  │    ├── formatter             (clang-format integration)
- │    └── package               (resolver/fetcher/lockfile — M3 scaffolding)
+ │    └── package               (local path resolver, lockfiles, fetcher stub)
  └── cli                        (arg parsing, command wiring, user interaction)
 ```
 
@@ -118,6 +118,7 @@ src/build/executor/executor.hpp          Executor, BuildResult
 src/build/cache/cache.hpp                BuildState, Depfile, FileHasher
 src/formatter/formatter.hpp              clang-format integration
 src/package/lockfile/lockfile.hpp        cova.lock, cova-toolchain.lock
+src/package/dependency/dependency.hpp     local path dependency resolution + lock enforcement
 src/cli/cli.hpp                          parsing, Invocation, CommandContext, Ui
 ```
 
