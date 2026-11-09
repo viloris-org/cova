@@ -214,7 +214,52 @@ output set before staging files and renaming them into place. A corrupted entry
 is a miss. `cova build` reports "restored from cache" separately from
 "executed", so a cache hit is never presented as a successful re-execution.
 
-## 7. Caching qualification summary
+## 7. Performance work
+
+Build performance was measured on a synthetic 41-translation-unit project on
+the development host. The numbers are indicative, not a portable benchmark, but
+they show where the time went and what changed:
+
+| Scenario | Before this pass | After |
+|---|---|---|
+| Cold build (fresh `COVA_HOME`, 41 TUs) | 6.3 s | 1.3 s |
+| No-change incremental build | 1.9 s | 0.6 s |
+| Single-file incremental build | 2.0 s | 0.7 s |
+| Toolchain discovery (`cova toolchain list`) | 1.35 s | 0.23 s |
+
+The changes:
+
+* **Hard-link alias grouping.** Distribution aliases (`g++`, `c++`,
+  `x86_64-pc-linux-gnu-g++`) are usually hard links to one binary. Discovery
+  groups them by file identity, describes one representative per group with the
+  version/resource-dir/sysroot queries, and materializes the alias descriptors
+  by replacing only the driver path and id.
+* **Parallel discovery and subprogram enrichment.** Representative compiler
+  descriptions and the selected toolchain's `cc1`/`cc1plus`/assembler/... queries
+  run concurrently; results are consumed in deterministic order.
+* **Scoped probes.** A normal build asks only for C++ compilation, linking and
+  ABI facts. The full capability matrix (C, preprocessing, archives, C++26,
+  shared libraries, LTO, sanitizers, coverage, threads) is requested by
+  `cova doctor` and `cova explain`. Probe cache keys include the requested
+  scope, so the two reports never masquerade as each other.
+* **Parallel cold dependency scans.** When there is no incremental state and no
+  artifact-cache entry, there is nothing to reuse; the compile actions' closure
+  scans run concurrently before the executor. `Action::input_closure_checked`
+  prevents the executor from scanning the same action again.
+* **No duplicate executor scan.** Warm builds and evidence-backed rebuilds use
+  the recorded closure; the `BuildState::inputs_match` fast path avoids a scan
+  when only an output is missing.
+* **Observability.** `--verbose` reports project load, dependency resolution,
+  toolchain resolution, planning, build execution, and each dependency scan's
+  duration, so future bottlenecks are measurable without a profiler.
+
+A cold build still contains one preprocessing pass per compile action and the
+compiler's own compile pass. Removing that duplication would require a
+filesystem snapshot or a compiler integration that exposes the dependency
+closure during compilation; Cova deliberately keeps the pre-execution scan for
+cache correctness.
+
+## 8. Caching qualification summary
 
 | Condition | Shared artifact cache | Local incremental state |
 |---|---|---|
@@ -224,7 +269,7 @@ is a miss. `cova build` reports "restored from cache" separately from
 | Closure unverified / scan failed / input changed during execution | no | no |
 | Schema, key or blob integrity mismatch | miss | n/a |
 
-## 8. Remaining work (not claimed as delivered)
+## 9. Remaining work (not claimed as delivered)
 
 * Remote/shared cache transport, eviction and signed metadata.
 * Layered ABI evidence (Layer B per compile action, Layer C artifact evidence)

@@ -7,8 +7,10 @@
 // in one command but right in another.
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <iostream>
 #include <set>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,12 @@ using Clock = std::chrono::steady_clock;
 // quiet unless something is wrong.
 bool status_enabled(const CommandContext& ctx) {
   return !ctx.global.quiet && !ctx.global.json;
+}
+
+std::string elapsed_ms(Clock::time_point started) {
+  return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now() - started)
+                            .count());
 }
 
 std::string project_label(const LoadedProject& project) {
@@ -101,6 +109,7 @@ Result<bool> refresh_compile_closure(const build::Action& action,
   if (action.kind != build::ActionKind::Compile || action.argv.empty()) {
     return true;
   }
+  const_cast<build::Action&>(action).input_closure_checked = true;
   auto scratch = fs::make_temp_dir(std::filesystem::temp_directory_path(), "cova-scan-");
   if (!scratch) {
     return fail<bool>(scratch.error());
@@ -202,9 +211,86 @@ Result<bool> refresh_compile_closure(const build::Action& action,
   return true;
 }
 
+bool cache_has_entries(const build::CacheSettings& settings) {
+  if (!settings.enabled) {
+    return false;
+  }
+  std::error_code ec;
+  const auto actions = settings.root / "actions";
+  if (!std::filesystem::is_directory(actions, ec)) {
+    return false;
+  }
+  for (auto it = std::filesystem::directory_iterator(actions, ec);
+       it != std::filesystem::directory_iterator(); it.increment(ec)) {
+    if (ec) {
+      return true;  // Do not claim "cold" when the cache cannot be inspected.
+    }
+    return true;
+  }
+  return false;
+}
+
+// On a genuinely cold build there is no state or cache to consult, and every
+// compile action needs its closure. Run those scans concurrently instead of
+// serializing them behind the executor's up-to-date mutex.
+void run_cold_dependency_scans(const build::BuildGraph& graph,
+                               const build::ActionEnvironment& environment,
+                               int requested_workers, CommandContext& ctx) {
+  std::vector<const build::Action*> actions;
+  for (const build::Action* action : graph.actions_in_order()) {
+    if (action->kind == build::ActionKind::Compile && !action->input_closure_checked) {
+      actions.push_back(action);
+    }
+  }
+  if (actions.empty()) {
+    return;
+  }
+  const int hardware = static_cast<int>(std::thread::hardware_concurrency());
+  const int workers = std::max(
+      1, std::min<int>(requested_workers > 0 ? requested_workers : hardware,
+                       static_cast<int>(actions.size())));
+  struct ScanResult {
+    bool succeeded = false;
+    long long milliseconds = 0;
+  };
+  std::vector<ScanResult> results(actions.size());
+  std::atomic<std::size_t> next{0};
+  auto worker = [&]() {
+    for (;;) {
+      const std::size_t index = next.fetch_add(1);
+      if (index >= actions.size()) {
+        return;
+      }
+      const auto started = Clock::now();
+      std::string detail;
+      auto refreshed = refresh_compile_closure(*actions[index], environment, detail);
+      results[index].succeeded = refreshed.has_value() && *refreshed;
+      results[index].milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        Clock::now() - started)
+                                        .count();
+    }
+  };
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(workers));
+  for (int index = 0; index < workers; ++index) {
+    threads.emplace_back(worker);
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  if (ctx.global.verbose) {
+    for (std::size_t index = 0; index < actions.size(); ++index) {
+      ctx.ui->verbose("dependency scan: " + actions[index]->label + " (" +
+                      std::to_string(results[index].milliseconds) + "ms)" +
+                      (results[index].succeeded ? "" : " [failed]"));
+    }
+  }
+}
+
 // Runs the shared preparation pipeline. Returns nullopt when a diagnostic has
 // already been printed and the caller should just fail.
 std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include_tests) {
+  const auto prepare_started = Clock::now();
   auto project = load_project(ctx);
   if (!project) {
     return report_error(project.error(), ctx);
@@ -219,6 +305,9 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
     return report_error(target.error(), ctx);
   }
   out.target = *target;
+  if (ctx.global.verbose) {
+    ctx.ui->verbose("project load: " + elapsed_ms(prepare_started) + "ms");
+  }
 
   // Preparation can spend seconds probing compilers. Animate the stage on a
   // terminal; in a pipe each stage still prints one line when it starts.
@@ -227,6 +316,7 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
 
   // Resolve local dependencies and enforce the shared lockfile before any
   // expensive toolchain probing.
+  const auto dependencies_started = Clock::now();
   stages.begin("Resolving dependencies");
   auto dependencies =
       resolve_dependencies(ctx, out.project, out.target, /*apply_lock=*/true, include_tests);
@@ -235,6 +325,9 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
     return report_error(dependencies.error(), ctx);
   }
   stages.finish();
+  if (ctx.global.verbose) {
+    ctx.ui->verbose("dependency resolution: " + elapsed_ms(dependencies_started) + "ms");
+  }
   if (dependencies->lock_written) {
     ctx.ui->verbose("wrote " + fs::generic_string(dependencies->lockfile));
   } else if (dependencies->lock_up_to_date) {
@@ -277,6 +370,7 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
 
   // Resolution runs real compiler probes, which is the slowest and least
   // observable part of a cold build. Say so before waiting on it.
+  const auto toolchain_started = Clock::now();
   stages.begin("Resolving toolchain for " + out.target.to_string());
   auto resolved = resolve_toolchain_or_report(ctx, request);
   if (!resolved) {
@@ -285,7 +379,11 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
   }
   stages.finish();
   out.toolchain = std::move(*resolved);
+  if (ctx.global.verbose) {
+    ctx.ui->verbose("toolchain resolution: " + elapsed_ms(toolchain_started) + "ms");
+  }
 
+  const auto planning_started = Clock::now();
   stages.begin("Planning build");
   auto plan = plan_with_dependencies(ctx, out.project, *dependencies, out.toolchain, out.target,
                                      include_tests);
@@ -295,6 +393,9 @@ std::optional<int> prepare(CommandContext& ctx, PreparedBuild& out, bool include
   }
   stages.finish();
   out.plan = std::move(*plan);
+  if (ctx.global.verbose) {
+    ctx.ui->verbose("planning: " + elapsed_ms(planning_started) + "ms");
+  }
 
   auto compile_commands = write_compile_commands(out.project, out.plan);
   if (!compile_commands) {
@@ -456,12 +557,15 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     // 3. Both checks missed. Before running the action, ask the provider for
     //    the real input closure, so a stale depfile or a newly included header
     //    cannot be missed. The refreshed inputs produce the final identity.
-    if (action.kind == build::ActionKind::Compile && !dry_run) {
-      if (ctx.global.verbose) {
-        ctx.ui->verbose("dependency scan: " + action.label);
-      }
+    if (action.kind == build::ActionKind::Compile && !dry_run &&
+        !action.input_closure_checked) {
+      const auto scan_started = Clock::now();
       std::string detail;
       auto refreshed = refresh_compile_closure(action, env, detail);
+      if (ctx.global.verbose) {
+        ctx.ui->verbose("dependency scan: " + action.label + " (" +
+                        elapsed_ms(scan_started) + "ms)");
+      }
       if (!refreshed) {
         reason = "dependency discovery failed: " + refreshed.error().message;
         return false;
@@ -531,10 +635,22 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     }
   };
 
+  // A fresh build has no state and no cache entries, so every compile action
+  // needs a scan. Run those scans in parallel before the executor serializes
+  // its up-to-date checks. When state or cache evidence exists, the executor's
+  // normal miss path handles the (usually few) scans.
+  if (!dry_run && local_state.size() == 0 && !cache_has_entries(cache)) {
+    run_cold_dependency_scans(prepared.plan.graph, env, options.max_parallel, ctx);
+  }
+
   // The executor snapshots its options, so the callbacks must be installed
   // before it is constructed.
+  const auto execution_started = Clock::now();
   build::Executor executor(prepared.plan.graph, env, options, is_up_to_date);
   auto result = executor.run();
+  if (ctx.global.verbose) {
+    ctx.ui->verbose("build execution: " + elapsed_ms(execution_started) + "ms");
+  }
   // Clear the transient line before diagnostics or the summary are printed.
   reporter.stop();
   if (!result) {

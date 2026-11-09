@@ -119,6 +119,10 @@ struct Action {
   // (for example an unreadable include directory). Such an action must not be
   // reused from the cache or from incremental state.
   mutable bool input_identity_complete = true;
+  // True once a dependency scan or equivalent proof has been attempted in this
+  // build. Prevents the executor from repeating a scan the planner phase
+  // already performed.
+  mutable bool input_closure_checked = false;
   // Content hashes captured by the last cache_key computation, used to detect
   // inputs changed by another process between discovery and execution.
   mutable std::vector<std::pair<std::string, std::string>> computed_input_hashes;
