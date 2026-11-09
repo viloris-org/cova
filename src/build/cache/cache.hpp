@@ -18,6 +18,11 @@ namespace cova::build {
 namespace stdfs = std::filesystem;
 using Path = stdfs::path;
 
+// Versions of the persisted schemas. A mismatch is a miss, never a silent
+// compatibility decision.
+inline constexpr std::string_view kBuildStateSchemaVersion = "cova.build-state/2";
+inline constexpr std::string_view kArtifactCacheSchemaVersion = "cova.artifact-cache/2";
+
 // One persisted record of a successfully completed action.
 struct ActionRecord {
   std::string cache_key;
@@ -60,7 +65,10 @@ struct Depfile {
 };
 
 // Shared artifact cache. Entries are keyed by Action::cache_key and contain a
-// manifest plus the output blobs.
+// versioned manifest plus the output blobs. Publication is atomic: the manifest
+// is written last, so a partial entry is never observable. A second writer for
+// the same key with different output content is a non-determinism incident and
+// never overwrites the existing entry.
 struct CacheSettings {
   Path root;
   bool enabled = true;
@@ -71,9 +79,12 @@ struct CacheSettings {
 CacheSettings default_cache_settings();
 
 // Restores the action's outputs from the cache. Returns false when there is no
-// complete, matching entry.
+// complete, schema-compatible, integrity-valid entry. Outputs are staged and
+// renamed, so a failure cannot leave a half-restored artifact.
 Result<bool> cache_restore(const CacheSettings& settings, const Action& action,
                            const std::string& key);
+// Publishes a completed action. Returns a `cova::build::cache_nondeterminism`
+// error when the same key already holds different output content.
 Status cache_store(const CacheSettings& settings, const Action& action,
                    const std::string& key);
 

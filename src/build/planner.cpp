@@ -247,10 +247,10 @@ std::vector<std::string> target_flags(const toolchain::ResolvedToolchain& toolch
   return flags;
 }
 
-void add_depfile_inputs(Action& action, const fs::Path& depfile, const fs::Path& base) {
+bool add_depfile_inputs(Action& action, const fs::Path& depfile, const fs::Path& base) {
   auto parsed = Depfile::load(depfile, base);
   if (!parsed) {
-    return;
+    return false;
   }
   std::set<std::string> existing;
   for (const auto& input : action.inputs) {
@@ -262,9 +262,14 @@ void add_depfile_inputs(Action& action, const fs::Path& depfile, const fs::Path&
     }
     const std::string key = fs::generic_string(fs::canonical_for_compare(dependency));
     if (existing.insert(key).second) {
-      action.inputs.push_back(FileInput{dependency, "header"});
+      action.inputs.push_back(
+          FileInput{dependency, "header", InputOrigin::Discovered});
     }
   }
+  // A parsed depfile is the minimum evidence that the provider discovered the
+  // full input closure. Without it the action may only run; it may not be
+  // reused from a cache or an incremental record.
+  return true;
 }
 
 // Adds a compile action for one source and returns the object output path.
@@ -320,7 +325,7 @@ ActionId add_compile_action(BuildGraph& graph, const manifest::Manifest& manifes
   action.working_dir = manifest.root;
   action.inputs.push_back(FileInput{source, "source"});
   action.outputs.push_back(FileOutput{object_out, true});
-  add_depfile_inputs(action, depfile, manifest.root);
+  action.input_closure_complete = add_depfile_inputs(action, depfile, manifest.root);
   return graph.add(std::move(action));
 }
 
@@ -448,6 +453,9 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       action.dependencies.push_back(object_actions[index]);
     }
     action.outputs.push_back(FileOutput{final_output, true});
+    // Archive/link inputs are the object files produced by this graph, which
+    // are themselves complete inputs, so no provider scan is needed.
+    action.input_closure_complete = true;
     final_action = result.graph.add(std::move(action));
   }
   result.final_action = final_action;
@@ -540,6 +548,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
         link.dependencies.push_back(object_action);
       }
       link.outputs.push_back(FileOutput{binary, true});
+      link.input_closure_complete = true;
       result.graph.add(std::move(link));
       result.test_binaries.push_back(binary);
     }

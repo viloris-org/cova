@@ -10,7 +10,6 @@
 #include <thread>
 #include <vector>
 
-#include "build/cache/cache.hpp"
 #include "core/filesystem/filesystem.hpp"
 #include "core/process/process.hpp"
 
@@ -52,6 +51,7 @@ ActionOutcome Executor::run_action(const Action& action) {
 
   if (action.argv.empty()) {
     outcome.succeeded = true;
+    outcome.artifact_validated = true;
     outcome.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
     return outcome;
@@ -76,6 +76,14 @@ ActionOutcome Executor::run_action(const Action& action) {
   if (!action.working_dir.empty()) {
     spec.cwd = action.working_dir;
   }
+  if (environment_.explicit_environment) {
+    std::vector<std::pair<std::string, std::string>> variables;
+    variables.reserve(environment_.environment.size());
+    for (const auto& [name, value] : environment_.environment) {
+      variables.emplace_back(name, value);
+    }
+    spec.environment = std::move(variables);
+  }
   auto result = proc::run(spec);
   outcome.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started);
@@ -88,11 +96,22 @@ ActionOutcome Executor::run_action(const Action& action) {
     outcome.failure_message = failure_detail(*result);
     return outcome;
   }
-  outcome.succeeded = true;
-  if (action.cacheable && !action.computed_key.empty()) {
-    auto stored = cache_store(default_cache_settings(), action, action.computed_key);
-    (void)stored;
+  // ExecutionSucceeded is not ArtifactValidated: a compiler may exit 0 while a
+  // declared output is missing. Only a complete output set may be published.
+  for (const auto& output : action.outputs) {
+    if (!fs::is_regular_file(output.path)) {
+      outcome.failure_message =
+          "the action reported success but did not produce `" + fs::generic_string(output.path) + "`";
+      return outcome;
+    }
   }
+  outcome.succeeded = true;
+  outcome.artifact_validated = true;
+  // Sharing requires a hermetic environment, a complete input closure and an
+  // action the planner marks shareable. The caller publishes under the final
+  // (post-depfile) identity.
+  outcome.share_eligible = action.cacheable && environment_.shared_cache_eligible &&
+                           action.input_closure_complete;
   return outcome;
 }
 

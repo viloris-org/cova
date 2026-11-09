@@ -636,4 +636,148 @@ COVA_TEST_NAMED(build, planner_keeps_duplicate_definition_checks_for_clang) {
   }
 }
 
+COVA_TEST_NAMED(build, action_identity_tracks_environment_policy) {
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.argv = {"cc", "-c", "unit.cpp"};
+  auto environment = host_environment();
+  const std::string baseline = action.cache_key(environment);
+
+  environment.environment["CPATH"] = "/opt/one";
+  const std::string one = action.cache_key(environment);
+  COVA_CHECK(one != baseline);
+  environment.environment["CPATH"] = "/opt/two";
+  const std::string two = action.cache_key(environment);
+  COVA_CHECK(two != one);
+
+  auto tracked = environment;
+  tracked.isolation = cova::proc::EnvironmentIsolation::TrackedEnvironment;
+  auto untracked = environment;
+  untracked.isolation = cova::proc::EnvironmentIsolation::UntrackedEnvironment;
+  COVA_CHECK(action.cache_key(tracked) != action.cache_key(untracked));
+}
+
+COVA_TEST_NAMED(build, action_identity_tracks_response_file_contents) {
+  cova::test::TempDir temp;
+  const std::filesystem::path response = std::filesystem::path(temp.path()) / "args.rsp";
+  COVA_CHECK(cova::fs::write_file(response, "-O2\n").has_value());
+
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.working_dir = std::filesystem::path(temp.path());
+  action.argv = {"cc", "@" + response.string(), "-c", "unit.cpp"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(response, "-O3\n").has_value());
+  COVA_CHECK(first != action.cache_key(environment));
+
+  const std::filesystem::path nested = std::filesystem::path(temp.path()) / "nested.rsp";
+  COVA_CHECK(cova::fs::write_file(nested, "-O2\n").has_value());
+  COVA_CHECK(cova::fs::write_file(response, "@" + nested.string() + "\n").has_value());
+  const std::string outer = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(nested, "-O1\n").has_value());
+  COVA_CHECK(outer != action.cache_key(environment));
+}
+
+COVA_TEST_NAMED(build, action_identity_tracks_include_directory_listings) {
+  cova::test::TempDir temp;
+  const std::filesystem::path include = std::filesystem::path(temp.path()) / "include";
+  COVA_CHECK(cova::fs::create_directories(include).has_value());
+  COVA_CHECK(cova::fs::write_file(include / "a.hpp", "#pragma once\n").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.argv = {"cc", "-I" + include.string(), "-c", "unit.cpp"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(include / "b.hpp", "#pragma once\n").has_value());
+  // A new higher-priority header can change `#include <b.hpp>` resolution even
+  // when no depfile has been regenerated yet.
+  COVA_CHECK(first != action.cache_key(environment));
+}
+
+COVA_TEST_NAMED(build, artifact_cache_restores_and_detects_conflicts) {
+  cova::test::TempDir temp;
+  cova::build::CacheSettings settings;
+  settings.root = std::filesystem::path(temp.path()) / "cache";
+  const std::filesystem::path output = std::filesystem::path(temp.path()) / "out.o";
+  COVA_CHECK(cova::fs::write_file(output, "first-content").has_value());
+
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.outputs.push_back(cova::build::FileOutput{output, true});
+  COVA_CHECK(cova::build::cache_store(settings, action, "abc").has_value());
+
+  COVA_CHECK(cova::fs::write_file(output, "garbage").has_value());
+  const bool restored = COVA_REQUIRE_OK(cova::build::cache_restore(settings, action, "abc"));
+  COVA_CHECK(restored);
+  COVA_CHECK_EQ(COVA_REQUIRE_OK(cova::fs::read_file(output)), std::string("first-content"));
+
+  COVA_CHECK(cova::fs::write_file(output, "different-content").has_value());
+  auto conflict = cova::build::cache_store(settings, action, "abc");
+  COVA_CHECK(!conflict.has_value());
+  COVA_CHECK_EQ(conflict.error().code, std::string("cova::build::cache_nondeterminism"));
+
+  // Reuse is suspended while the non-determinism incident is unresolved.
+  COVA_CHECK(cova::fs::write_file(output, "garbage").has_value());
+  const bool suspended = COVA_REQUIRE_OK(cova::build::cache_restore(settings, action, "abc"));
+  COVA_CHECK(!suspended);
+
+  // The original entry was not overwritten; explaining/clearing the incident
+  // makes it restorable again.
+  const auto entry = settings.root / "actions" / "ab" / "abc";
+  COVA_CHECK(cova::fs::remove_file(entry / "nondeterminism.toml").has_value());
+  const bool existing = COVA_REQUIRE_OK(cova::build::cache_restore(settings, action, "abc"));
+  COVA_CHECK(existing);
+  COVA_CHECK_EQ(COVA_REQUIRE_OK(cova::fs::read_file(output)), std::string("first-content"));
+}
+
+COVA_TEST_NAMED(build, artifact_cache_rejects_corruption_and_schema_mismatch) {
+  cova::test::TempDir temp;
+  cova::build::CacheSettings settings;
+  settings.root = std::filesystem::path(temp.path()) / "cache";
+  const std::filesystem::path output = std::filesystem::path(temp.path()) / "out.o";
+  COVA_CHECK(cova::fs::write_file(output, "payload").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.outputs.push_back(cova::build::FileOutput{output, true});
+  COVA_CHECK(cova::build::cache_store(settings, action, "abc").has_value());
+
+  const auto entry = settings.root / "actions" / "ab" / "abc";
+  std::filesystem::path blob;
+  for (const auto& item : std::filesystem::directory_iterator(entry)) {
+    const std::string name = item.path().filename().string();
+    if (name.rfind("blob-", 0) == 0) {
+      blob = item.path();
+    }
+  }
+  COVA_CHECK(!blob.empty());
+  COVA_CHECK(cova::fs::write_file(blob, "corrupt").has_value());
+  const bool corrupt = COVA_REQUIRE_OK(cova::build::cache_restore(settings, action, "abc"));
+  COVA_CHECK(!corrupt);
+
+  COVA_CHECK(cova::build::cache_store(settings, action, "def").has_value());
+  const auto manifest = settings.root / "actions" / "de" / "def" / "manifest.toml";
+  auto text = COVA_REQUIRE_OK(cova::fs::read_file(manifest));
+  text = cova::str::replace_all(text, std::string(cova::build::kArtifactCacheSchemaVersion),
+                                "cova.artifact-cache/1");
+  COVA_CHECK(cova::fs::write_file(manifest, text).has_value());
+  const bool mismatch = COVA_REQUIRE_OK(cova::build::cache_restore(settings, action, "def"));
+  COVA_CHECK(!mismatch);
+}
+
+COVA_TEST_NAMED(build, build_state_schema_mismatch_is_ignored) {
+  cova::test::TempDir temp;
+  const auto path = std::filesystem::path(temp.path()) / "state.toml";
+  COVA_CHECK(cova::fs::write_file(path, R"(
+schema-version = "cova.build-state/1"
+
+[[record]]
+cache-key = "old"
+succeeded = true
+)")
+                 .has_value());
+  auto state = COVA_REQUIRE_OK(cova::build::BuildState::load(path));
+  COVA_CHECK_EQ(state.size(), std::size_t{0});
+}
+
 COVA_TEST_MAIN()

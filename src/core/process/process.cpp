@@ -219,9 +219,19 @@ std::vector<std::pair<std::wstring, std::wstring>> current_environment() {
   return entries;
 }
 
-// Builds a sorted, double-NUL-terminated UTF-16 environment block.
-std::wstring build_environment(const ProcessSpec& spec) {
-  std::vector<std::pair<std::wstring, std::wstring>> entries = current_environment();
+// Builds the child environment entries from either the explicit environment in
+// the spec or the parent environment, then applies removals and overrides.
+std::vector<std::pair<std::wstring, std::wstring>> build_environment_entries(
+    const ProcessSpec& spec) {
+  std::vector<std::pair<std::wstring, std::wstring>> entries;
+  if (spec.environment) {
+    entries.reserve(spec.environment->size());
+    for (const auto& [name, value] : *spec.environment) {
+      entries.emplace_back(widen(name), widen(value));
+    }
+  } else {
+    entries = current_environment();
+  }
 
   for (const std::string& removed : spec.env_remove) {
     const std::wstring name = widen(removed);
@@ -243,7 +253,22 @@ std::wstring build_environment(const ProcessSpec& spec) {
       found->second = value;
     }
   }
+  return entries;
+}
 
+std::optional<std::wstring> environment_value(
+    const std::vector<std::pair<std::wstring, std::wstring>>& entries, std::wstring_view name) {
+  for (const auto& [entry_name, value] : entries) {
+    if (same_name(entry_name, name)) {
+      return value;
+    }
+  }
+  return std::nullopt;
+}
+
+// Builds a sorted, double-NUL-terminated UTF-16 environment block.
+std::wstring build_environment(const ProcessSpec& spec) {
+  auto entries = build_environment_entries(spec);
   std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
     return str::to_lower(narrow(left.first)) < str::to_lower(narrow(right.first));
   });
@@ -299,16 +324,52 @@ HANDLE inherited_std_handle(DWORD which, DWORD fallback_access, bool& owned) {
   return null_handle;
 }
 
-Result<Path> resolve_program(const Path& program) {
+std::optional<Path> find_on_path(std::string_view executable, std::wstring_view path_value) {
+  if (executable.empty()) {
+    return std::nullopt;
+  }
+  std::vector<std::string> names{std::string(executable)};
+  if (Path(executable).extension().empty()) {
+    names.push_back(std::string(executable) + ".exe");
+  }
+  std::size_t start = 0;
+  while (start <= path_value.size()) {
+    const std::size_t end = path_value.find(L';', start);
+    const std::wstring_view directory =
+        path_value.substr(start, end == std::wstring_view::npos ? path_value.size() - start
+                                                                : end - start);
+    for (const std::string& name : names) {
+      const Path candidate = Path(std::wstring(directory)) / name;
+      if (fs::is_regular_file(candidate)) {
+        return candidate;
+      }
+    }
+    if (end == std::wstring_view::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  return std::nullopt;
+}
+
+Result<Path> resolve_program(const Path& program, std::wstring_view path_value) {
   if (program.empty()) {
     return std::unexpected(Error::make("cova::proc::invalid", "empty program path"));
   }
-  const std::optional<Path> found = fs::find_in_path(program.string());
-  if (!found) {
-    if (program.has_parent_path()) {
-      return std::unexpected(Error::make("cova::proc::not_found", "program does not exist")
-                                 .with("program: " + program.string()));
+  if (program.has_parent_path()) {
+    // An explicit path is used verbatim (adding the conventional .exe suffix
+    // when the caller omitted it), not searched on PATH.
+    for (const std::string& name : {program.string(), program.string() + ".exe"}) {
+      const Path candidate(name);
+      if (fs::is_regular_file(candidate)) {
+        return candidate;
+      }
     }
+    return std::unexpected(Error::make("cova::proc::not_found", "program does not exist")
+                               .with("program: " + program.string()));
+  }
+  const std::optional<Path> found = find_on_path(program.string(), path_value);
+  if (!found) {
     return std::unexpected(Error::make("cova::proc::not_found", "program not found on PATH")
                                .with("program: " + program.string()));
   }
@@ -333,6 +394,17 @@ void drain_pipe(HANDLE pipe, std::string& sink) {
 
 }  // namespace
 
+std::vector<std::pair<std::string, std::string>> process_environment() {
+  std::vector<std::pair<std::string, std::string>> out;
+  for (const auto& [name, value] : current_environment()) {
+    out.emplace_back(narrow(name), narrow(value));
+  }
+  std::sort(out.begin(), out.end(), [](const auto& left, const auto& right) {
+    return str::to_lower(left.first) < str::to_lower(right.first);
+  });
+  return out;
+}
+
 std::string ProcessResult::stdout_trimmed() const { return str::trim(stdout_text); }
 std::string ProcessResult::stderr_trimmed() const { return str::trim(stderr_text); }
 
@@ -346,7 +418,12 @@ std::string ProcessResult::to_string() const {
 }
 
 Result<ProcessResult> run(const ProcessSpec& spec) {
-  auto resolved_result = resolve_program(spec.program);
+  // Build the environment first: program lookup must use the child's PATH, not
+  // the parent's, when the caller supplied an explicit environment.
+  const auto environment_entries = build_environment_entries(spec);
+  const std::wstring path_value =
+      environment_value(environment_entries, L"PATH").value_or(std::wstring());
+  auto resolved_result = resolve_program(spec.program, path_value);
   if (!resolved_result) {
     return std::unexpected(std::move(resolved_result.error()));
   }
@@ -755,18 +832,23 @@ void close_fd(int& fd) {
   }
 }
 
-// Builds the environment block for execve from the parent environment plus the
-// spec's overrides/removals. Kept deterministic in ordering.
-std::vector<std::string> build_environment(const ProcessSpec& spec) {
+// Builds the child environment entries from either the explicit environment in
+// the spec or the parent environment, then applies removals and overrides.
+std::vector<std::pair<std::string, std::string>> build_environment_entries(
+    const ProcessSpec& spec) {
   std::vector<std::pair<std::string, std::string>> entries;
-  for (char** env = environ; env != nullptr && *env != nullptr; ++env) {
-    const std::string_view line(*env);
-    const std::size_t equals = line.find('=');
-    const std::string name(line.substr(0, equals));
-    const std::string value = equals == std::string_view::npos
-                                  ? std::string()
-                                  : std::string(line.substr(equals + 1));
-    entries.emplace_back(name, value);
+  if (spec.environment) {
+    entries = *spec.environment;
+  } else {
+    for (char** env = environ; env != nullptr && *env != nullptr; ++env) {
+      const std::string_view line(*env);
+      const std::size_t equals = line.find('=');
+      const std::string name(line.substr(0, equals));
+      const std::string value = equals == std::string_view::npos
+                                    ? std::string()
+                                    : std::string(line.substr(equals + 1));
+      entries.emplace_back(name, value);
+    }
   }
 
   auto find = [&entries](std::string_view name) -> auto {
@@ -787,7 +869,23 @@ std::vector<std::string> build_environment(const ProcessSpec& spec) {
       it->second = value;
     }
   }
+  return entries;
+}
 
+std::optional<std::string> environment_value(
+    const std::vector<std::pair<std::string, std::string>>& entries, std::string_view name) {
+  for (const auto& [entry_name, value] : entries) {
+    if (entry_name == name) {
+      return value;
+    }
+  }
+  return std::nullopt;
+}
+
+// Builds the environment block for execve from the entries. Kept deterministic
+// in ordering.
+std::vector<std::string> build_environment(const ProcessSpec& spec) {
+  const auto entries = build_environment_entries(spec);
   std::vector<std::string> block;
   block.reserve(entries.size());
   for (const auto& [name, value] : entries) {
@@ -797,8 +895,9 @@ std::vector<std::string> build_environment(const ProcessSpec& spec) {
 }
 
 // Resolves the program: an explicit path is used verbatim (must be executable),
-// a bare name is looked up on PATH before forking so the error is precise.
-Result<std::string> resolve_program(const Path& program) {
+// a bare name is looked up on the child's PATH before forking so the error is
+// precise.
+Result<std::string> resolve_program(const Path& program, std::string_view path_value) {
   const std::string text = program.string();
   if (text.empty()) {
     return std::unexpected(Error::make("cova::proc::invalid", "empty program path"));
@@ -814,15 +913,34 @@ Result<std::string> resolve_program(const Path& program) {
     }
     return text;
   }
-  const std::optional<Path> found = fs::find_in_path(text);
-  if (!found) {
-    return std::unexpected(Error::make("cova::proc::not_found", "program not found on PATH")
-                               .with("program: " + text));
+  for (const std::string& directory : str::split(path_value, ':')) {
+    const Path base = directory.empty() ? Path(".") : Path(directory);
+    const Path candidate = base / program;
+    if (fs::is_regular_file(candidate) && ::access(candidate.c_str(), X_OK) == 0) {
+      return candidate.string();
+    }
   }
-  return found->string();
+  return std::unexpected(Error::make("cova::proc::not_found", "program not found on PATH")
+                             .with("program: " + text));
 }
 
 }  // namespace
+
+std::vector<std::pair<std::string, std::string>> process_environment() {
+  std::vector<std::pair<std::string, std::string>> out;
+  for (char** env = environ; env != nullptr && *env != nullptr; ++env) {
+    const std::string_view line(*env);
+    const std::size_t equals = line.find('=');
+    if (equals == std::string_view::npos) {
+      continue;
+    }
+    out.emplace_back(std::string(line.substr(0, equals)), std::string(line.substr(equals + 1)));
+  }
+  std::sort(out.begin(), out.end(), [](const auto& left, const auto& right) {
+    return left.first < right.first;
+  });
+  return out;
+}
 
 std::string ProcessResult::stdout_trimmed() const { return str::trim(stdout_text); }
 std::string ProcessResult::stderr_trimmed() const { return str::trim(stderr_text); }
@@ -837,7 +955,12 @@ std::string ProcessResult::to_string() const {
 }
 
 Result<ProcessResult> run(const ProcessSpec& spec) {
-  auto resolved = resolve_program(spec.program);
+  // Build the environment first: program lookup must use the child's PATH, not
+  // the parent's, when the caller supplied an explicit environment.
+  const auto environment_entries = build_environment_entries(spec);
+  const std::string path_value =
+      environment_value(environment_entries, "PATH").value_or(std::string());
+  auto resolved = resolve_program(spec.program, path_value);
   if (!resolved) {
     return std::unexpected(std::move(resolved.error()));
   }

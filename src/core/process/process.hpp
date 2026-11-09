@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/common.hpp"
+#include "core/process/environment.hpp"
 
 namespace cova::proc {
 
@@ -21,6 +22,10 @@ struct ProcessSpec {
   Path program;                    // absolute or resolved via PATH
   std::vector<std::string> args;   // argv[1..]
   std::optional<Path> cwd;         // working directory
+  // When set, the child receives exactly this environment (plus
+  // env_overrides, minus env_remove) instead of inheriting the parent's. Build
+  // actions set this to make the environment an explicit, hashed input.
+  std::optional<std::vector<std::pair<std::string, std::string>>> environment;
   std::vector<std::pair<std::string, std::string>> env_overrides;  // added/replaced
   std::vector<std::string> env_remove;
   std::optional<std::string> stdin_data;

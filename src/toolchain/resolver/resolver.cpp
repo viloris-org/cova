@@ -3,12 +3,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "core/filesystem/filesystem.hpp"
 #include "core/hashing/hash.hpp"
+#include "core/process/environment.hpp"
 #include "core/toml/toml.hpp"
 #include "toolchain/discovery/discovery.hpp"
 #include "toolchain/probe/probe.hpp"
@@ -486,11 +488,20 @@ ResolutionReport resolve(const ResolutionRequest& request) {
         request.target.to_string() + "|" +
         fs::generic_string(sysroot ? sysroot->path : probed.default_sysroot) + "|" +
         (sysroot ? sysroot->content_hash : std::string());
+    std::map<std::string, std::string, std::less<>> abi_facts;
     if (request.probe_capabilities) {
       ProbeReport probe_report;
+      ProbeOptions probe_options;
+      probe_options.target = request.target;
+      probe_options.sysroot = sysroot ? sysroot->path : probed.default_sysroot;
+      probe_options.required = {"cpp", "link"};
+      if (auto environment = proc::collect_environment(); environment) {
+        probe_options.environment = environment->variables();
+        probe_options.environment_identity = environment->identity();
+      }
       bool have_probe = false;
       if (!request.cache_root.empty()) {
-        auto cached = load_cached_probe(request.cache_root, probed, probe_variant);
+        auto cached = load_cached_probe(request.cache_root, probed, probe_options, probe_variant);
         if (cached) {
           probe_report = std::move(*cached);
           have_probe = true;
@@ -498,17 +509,15 @@ ResolutionReport resolve(const ResolutionRequest& request) {
         }
       }
       if (!have_probe) {
-        ProbeOptions probe_options;
-        probe_options.target = request.target;
-        probe_options.sysroot = sysroot ? sysroot->path : probed.default_sysroot;
-        probe_options.required = {"cpp", "link"};
         probe_report = probe(probed, probe_options).value_or(ProbeReport{});
         if (!request.cache_root.empty()) {
-          auto stored = store_cached_probe(request.cache_root, probed, probe_report, probe_variant);
+          auto stored = store_cached_probe(request.cache_root, probed, probe_options,
+                                           probe_report, probe_variant);
           (void)stored;
         }
         report.decisions.push_back(attempt.label + ": probed capabilities");
       }
+      abi_facts = probe_report.abi_facts;
       probed.capabilities = probe_report.capabilities;
       if (!probe_report.succeeded || !probed.capabilities.cpp_compilation ||
           !probed.capabilities.executable_link) {
@@ -549,6 +558,10 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     resolved.descriptor = probed;
     resolved.target = request.target;
     resolved.abi_signature = make_abi_signature(probed, request.target);
+    if (!abi_facts.empty()) {
+      resolved.abi_signature =
+          platform::apply_abi_facts(resolved.abi_signature, probed.family, abi_facts);
+    }
     if (sysroot) {
       resolved.sysroot_id = sysroot->id;
       resolved.sysroot_path = sysroot->path;
