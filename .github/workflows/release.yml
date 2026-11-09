@@ -284,7 +284,7 @@ jobs:
           if command -v llvm-objdump >/dev/null 2>&1; then dump=llvm-objdump; else dump=objdump; fi
           deps="$("$dump" -p build/bin/cova.exe | sed -n 's/^[[:space:]]*DLL Name: //p')"
           echo "$deps"
-          if printf '%s\n' "$deps" | grep -qiE '^(libstdc\+\+-6|libgcc_s_|libwinpthread-1|libc\+\+|libunwind|libssp-0)\.dll$'; then
+          if printf '%s\n' "$deps" | grep -qiE '^(libstdc\+\+-6|libgcc_s_.+|libwinpthread-1|libc\+\+.*|libunwind.*|libssp-0)\.dll$'; then
             echo "::error::cova.exe links a C++ runtime DLL that the MSI does not install"
             exit 1
           fi
@@ -406,7 +406,8 @@ jobs:
           Arm64 installer with CLANGARM64 Clang. Both link the C++ runtime
           statically but use the system UCRT (present on Windows 10 and later).
           The MSIs are per-machine, add Cova to the system \`PATH\`, and are not
-          code-signed.
+          code-signed. The portable Windows \`.zip\` from earlier betas is no
+          longer published; use the MSI for the machine's architecture.
 
           On Windows, Cova builds projects with a MinGW-w64 toolchain (GCC or
           Clang) from MSYS2, winlibs or llvm-mingw. MSVC as a host toolchain is
