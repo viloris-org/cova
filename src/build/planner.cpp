@@ -194,13 +194,22 @@ std::string shared_library_suffix(const platform::Triple& target) {
   return ".so";
 }
 
-// MinGW's shared libstdc++ does not export the `<print>` terminal helpers, so
-// a Windows GNU link has to use the static C++ runtime.
+// A Windows GNU program should not depend on the MinGW runtime DLLs.
 void append_windows_static_runtime(std::vector<std::string>& argv,
                                    const platform::Triple& target) {
   if (target.os == platform::Os::Windows && target.env == platform::Env::Gnu) {
     argv.push_back("-static-libstdc++");
     argv.push_back("-static-libgcc");
+  }
+}
+
+// `<print>` reaches the terminal through helpers that MinGW ships in
+// libstdc++exp, not libstdc++. The archive must follow the objects that
+// reference it, so this is appended after them.
+void append_windows_experimental_library(std::vector<std::string>& argv,
+                                         const platform::Triple& target) {
+  if (target.os == platform::Os::Windows && target.env == platform::Env::Gnu) {
+    argv.push_back("-lstdc++exp");
   }
 }
 
@@ -402,6 +411,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       for (const auto& artifact : options.dependency_artifacts) {
         argv.push_back(artifact);
       }
+      append_windows_experimental_library(argv, options.target);
       argv.push_back("-o");
       argv.push_back(fs::generic_string(final_output));
       if (override != nullptr) {
@@ -493,6 +503,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       for (const auto& artifact : options.dependency_artifacts) {
         argv.push_back(artifact);
       }
+      append_windows_experimental_library(argv, options.target);
       argv.push_back("-o");
       argv.push_back(fs::generic_string(binary));
       if (override != nullptr) {
