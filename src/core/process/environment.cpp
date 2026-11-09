@@ -237,21 +237,26 @@ std::string EnvironmentSnapshot::identity() const {
 }
 
 EnvironmentPolicy environment_policy(std::string_view name) {
-  if (in_list(name, kTrackedNames) || is_locale_name(name)) {
-    return EnvironmentPolicy::InheritedTracked;
-  }
+  // Rejection wins over the locale prefix: `LC_*` is audited, but a name such
+  // as `LC_PASSWORD` is still secret-bearing and must never be forwarded.
   if (in_list(name, kRejectedNames) || is_sensitive_environment_variable(name)) {
     return EnvironmentPolicy::Rejected;
+  }
+  if (in_list(name, kTrackedNames) || is_locale_name(name)) {
+    return EnvironmentPolicy::InheritedTracked;
   }
   return EnvironmentPolicy::Rejected;
 }
 
 bool is_tracked_environment_variable(std::string_view name) {
+  if (is_rejected_environment_variable(name)) {
+    return false;
+  }
   return in_list(name, kTrackedNames) || is_locale_name(name);
 }
 
 bool is_rejected_environment_variable(std::string_view name) {
-  return in_list(name, kRejectedNames);
+  return in_list(name, kRejectedNames) || is_sensitive_environment_variable(name);
 }
 
 bool is_sensitive_environment_variable(std::string_view name) {

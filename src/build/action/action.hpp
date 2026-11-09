@@ -25,7 +25,7 @@ using Path = stdfs::path;
 
 // Version of the action identity schema. A bump deliberately invalidates every
 // cache entry produced by an older meaning of the identity.
-inline constexpr std::string_view kActionIdentitySchemaVersion = "cova.action-identity/2";
+inline constexpr std::string_view kActionIdentitySchemaVersion = "cova.action-identity/3";
 
 enum class ActionKind {
   Compile,
@@ -123,6 +123,9 @@ struct Action {
   // build. Prevents the executor from repeating a scan the planner phase
   // already performed.
   mutable bool input_closure_checked = false;
+  // True when the last scan attempt failed to produce a usable closure. Such
+  // an action may run, but its artifact must not be published.
+  mutable bool input_closure_scan_failed = false;
   // Content hashes captured by the last cache_key computation, used to detect
   // inputs changed by another process between discovery and execution.
   mutable std::vector<std::pair<std::string, std::string>> computed_input_hashes;

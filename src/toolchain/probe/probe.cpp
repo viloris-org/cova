@@ -122,13 +122,14 @@ Status run_probe_command(const ToolchainDescriptor& descriptor, const ProbeOptio
 // Probe cache identity. Every field that can change an observation is part of
 // the key, so an implementation or rule change cannot reuse an older report.
 constexpr std::string_view kProbeSchemaVersion = "cova.probe/2";
-constexpr std::string_view kProbeLogicVersion = "cova.probe.logic/2";
-constexpr std::string_view kProbeImplementationVersion = "cova-probe/2";
+constexpr std::string_view kProbeLogicVersion = "cova.probe.logic/3";
+constexpr std::string_view kProbeImplementationVersion = "cova-probe/3";
 // Bump this manifest whenever probe rules or their inputs change. It is hashed
 // into the key so the requirement is enforced by code, not by a comment.
 constexpr std::string_view kProbeSourceManifest =
     "predefined-macros-v1|cpp-codegen-v1|preprocess-v1|archive-v1|link-v1|"
-    "stdlib-headers-v1|cpp26-baseline-v1|secondary-flags-v1";
+    "stdlib-headers-v1|cpp26-baseline-v1|secondary-flags-v1|scoped-probes-v1|"
+    "negative-exception-facts-v1";
 
 std::string probe_source_hash() {
   return to_hex(Sha256::of(kProbeSourceManifest));
@@ -397,6 +398,18 @@ Result<std::map<std::string, std::string, std::less<>>> probe_abi_facts(
     } else {
       facts[std::string(rest.substr(0, name_end))] =
           str::trim(rest.substr(name_end + 1));
+    }
+  }
+  // GCC and Clang define these macros only when the corresponding feature is
+  // enabled in the probed configuration. Absence is therefore evidence of the
+  // disabled state, not an unknown fact.
+  const std::string family = str::to_lower(descriptor.family);
+  if (family == "gcc" || family == "g++" || family == "clang") {
+    if (facts.find("__EXCEPTIONS") == facts.end()) {
+      facts["__EXCEPTIONS"] = "0";
+    }
+    if (facts.find("__GXX_RTTI") == facts.end()) {
+      facts["__GXX_RTTI"] = "0";
     }
   }
   return facts;

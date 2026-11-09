@@ -648,6 +648,18 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
   for (const auto& candidate : candidates) {
     bool grouped = false;
     for (auto& group : groups) {
+      if (candidate.parent_path() != group.representative.parent_path()) {
+        continue;
+      }
+      const auto candidate_match = match_driver(basename_lower(candidate));
+      const auto representative_match =
+          match_driver(basename_lower(group.representative));
+      if (!candidate_match || !representative_match ||
+          candidate_match->family != representative_match->family ||
+          target_from_executable(basename_lower(candidate)) !=
+              target_from_executable(basename_lower(group.representative))) {
+        continue;
+      }
       std::error_code equivalent_error;
       if (stdfs::equivalent(candidate, group.representative, equivalent_error) &&
           !equivalent_error) {
@@ -675,6 +687,17 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
   for (std::size_t index = 0; index < groups.size(); ++index) {
     auto descriptor_result = described[index].get();
     if (!descriptor_result) {
+      // A failed representative should not hide aliases that could still be
+      // described independently (for example after a transient query error).
+      for (const auto& candidate : groups[index].aliases) {
+        auto fallback = describe_compiler(candidate, ToolchainSource::System);
+        if (fallback &&
+            (options.families.empty() ||
+             std::find(options.families.begin(), options.families.end(), fallback->family) !=
+                 options.families.end())) {
+          descriptors.push_back(std::move(*fallback));
+        }
+      }
       continue;
     }
     for (const auto& candidate : groups[index].aliases) {

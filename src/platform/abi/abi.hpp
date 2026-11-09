@@ -22,7 +22,7 @@ namespace cova::platform {
 inline constexpr std::string_view kAbiSignatureSchemaVersion = "cova.abi-signature/2";
 // Version of the argument classification rules. A rule change invalidates
 // effective-ABI identities produced by an older classifier.
-inline constexpr std::string_view kAbiClassifierVersion = "cova.abi-classifier/1";
+inline constexpr std::string_view kAbiClassifierVersion = "cova.abi-classifier/2";
 
 // Whether an ABI fact was actually established. A missing observation is
 // Unknown, never a harmless default value.

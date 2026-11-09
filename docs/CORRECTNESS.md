@@ -52,7 +52,7 @@ the CPATH/LIBRARY_PATH invalidation cases exercised by the build identity tests.
 
 ## 2. Build action identity (FR-02)
 
-`kActionIdentitySchemaVersion` (`cova.action-identity/2`) prefixes every key. A
+`kActionIdentitySchemaVersion` (`cova.action-identity/3`) prefixes every key. A
 key covers:
 
 * executable identity (explicit compiler path hashed; bare names rely on the
@@ -86,8 +86,10 @@ performed: without a provider-specific proof of equivalence, the original
 representation is preserved.
 
 `BuildState` and the artifact cache carry their own schema versions
-(`cova.build-state/2`, `cova.artifact-cache/2`). An older state file is ignored;
-an older or malformed cache entry is a miss.
+(`cova.build-state/3`, `cova.artifact-cache/2`). An older state file is ignored;
+an older or malformed cache entry is a miss. Incremental records also store the
+content hashes of their outputs, so a corrupt or truncated output that still
+exists is not treated as current.
 
 ## 3. ABI identity (FR-03, FR-04, FR-15 baseline)
 
@@ -210,8 +212,11 @@ before the manifest, so a crash or disk-full failure leaves either no manifest
 different output content records `nondeterminism.toml` and returns
 `cova::build::cache_nondeterminism` instead of overwriting the first entry.
 Restore validates the schema, key, output manifest, blob hashes and the exact
-output set before staging files and renaming them into place. A corrupted entry
-is a miss. `cova build` reports "restored from cache" separately from
+output set before staging files and renaming them into place. Cache keys and
+blob names must be plain path components, so a corrupt manifest cannot traverse
+out of the cache entry. A corrupted entry is a miss. `cova build --dry-run`
+never restores cache outputs: it consults the incremental record only and
+reports a cache-only hit as stale. `cova build` reports "restored from cache" separately from
 "executed", so a cache hit is never presented as a successful re-execution.
 
 ## 7. Performance work

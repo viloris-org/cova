@@ -180,6 +180,9 @@ COVA_TEST_NAMED(build, state_round_trips_and_detects_changes) {
   cova::build::ActionRecord record;
   record.cache_key = key;
   record.output_paths.push_back(cova::fs::generic_string(output));
+  record.output_hashes.emplace_back(
+      cova::fs::generic_string(output),
+      cova::to_hex(*cova::build::FileHasher{}.hash_file(output)));
   record.input_paths.push_back(cova::fs::generic_string(input));
   record.input_hashes.emplace_back(
       cova::fs::generic_string(input),
@@ -193,6 +196,10 @@ COVA_TEST_NAMED(build, state_round_trips_and_detects_changes) {
   auto reloaded = COVA_REQUIRE_OK(cova::build::BuildState::load(state_path));
   std::string reason;
   COVA_CHECK(reloaded.is_up_to_date(action, reason));
+  COVA_CHECK(cova::fs::write_file(output, "corrupted object\n").has_value());
+  COVA_CHECK(!reloaded.is_up_to_date(action, reason));
+  COVA_CHECK(cova::fs::write_file(output, "object\n").has_value());
+  COVA_CHECK(reloaded.is_up_to_date(action, reason));
   COVA_CHECK(cova::fs::write_file(input, "int a = 3;\n").has_value());
   COVA_CHECK(!reloaded.is_up_to_date(action, reason));
 }
@@ -203,6 +210,23 @@ COVA_TEST_NAMED(build, parses_depfiles) {
       cova::build::Depfile::parse(text, cova::fs::Path("/project")));
   COVA_CHECK_EQ(depfile.dependencies.size(), std::size_t{3});
   COVA_CHECK_EQ(depfile.dependencies.front(), cova::fs::Path("/project/src/main.cpp"));
+}
+
+COVA_TEST_NAMED(build, depfile_parser_does_not_split_windows_drive_letters) {
+  const std::string text =
+      "C:/build/obj/main.o: C:/src/main.cpp C:/src/include/a.hpp\n";
+  auto depfile = COVA_REQUIRE_OK(
+      cova::build::Depfile::parse(text, cova::fs::Path("/project")));
+  COVA_CHECK_EQ(depfile.dependencies.size(), std::size_t{2});
+  bool found_source = false;
+  bool found_header = false;
+  for (const auto& dependency : depfile.dependencies) {
+    const std::string path = cova::fs::generic_string(dependency);
+    found_source = found_source || path.find("C:/src/main.cpp") != std::string::npos;
+    found_header = found_header || path.find("C:/src/include/a.hpp") != std::string::npos;
+  }
+  COVA_CHECK(found_source);
+  COVA_CHECK(found_header);
 }
 
 COVA_TEST_NAMED(build, scheduler_releases_dependents) {
@@ -700,6 +724,20 @@ COVA_TEST_NAMED(build, action_identity_tracks_include_directory_listings) {
   COVA_CHECK(first != action.cache_key(environment));
 }
 
+COVA_TEST_NAMED(build, action_identity_tracks_attached_system_include_dirs) {
+  cova::test::TempDir temp;
+  const std::filesystem::path include = std::filesystem::path(temp.path()) / "include";
+  COVA_CHECK(cova::fs::create_directories(include).has_value());
+  COVA_CHECK(cova::fs::write_file(include / "a.hpp", "#pragma once\n").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.argv = {"cc", "-isystem" + include.string(), "-c", "unit.cpp"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(include / "b.hpp", "#pragma once\n").has_value());
+  COVA_CHECK(first != action.cache_key(environment));
+}
+
 COVA_TEST_NAMED(build, artifact_cache_restores_and_detects_conflicts) {
   cova::test::TempDir temp;
   cova::build::CacheSettings settings;
@@ -711,6 +749,9 @@ COVA_TEST_NAMED(build, artifact_cache_restores_and_detects_conflicts) {
   action.kind = cova::build::ActionKind::Compile;
   action.outputs.push_back(cova::build::FileOutput{output, true});
   COVA_CHECK(cova::build::cache_store(settings, action, "abc").has_value());
+  auto unsafe_store = cova::build::cache_store(settings, action, "../escape");
+  COVA_CHECK(!unsafe_store.has_value());
+  COVA_CHECK_EQ(unsafe_store.error().code, std::string("cova::build::cache_key"));
 
   COVA_CHECK(cova::fs::write_file(output, "garbage").has_value());
   const bool restored = COVA_REQUIRE_OK(cova::build::cache_restore(settings, action, "abc"));
@@ -856,6 +897,21 @@ COVA_TEST_NAMED(build, action_identity_detects_response_file_cycles) {
   COVA_CHECK(!action.input_identity_complete);
 }
 
+COVA_TEST_NAMED(build, action_identity_tracks_xclang_plugin_loads) {
+  cova::test::TempDir temp;
+  const std::filesystem::path root(temp.path());
+  const auto plugin = root / "plugin.so";
+  COVA_CHECK(cova::fs::write_file(plugin, "plugin-one").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.working_dir = root;
+  action.argv = {"clang", "-Xclang", "-load", "-Xclang", plugin.string(), "-c", "unit.cpp"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(plugin, "plugin-two").has_value());
+  COVA_CHECK(first != action.cache_key(environment));
+}
+
 COVA_TEST_NAMED(build, action_identity_tracks_plugin_and_specs_files) {
   cova::test::TempDir temp;
   const std::filesystem::path root(temp.path());
@@ -910,9 +966,13 @@ COVA_TEST_NAMED(build, state_inputs_match_is_independent_of_output_presence) {
   auto environment = host_environment();
   const std::string key = action.cache_key(environment);
 
+  COVA_CHECK(cova::fs::write_file(output, "object\n").has_value());
   cova::build::ActionRecord record;
   record.cache_key = key;
   record.output_paths.push_back(cova::fs::generic_string(output));
+  record.output_hashes.emplace_back(
+      cova::fs::generic_string(output),
+      cova::to_hex(*cova::build::FileHasher{}.hash_file(output)));
   record.input_hashes.emplace_back(
       cova::fs::generic_string(input),
       cova::to_hex(*cova::build::FileHasher{}.hash_file(input)));
@@ -921,6 +981,7 @@ COVA_TEST_NAMED(build, state_inputs_match_is_independent_of_output_presence) {
   state.record(std::move(record));
 
   COVA_CHECK(state.inputs_match(action));
+  COVA_CHECK(cova::fs::remove_file(output).has_value());
   std::string reason;
   COVA_CHECK(!state.is_up_to_date(action, reason));
   COVA_CHECK(cova::fs::write_file(output, "object\n").has_value());

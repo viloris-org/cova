@@ -50,6 +50,13 @@ ActionOutcome Executor::run_action(const Action& action) {
   const auto started = std::chrono::steady_clock::now();
 
   if (action.argv.empty()) {
+    for (const auto& output : action.outputs) {
+      if (!fs::is_regular_file(output.path)) {
+        outcome.failure_message = "the action declares output `" +
+                                  fs::generic_string(output.path) + "` but has no command";
+        return outcome;
+      }
+    }
     outcome.succeeded = true;
     outcome.artifact_validated = true;
     outcome.duration = std::chrono::duration_cast<std::chrono::milliseconds>(

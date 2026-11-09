@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -362,7 +363,7 @@ Result<Path> resolve_program(const Path& program, std::wstring_view path_value) 
     for (const std::string& name : {program.string(), program.string() + ".exe"}) {
       const Path candidate(name);
       if (fs::is_regular_file(candidate)) {
-        return candidate;
+        return fs::absolute_normalized(candidate);
       }
     }
     return std::unexpected(Error::make("cova::proc::not_found", "program does not exist")
@@ -373,7 +374,7 @@ Result<Path> resolve_program(const Path& program, std::wstring_view path_value) 
     return std::unexpected(Error::make("cova::proc::not_found", "program not found on PATH")
                                .with("program: " + program.string()));
   }
-  return *found;
+  return fs::absolute_normalized(*found);
 }
 
 void drain_pipe(HANDLE pipe, std::string& sink) {
@@ -825,6 +826,21 @@ namespace {
 
 constexpr std::chrono::milliseconds kPollSlice{20};
 
+// `strerror` returns a process-wide buffer and is not thread-safe; child
+// processes are started concurrently by the executor.
+std::string errno_text(int code) {
+  char buffer[256] = {};
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
+  const char* text = ::strerror_r(code, buffer, sizeof(buffer));
+  return text == nullptr ? std::string() : std::string(text);
+#else
+  if (::strerror_r(code, buffer, sizeof(buffer)) == 0) {
+    return std::string(buffer);
+  }
+  return "errno " + std::to_string(code);
+#endif
+}
+
 void close_fd(int& fd) {
   if (fd >= 0) {
     ::close(fd);
@@ -911,13 +927,13 @@ Result<std::string> resolve_program(const Path& program, std::string_view path_v
       return std::unexpected(Error::make("cova::proc::not_executable", "program is not executable")
                                  .with("program: " + text));
     }
-    return text;
+    return fs::generic_string(fs::absolute_normalized(program));
   }
   for (const std::string& directory : str::split(path_value, ':')) {
     const Path base = directory.empty() ? Path(".") : Path(directory);
     const Path candidate = base / program;
     if (fs::is_regular_file(candidate) && ::access(candidate.c_str(), X_OK) == 0) {
-      return candidate.string();
+      return fs::generic_string(fs::absolute_normalized(candidate));
     }
   }
   return std::unexpected(Error::make("cova::proc::not_found", "program not found on PATH")
@@ -980,7 +996,7 @@ Result<ProcessResult> run(const ProcessSpec& spec) {
   if (!spec.inherit_stdout) {
     if (::pipe(stdout_pipe) != 0) {
       return std::unexpected(Error::make("cova::proc::pipe", "cannot create stdout pipe")
-                                 .with("errno: " + std::string(std::strerror(errno))));
+                                 .with("errno: " + errno_text(errno)));
     }
   }
   if (!spec.inherit_stderr) {
@@ -988,7 +1004,7 @@ Result<ProcessResult> run(const ProcessSpec& spec) {
       close_fd(stdout_pipe[0]);
       close_fd(stdout_pipe[1]);
       return std::unexpected(Error::make("cova::proc::pipe", "cannot create stderr pipe")
-                                 .with("errno: " + std::string(std::strerror(errno))));
+                                 .with("errno: " + errno_text(errno)));
     }
   }
   if (needs_stdin_pipe) {
@@ -998,7 +1014,7 @@ Result<ProcessResult> run(const ProcessSpec& spec) {
       close_fd(stderr_pipe[0]);
       close_fd(stderr_pipe[1]);
       return std::unexpected(Error::make("cova::proc::pipe", "cannot create stdin pipe")
-                                 .with("errno: " + std::string(std::strerror(errno))));
+                                 .with("errno: " + errno_text(errno)));
     }
   }
 
@@ -1033,7 +1049,7 @@ Result<ProcessResult> run(const ProcessSpec& spec) {
     close_fd(stdin_pipe[0]);
     close_fd(stdin_pipe[1]);
     return std::unexpected(Error::make("cova::proc::fork", "cannot fork")
-                               .with("errno: " + std::string(std::strerror(errno))));
+                               .with("errno: " + errno_text(errno)));
   }
 
   if (pid == 0) {

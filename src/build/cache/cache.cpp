@@ -91,6 +91,14 @@ Result<BuildState> BuildState::load(const Path& path) {
       record.cache_key = string_or(table, "cache-key");
       record.output_paths = strings_or(table, "output-paths");
       record.input_paths = strings_or(table, "input-paths");
+      for (const auto& encoded : strings_or(table, "output-hashes")) {
+        const auto position = encoded.rfind('\t');
+        if (position == std::string::npos) {
+          continue;
+        }
+        record.output_hashes.emplace_back(encoded.substr(0, position),
+                                          encoded.substr(position + 1));
+      }
       record.toolchain_fingerprint = string_or(table, "toolchain-fingerprint");
       record.sysroot_fingerprint = string_or(table, "sysroot-fingerprint");
       if (auto value = get(table, "completed-at-ns"); value != nullptr && value->is_integer()) {
@@ -137,6 +145,12 @@ Status BuildState::save(const Path& path) const {
       hashes.push_back(input + "\t" + digest);
     }
     put_strings(table, "input-hashes", hashes);
+    std::vector<std::string> output_hashes;
+    output_hashes.reserve(record.output_hashes.size());
+    for (const auto& [output, digest] : record.output_hashes) {
+      output_hashes.push_back(output + "\t" + digest);
+    }
+    put_strings(table, "output-hashes", output_hashes);
     if (!record.toolchain_fingerprint.empty()) {
       table.emplace("toolchain-fingerprint", Value(record.toolchain_fingerprint));
     }
@@ -177,12 +191,27 @@ bool BuildState::is_up_to_date(const Action& action, std::string& reason) const 
     return false;
   }
   for (const auto& output : match->output_paths) {
-    if (!fs::exists(output)) {
+    if (!fs::is_regular_file(output)) {
       reason = "output is missing: " + output;
       return false;
     }
   }
+  if (match->output_hashes.size() != match->output_paths.size()) {
+    reason = "the previous record has no complete output integrity data";
+    return false;
+  }
   FileHasher hasher;
+  for (const auto& [output, expected] : match->output_hashes) {
+    auto digest = hasher.hash_file(output);
+    if (!digest) {
+      reason = "output is unreadable: " + output;
+      return false;
+    }
+    if (cova::to_hex(*digest) != expected) {
+      reason = "output changed: " + output;
+      return false;
+    }
+  }
   for (const auto& [input, expected] : match->input_hashes) {
     auto digest = hasher.hash_file(input);
     if (!digest) {
@@ -255,7 +284,21 @@ Result<Depfile> Depfile::parse(std::string_view text, const Path& base) {
       joined.push_back(' ');
     }
   }
-  auto colon = joined.find(':');
+  // Find the target/dependency separator. A Windows drive prefix (`C:`)
+  // must not be mistaken for it, otherwise every dependency path is shifted.
+  std::size_t colon = std::string::npos;
+  for (std::size_t index = 0; index < joined.size(); ++index) {
+    if (joined[index] != ':') {
+      continue;
+    }
+    if (index == 1 && std::isalpha(static_cast<unsigned char>(joined[0])) &&
+        index + 1 < joined.size() &&
+        (joined[index + 1] == '/' || joined[index + 1] == '\\')) {
+      continue;
+    }
+    colon = index;
+    break;
+  }
   if (colon == std::string::npos) {
     return fail<Depfile>(Error::make("cova::build::depfile", "dependency file has no target line"));
   }
@@ -307,6 +350,13 @@ struct Artifact {
   std::string sha256;
   std::uint64_t size = 0;
 };
+
+bool is_plain_component(std::string_view text) {
+  if (text.empty() || text == "." || text == "..") {
+    return false;
+  }
+  return text.find('/') == std::string::npos && text.find('\\') == std::string::npos;
+}
 
 std::string temporary_suffix() {
   const auto count = temporary_counter.fetch_add(1);
@@ -375,6 +425,9 @@ std::optional<std::vector<Artifact>> read_complete_entry(const Path& directory) 
     artifact.blob = string_or(table, "blob");
     artifact.sha256 = string_or(table, "sha256");
     if (artifact.path.empty() || artifact.blob.empty() || artifact.sha256.empty()) {
+      return std::nullopt;
+    }
+    if (!is_plain_component(artifact.blob)) {
       return std::nullopt;
     }
     if (!fs::is_regular_file(directory / artifact.blob)) {
@@ -450,8 +503,12 @@ Status record_nondeterminism(const Path& directory, const std::string& key,
 
 Status cache_store(const CacheSettings& settings, const Action& action,
                    const std::string& key) {
-  if (!settings.enabled || settings.read_only || action.outputs.empty() || key.empty()) {
+  if (!settings.enabled || settings.read_only || action.outputs.empty()) {
     return ok();
+  }
+  if (!is_plain_component(key)) {
+    return fail(Error::make("cova::build::cache_key", "invalid artifact cache key")
+                    .with("key: " + key));
   }
   auto artifacts = compute_artifacts(action);
   if (!artifacts) {
@@ -567,7 +624,7 @@ Status cache_store(const CacheSettings& settings, const Action& action,
 
 Result<bool> cache_restore(const CacheSettings& settings, const Action& action,
                            const std::string& key) {
-  if (!settings.enabled || action.outputs.empty() || key.empty()) {
+  if (!settings.enabled || action.outputs.empty() || !is_plain_component(key)) {
     return false;
   }
   const std::string prefix = key.size() >= 2 ? key.substr(0, 2) : "00";
@@ -609,7 +666,8 @@ Result<bool> cache_restore(const CacheSettings& settings, const Action& action,
     artifact.path = string_or(table, "path");
     artifact.blob = string_or(table, "blob");
     artifact.sha256 = string_or(table, "sha256");
-    if (artifact.path.empty() || artifact.blob.empty() || artifact.sha256.empty()) {
+    if (artifact.path.empty() || artifact.blob.empty() || artifact.sha256.empty() ||
+        !is_plain_component(artifact.blob)) {
       return false;
     }
     artifacts.push_back(std::move(artifact));

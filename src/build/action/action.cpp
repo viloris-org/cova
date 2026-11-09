@@ -316,8 +316,8 @@ std::vector<std::string> include_directories(const Action& action,
         }
         break;
       }
-      if (argument.size() > option.size() && argument.substr(0, option.size()) == option &&
-          (argument[option.size()] == '=' || option == "-I" || option == "-F")) {
+      if (argument.size() > option.size() && argument.substr(0, option.size()) == option) {
+        // Attached forms: `-I/path`, `-isystem/path`, `-isystem=path`.
         value = argument.substr(option.size());
         if (!value.empty() && value.front() == '=') {
           value.erase(value.begin());
@@ -340,7 +340,8 @@ std::vector<std::string> include_directories(const Action& action,
       }
     };
     for (const auto& [name, value] : environment.environment) {
-      if (name == "CPATH" || name == "C_INCLUDE_PATH" || name == "CPLUS_INCLUDE_PATH") {
+      if (str::iequals(name, "CPATH") || str::iequals(name, "C_INCLUDE_PATH") ||
+          str::iequals(name, "CPLUS_INCLUDE_PATH")) {
         add_path_list(value);
       }
     }
@@ -411,8 +412,16 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
         index + 1 < argv.size()) {
       add_auxiliary_file_identity(response_context, Path(argv[index + 1]), "driver-input");
     }
-    if (argv[index] == "-Xclang" && index + 2 < argv.size() && argv[index + 1] == "-load") {
-      add_auxiliary_file_identity(response_context, Path(argv[index + 2]), "plugin");
+    if (argv[index] == "-Xclang" && index + 1 < argv.size() && argv[index + 1] == "-load") {
+      // Clang accepts both `-Xclang -load plugin.so` and the common
+      // `-Xclang -load -Xclang plugin.so` form.
+      if (index + 2 < argv.size()) {
+        if (argv[index + 2] == "-Xclang" && index + 3 < argv.size()) {
+          add_auxiliary_file_identity(response_context, Path(argv[index + 3]), "plugin");
+        } else {
+          add_auxiliary_file_identity(response_context, Path(argv[index + 2]), "plugin");
+        }
+      }
     }
   }
   if (!response_context.identity_complete) {

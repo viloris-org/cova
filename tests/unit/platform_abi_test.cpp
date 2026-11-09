@@ -72,6 +72,26 @@ COVA_TEST_NAMED(platform, effective_abi_resolves_ordered_overrides) {
   COVA_CHECK(contains(reversed.signature.abi_affecting_features, "exceptions=0"));
 }
 
+COVA_TEST_NAMED(platform, effective_abi_resolves_last_wins_layout_flags) {
+  auto base = baseline();
+  auto short_off = cova::platform::effective_abi(base, {"-fshort-enums", "-fno-short-enums"});
+  COVA_CHECK(contains(short_off.signature.abi_affecting_features, "short-enums=0"));
+  COVA_CHECK(!contains(short_off.signature.abi_affecting_features, "short-enums=1"));
+
+  auto packed = cova::platform::effective_abi(base, {"-fpack-struct=8", "-fno-pack-struct"});
+  COVA_CHECK(contains(packed.signature.abi_affecting_features, "pack-struct=0"));
+  COVA_CHECK(!contains(packed.signature.abi_affecting_features, "pack-struct=8"));
+
+  auto abi = cova::platform::effective_abi(base, {"-mabi=lp64", "-mabi=ilp32"});
+  COVA_CHECK(contains(abi.signature.abi_affecting_features, "mabi=ilp32"));
+  COVA_CHECK(!contains(abi.signature.abi_affecting_features, "mabi=lp64"));
+
+  auto stdlib =
+      cova::platform::effective_abi(base, {"-stdlib=libc++", "-stdlib=libstdc++"});
+  COVA_CHECK(stdlib.signature.libcpp == cova::platform::LibCpp::LibStdCpp);
+  COVA_CHECK(contains(stdlib.signature.abi_affecting_features, "libcpp=libstdc++"));
+}
+
 COVA_TEST_NAMED(platform, effective_abi_does_not_pollute_with_neutral_flags) {
   auto base = baseline();
   base.abi_affecting_features.clear();

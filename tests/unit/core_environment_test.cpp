@@ -110,6 +110,11 @@ COVA_TEST_NAMED(core, environment_locale_prefix_is_tracked) {
   COVA_CHECK(cova::proc::is_tracked_environment_variable("LC_WHATEVER"));
   COVA_CHECK(cova::proc::environment_policy("LC_WHATEVER") ==
              cova::proc::EnvironmentPolicy::InheritedTracked);
+  // The locale prefix must not override secret rejection.
+  COVA_CHECK(cova::proc::environment_policy("LC_PASSWORD") ==
+             cova::proc::EnvironmentPolicy::Rejected);
+  COVA_CHECK(cova::proc::is_rejected_environment_variable("SERVICE_PASSWORD"));
+  COVA_CHECK(!cova::proc::is_tracked_environment_variable("SERVICE_PASSWORD"));
   COVA_CHECK(!cova::proc::is_tracked_environment_variable("COVA_LEAK"));
 }
 
