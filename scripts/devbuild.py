@@ -56,6 +56,11 @@ def ninja_path(value) -> str:
     return text
 
 
+def build_relative(value) -> str:
+    """Path relative to BUILD; Ninja rejects a drive-letter colon in an input."""
+    return ninja_path(os.path.relpath(Path(value), BUILD))
+
+
 def include_flag(directory) -> str:
     text = str(directory).replace("\\", "/") if IS_WINDOWS else str(directory)
     if any(character.isspace() for character in text):
@@ -280,7 +285,7 @@ def render() -> str:
         lines.append(f"# --- module {module}\n")
         for src, obj in zip(srcs, objs):
             lines.append(
-                f"build {ninja_path(obj.relative_to(BUILD))}: cxx_compile {ninja_path(src)}\n"
+                f"build {ninja_path(obj.relative_to(BUILD))}: cxx_compile {build_relative(src)}\n"
             )
         lines.append(
             f"build {ninja_path(lib_path(module).relative_to(BUILD))}: archive "
@@ -308,7 +313,7 @@ def render() -> str:
         target = f"bin/{name}{EXE_SUFFIX}"
         test_targets.append(target)
         lines.append(f"# --- test {name} (module {module})\n")
-        lines.append(f"build {target}: link_exe {ninja_path(src)} {libs}\n")
+        lines.append(f"build {target}: link_exe {build_relative(src)} {libs}\n")
         lines.append("  ldflags = " + link_ldflags("-pthread") + "\n")
         if IS_DARWIN:
             lines.append("  force_load = " + force_load(libs) + "\n")
