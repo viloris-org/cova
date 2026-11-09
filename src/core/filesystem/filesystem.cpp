@@ -972,22 +972,11 @@ Status ensure_layout(const CovaDirs& dirs) {
 
 std::optional<std::string> get_env(std::string_view name) {
   const std::string key(name);
-#ifdef _WIN32
-  char* buffer = nullptr;
-  std::size_t size = 0;
-  if (_dupenv_s(&buffer, &size, key.c_str()) != 0 || buffer == nullptr) {
-    return std::nullopt;
-  }
-  std::string value(buffer);
-  std::free(buffer);
-  return value;
-#else
   const char* value = std::getenv(key.c_str());
   if (value == nullptr) {
     return std::nullopt;
   }
   return std::string(value);
-#endif
 }
 
 Status set_env(std::string_view name, std::string_view value) {

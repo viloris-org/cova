@@ -346,20 +346,13 @@ std::string TempDir::sub(std::string_view name) const {
 // ---------------------------------------------------------------------------
 
 ScopedEnv::ScopedEnv(std::string name, std::string value) : name_(std::move(name)) {
-#ifdef _WIN32
-  char* existing = nullptr;
-  std::size_t size = 0;
-  if (_dupenv_s(&existing, &size, name_.c_str()) == 0 && existing != nullptr) {
-    old_ = existing;
-    had_old_ = true;
-    std::free(existing);
-  }
-  _putenv_s(name_.c_str(), value.c_str());
-#else
   if (const char* existing = std::getenv(name_.c_str()); existing != nullptr) {
     old_ = existing;
     had_old_ = true;
   }
+#ifdef _WIN32
+  _putenv_s(name_.c_str(), value.c_str());
+#else
   ::setenv(name_.c_str(), value.c_str(), 1);
 #endif
 }
