@@ -509,6 +509,7 @@ int cmd_doctor(CommandContext& ctx) {
       if (target) {
         auto request = make_resolution_request(ctx, *project, *target, *config);
         request.probe_capabilities = true;
+        request.full_capabilities = true;
         auto report = toolchain::resolve(request);
         checks.push_back(Check{"native resolution", report.resolved, true,
                                report.resolved

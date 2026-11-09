@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <future>
 #include <initializer_list>
 #include <map>
 #include <set>
@@ -163,6 +164,16 @@ std::string source_prefix(ToolchainSource source) {
     break;
   }
   return "unknown";
+}
+
+std::string make_descriptor_id(ToolchainSource source, std::string_view family,
+                               const Version& version,
+                               const std::optional<platform::Triple>& inferred,
+                               const stdfs::path& compiler_path) {
+  return source_prefix(source) + "-" + std::string(family) + "-" + version.to_string() + "-" +
+         (inferred ? inferred->to_short_string() + "-" : "") +
+         std::to_string(fnv1a64(fs::generic_string(fs::canonical_for_compare(compiler_path))) %
+                        0xffffff);
 }
 
 } // namespace
@@ -350,14 +361,11 @@ stdfs::path resolve_reported_tool(const stdfs::path& compiler_directory,
   return {};
 }
 
-void add_subprogram_component(ToolchainDescriptor& descriptor, const stdfs::path& compiler_path,
-                              std::string role, std::string_view query) {
-  if (descriptor.component(role) != nullptr) {
-    return;
-  }
+std::optional<ToolComponent> query_subprogram_component(
+    const stdfs::path& compiler_path, std::string role, std::string_view query) {
   auto reported = query_program(compiler_path, query);
   if (!reported) {
-    return;
+    return std::nullopt;
   }
   const stdfs::path compiler_directory =
       compiler_path.has_parent_path() ? compiler_path.parent_path() : stdfs::path(".");
@@ -365,13 +373,13 @@ void add_subprogram_component(ToolchainDescriptor& descriptor, const stdfs::path
   if (resolved.empty()) {
     // GCC prints the literal name when it has no such file (for example
     // `-print-file-name=specs` on clang); that is not a tool identity.
-    return;
+    return std::nullopt;
   }
   ToolComponent component;
   component.role = std::move(role);
   component.path = fs::canonical_for_compare(resolved);
   component.sha256 = Sha256::hex_of_file(component.path).value_or("");
-  descriptor.components.push_back(std::move(component));
+  return component;
 }
 
 // Driver subprograms are real inputs: replacing `as`, `ld`, `cc1plus`,
@@ -386,11 +394,27 @@ void add_compiler_subprogram_components(ToolchainDescriptor& descriptor,
       {"collect2", "-print-prog-name=collect2"},
       {"lto-wrapper", "-print-prog-name=lto-wrapper"},
       {"specs", "-print-file-name=specs"},
+      {"linker", "-print-prog-name=ld"},
   };
+  struct Pending {
+    std::string role;
+    std::future<std::optional<ToolComponent>> result;
+  };
+  std::vector<Pending> pending;
   for (const auto& [role, query] : kQueries) {
-    add_subprogram_component(descriptor, compiler_path, std::string(role), query);
+    if (descriptor.component(role) != nullptr) {
+      continue;
+    }
+    pending.push_back(
+        Pending{std::string(role), std::async(std::launch::async, [compiler_path, role, query] {
+                  return query_subprogram_component(compiler_path, std::string(role), query);
+                })});
   }
-  add_subprogram_component(descriptor, compiler_path, "linker", "-print-prog-name=ld");
+  for (auto& entry : pending) {
+    if (auto component = entry.result.get()) {
+      descriptor.components.push_back(std::move(*component));
+    }
+  }
 }
 
 std::vector<std::string> query_supported_targets(const stdfs::path& compiler_path) {
@@ -468,10 +492,7 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   descriptor.libcpp = platform::default_libcpp_for(descriptor.family, configured_target);
   descriptor.abi = configured_target.abi();
   descriptor.id =
-      source_prefix(source) + "-" + descriptor.family + "-" + descriptor.version.to_string() + "-" +
-      (inferred ? inferred->to_short_string() + "-" : "") +
-      std::to_string(fnv1a64(fs::generic_string(fs::canonical_for_compare(compiler_path))) %
-                     0xffffff);
+      make_descriptor_id(source, descriptor.family, descriptor.version, inferred, compiler_path);
   descriptor.trust_level = source == ToolchainSource::System ? "system" : "managed";
   descriptor.supported_targets = {configured_target.to_string()};
   if (inferred) {
@@ -591,6 +612,11 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
 
   std::vector<ToolchainDescriptor> descriptors;
   std::set<std::string> seen;
+
+  // Collect driver paths first. Describing each alias separately repeats
+  // version, resource-dir, sysroot and sibling queries; hard-linked aliases
+  // are grouped so only one representative is described.
+  std::vector<stdfs::path> candidates;
   for (const auto& root : roots) {
     if (!fs::is_directory(root)) {
       continue;
@@ -610,15 +636,67 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
       if (!seen.insert(canonical).second) {
         continue;
       }
-      auto descriptor = describe_compiler(it->path(), ToolchainSource::System);
-      if (!descriptor) {
+      candidates.push_back(it->path());
+    }
+  }
+
+  struct CandidateGroup {
+    stdfs::path representative;
+    std::vector<stdfs::path> aliases;
+  };
+  std::vector<CandidateGroup> groups;
+  for (const auto& candidate : candidates) {
+    bool grouped = false;
+    for (auto& group : groups) {
+      std::error_code equivalent_error;
+      if (stdfs::equivalent(candidate, group.representative, equivalent_error) &&
+          !equivalent_error) {
+        group.aliases.push_back(candidate);
+        grouped = true;
+        break;
+      }
+    }
+    if (!grouped) {
+      groups.push_back(CandidateGroup{candidate, {candidate}});
+    }
+  }
+
+  // The groups are independent; the compiler queries are process-bound, so
+  // describe the representatives concurrently. Results are consumed in group
+  // order, keeping the final candidate set deterministic.
+  std::vector<std::future<Result<ToolchainDescriptor>>> described;
+  described.reserve(groups.size());
+  for (const auto& group : groups) {
+    described.push_back(std::async(std::launch::async,
+                                   [path = group.representative] {
+                                     return describe_compiler(path, ToolchainSource::System);
+                                   }));
+  }
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    auto descriptor_result = described[index].get();
+    if (!descriptor_result) {
+      continue;
+    }
+    for (const auto& candidate : groups[index].aliases) {
+      ToolchainDescriptor descriptor = *descriptor_result;
+      if (candidate != groups[index].representative) {
+        for (auto& component : descriptor.components) {
+          if (component.role == "cxx") {
+            component.path = fs::absolute_normalized(candidate);
+            break;
+          }
+        }
+        const auto inferred = target_from_executable(basename_lower(candidate));
+        descriptor.id = make_descriptor_id(ToolchainSource::System, descriptor.family,
+                                           descriptor.version, inferred, candidate);
+        descriptor.content_hash = descriptor.compute_fingerprint();
+      }
+      if (!options.families.empty() &&
+          std::find(options.families.begin(), options.families.end(), descriptor.family) ==
+              options.families.end()) {
         continue;
       }
-      if (!options.families.empty() && std::find(options.families.begin(), options.families.end(),
-                                                 descriptor->family) == options.families.end()) {
-        continue;
-      }
-      descriptors.push_back(std::move(*descriptor));
+      descriptors.push_back(std::move(descriptor));
     }
   }
 

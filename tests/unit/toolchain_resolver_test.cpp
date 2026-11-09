@@ -386,4 +386,22 @@ COVA_TEST_NAMED(toolchain, descriptor_fingerprint_covers_compiler_subprograms) {
   }
 }
 
+COVA_TEST_NAMED(toolchain, probe_scope_skips_unrequested_capabilities) {
+  auto discovered = COVA_REQUIRE_OK(cova::toolchain::discover({}));
+  if (discovered.empty()) {
+    return;
+  }
+  cova::toolchain::ProbeOptions options;
+  options.target = cova::platform::host_triple();
+  options.required = {"cpp"};
+  auto report = cova::toolchain::probe(discovered.front(), options);
+  if (!report) {
+    return;
+  }
+  COVA_CHECK(report->capabilities.cpp_compilation);
+  // The build fast path deliberately does not pay for these probes.
+  COVA_CHECK(!report->capabilities.executable_link);
+  COVA_CHECK(!report->capabilities.static_library);
+}
+
 COVA_TEST_MAIN()

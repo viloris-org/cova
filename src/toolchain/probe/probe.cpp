@@ -424,6 +424,15 @@ Result<ProbeReport> probe(const ToolchainDescriptor& descriptor, const ProbeOpti
   report.capabilities.cpp26_library = false;
   report.capabilities.shared_library = false;
 
+  const bool full = options.required.empty();
+  const auto wanted = [&](std::string_view name) {
+    if (full) {
+      return true;
+    }
+    return std::find(options.required.begin(), options.required.end(), std::string(name)) !=
+           options.required.end();
+  };
+
   auto record = [&](std::string name, const Status& status, bool& capability,
                     bool fatal) -> void {
     if (status) {
@@ -438,11 +447,11 @@ Result<ProbeReport> probe(const ToolchainDescriptor& descriptor, const ProbeOpti
     }
   };
 
-  {
+  if (wanted("c")) {
     auto status = probe_c_compilation(descriptor, options);
     record("C compilation", status, report.capabilities.c_compilation, false);
   }
-  {
+  if (wanted("cpp")) {
     auto status = probe_cpp_compilation(descriptor, options);
     record("C++ compilation", status, report.capabilities.cpp_compilation, true);
   }
@@ -461,7 +470,7 @@ Result<ProbeReport> probe(const ToolchainDescriptor& descriptor, const ProbeOpti
   }
   // Preprocessing is implied by a successful compile, but a separate invocation
   // makes the capability honest if the driver has an unusual configuration.
-  {
+  if (wanted("preprocess")) {
     auto scratch = make_scratch(options, "preprocess");
     if (scratch) {
       const auto source = *scratch / "pre.cpp";
@@ -487,19 +496,19 @@ Result<ProbeReport> probe(const ToolchainDescriptor& descriptor, const ProbeOpti
       (void)cleanup;
     }
   }
-  {
+  if (wanted("archive")) {
     auto status = probe_static_library(descriptor, options);
     record("static library", status, report.capabilities.static_library, false);
   }
-  {
+  if (wanted("link")) {
     auto status = probe_executable_link(descriptor, options);
     record("executable link", status, report.capabilities.executable_link, true);
   }
-  {
+  if (wanted("stdlib")) {
     auto status = probe_stdlib_headers(descriptor, options);
     record("standard library headers", status, report.capabilities.stdlib_headers, false);
   }
-  {
+  if (wanted("c++26")) {
     auto status = probe_cpp26_baseline(descriptor, options);
     record("C++26 baseline", status, report.capabilities.cpp26_language, false);
     report.capabilities.cpp26_library = report.capabilities.cpp26_language;
@@ -511,15 +520,25 @@ Result<ProbeReport> probe(const ToolchainDescriptor& descriptor, const ProbeOpti
     auto status = run_probe_command(descriptor, options, args, tag);
     return status.has_value();
   };
-  report.capabilities.shared_library = cheap_probe("shared", {"-x", "c++", "-std=c++26",
-                                                              "-shared", "-fPIC", "-c"});
-  report.capabilities.lto = cheap_probe("lto", {"-x", "c++", "-std=c++26", "-flto", "-c"});
-  report.capabilities.sanitizers = cheap_probe(
-      "sanitizer", {"-x", "c++", "-std=c++26", "-fsanitize=address", "-c"});
-  report.capabilities.coverage = cheap_probe("coverage",
-                                             {"-x", "c++", "-std=c++26", "--coverage", "-c"});
-  report.capabilities.threads_available = cheap_probe(
-      "threads", {"-x", "c++", "-std=c++26", "-pthread", "-c"});
+  if (wanted("shared")) {
+    report.capabilities.shared_library = cheap_probe(
+        "shared", {"-x", "c++", "-std=c++26", "-shared", "-fPIC", "-c"});
+  }
+  if (wanted("lto")) {
+    report.capabilities.lto = cheap_probe("lto", {"-x", "c++", "-std=c++26", "-flto", "-c"});
+  }
+  if (wanted("sanitizers")) {
+    report.capabilities.sanitizers = cheap_probe(
+        "sanitizer", {"-x", "c++", "-std=c++26", "-fsanitize=address", "-c"});
+  }
+  if (wanted("coverage")) {
+    report.capabilities.coverage = cheap_probe(
+        "coverage", {"-x", "c++", "-std=c++26", "--coverage", "-c"});
+  }
+  if (wanted("threads")) {
+    report.capabilities.threads_available = cheap_probe(
+        "threads", {"-x", "c++", "-std=c++26", "-pthread", "-c"});
+  }
   report.capabilities.cpp_modules_scan = false;
   report.capabilities.modules = false;
   return report;

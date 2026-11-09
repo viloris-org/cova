@@ -48,6 +48,9 @@ struct ResolutionRequest {
   std::vector<ToolchainDescriptor> candidates;
   // Whether to run capability probes (tests may disable this).
   bool probe_capabilities = true;
+  // Request the full capability matrix (doctor/explain). Normal builds only
+  // need C++ compilation, linking and the ABI facts.
+  bool full_capabilities = false;
   // Verbosity: collect a full decision trace.
   bool explain = false;
 };

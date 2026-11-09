@@ -494,7 +494,8 @@ ResolutionReport resolve(const ResolutionRequest& request) {
       ProbeOptions probe_options;
       probe_options.target = request.target;
       probe_options.sysroot = sysroot ? sysroot->path : probed.default_sysroot;
-      probe_options.required = {"cpp", "link"};
+      probe_options.required =
+          request.full_capabilities ? std::vector<std::string>{} : std::vector<std::string>{"cpp", "link"};
       if (auto environment = proc::collect_environment(); environment) {
         probe_options.environment = environment->variables();
         probe_options.environment_identity = environment->identity();

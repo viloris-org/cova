@@ -368,6 +368,7 @@ int cmd_explain(CommandContext& ctx) {
 
   toolchain::ResolutionRequest request = make_resolution_request(ctx, *project, *target, *config);
   request.explain = true;
+  request.full_capabilities = true;
   auto report = toolchain::resolve(request);
 
   if (ctx.global.json) {
