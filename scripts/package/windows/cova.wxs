@@ -42,11 +42,11 @@
         </Component>
 
         <Component Id="CovaLicense" Guid="CD5819D6-D728-4F00-AB7A-972A7A82AF23">
-          <File Id="CovaLicense" Source="$(var.LicenseSource)" Name="LICENSE" />
+          <File Id="CovaLicense" Source="$(var.LicenseSource)" Name="LICENSE" KeyPath="yes" />
         </Component>
 
         <Component Id="CovaNotice" Guid="0608870D-6DC3-42FD-AE15-27CCADE6EC5F">
-          <File Id="CovaNotice" Source="$(var.NoticeSource)" Name="NOTICE" />
+          <File Id="CovaNotice" Source="$(var.NoticeSource)" Name="NOTICE" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
