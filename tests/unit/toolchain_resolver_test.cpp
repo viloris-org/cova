@@ -167,6 +167,11 @@ COVA_TEST_NAMED(toolchain, recognises_cross_and_versioned_driver_names) {
   COVA_CHECK(mingw32->arch == cova::platform::Arch::X86);
   COVA_CHECK(mingw32->os == cova::platform::Os::Windows);
   COVA_CHECK(mingw32->env == cova::platform::Env::Gnu);
+
+  // Windows on Arm uses the same MinGW spelling with the aarch64 prefix.
+  auto woa = cova::toolchain::target_from_executable("aarch64-w64-mingw32-g++");
+  COVA_CHECK(woa.has_value());
+  COVA_CHECK_EQ(woa->to_string(), std::string("aarch64-pc-windows-gnu"));
 }
 
 COVA_TEST_NAMED(toolchain, discovery_recognises_prefixed_cross_driver) {

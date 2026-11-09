@@ -662,6 +662,10 @@ COVA_TEST_NAMED(build, planner_keeps_duplicate_definition_checks_for_clang) {
     const auto multiple =
         std::find(action->argv.begin(), action->argv.end(), "-Wl,--allow-multiple-definition");
     COVA_CHECK_MSG(multiple == action->argv.end(), action->label);
+    // libstdc++exp is GCC's MinGW archive. Clang on Windows GNU uses libc++
+    // (MSYS2 CLANG64/CLANGARM64, llvm-mingw), so the link must not ask for it.
+    const auto exp = std::find(action->argv.begin(), action->argv.end(), "-lstdc++exp");
+    COVA_CHECK_MSG(exp == action->argv.end(), action->label);
   }
 }
 

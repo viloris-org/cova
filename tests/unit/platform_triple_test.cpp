@@ -50,6 +50,22 @@ COVA_TEST_NAMED(platform, accepts_mingw_triple_spellings) {
   COVA_CHECK(cova::platform::is_known_target("x86_64-w64-mingw32"));
 }
 
+COVA_TEST_NAMED(platform, recognises_windows_on_arm) {
+  auto woa = COVA_REQUIRE_OK(Triple::parse("aarch64-w64-mingw32"));
+  COVA_CHECK(woa.arch == cova::platform::Arch::Aarch64);
+  COVA_CHECK(woa.vendor == cova::platform::Vendor::Pc);
+  COVA_CHECK(woa.os == cova::platform::Os::Windows);
+  COVA_CHECK(woa.env == cova::platform::Env::Gnu);
+  COVA_CHECK_EQ(woa.to_string(), std::string("aarch64-pc-windows-gnu"));
+  COVA_CHECK_EQ(woa.to_short_string(), std::string("aarch64-pc-windows-gnu"));
+  COVA_CHECK_EQ(woa.executable_suffix(), std::string(".exe"));
+
+  COVA_CHECK(cova::platform::is_known_target("aarch64-pc-windows-gnu"));
+  COVA_CHECK(cova::platform::is_known_target("aarch64-w64-mingw32"));
+  auto resolved = COVA_REQUIRE_OK(cova::platform::resolve_target("aarch64-w64-mingw32"));
+  COVA_CHECK_EQ(resolved.to_string(), std::string("aarch64-pc-windows-gnu"));
+}
+
 COVA_TEST_NAMED(platform, normalises_pc_vendor_for_linux) {
   auto triple = COVA_REQUIRE_OK(Triple::parse("x86_64-pc-linux-gnu"));
   COVA_CHECK(triple.vendor == cova::platform::Vendor::UnknownVendor);

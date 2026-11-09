@@ -214,12 +214,16 @@ void append_windows_static_runtime(std::vector<std::string>& argv,
   }
 }
 
-// `<print>` reaches the terminal through helpers that MinGW ships in
-// libstdc++exp, not libstdc++. The archive must follow the objects that
-// reference it, so this is appended after them.
+// `<print>` reaches the terminal through helpers that MinGW's libstdc++ ships
+// in libstdc++exp, not libstdc++. The archive must follow the objects that
+// reference it, so this is appended after them. The library is a GCC/libstdc++
+// implementation detail: Clang on Windows GNU normally uses libc++ (MSYS2
+// CLANG64/CLANGARM64, llvm-mingw), where asking for libstdc++exp fails the link.
 void append_windows_experimental_library(std::vector<std::string>& argv,
-                                         const platform::Triple& target) {
-  if (target.os == platform::Os::Windows && target.env == platform::Env::Gnu) {
+                                         const platform::Triple& target,
+                                         const toolchain::ResolvedToolchain& toolchain) {
+  if (target.os == platform::Os::Windows && target.env == platform::Env::Gnu &&
+      toolchain.descriptor.family == "gcc") {
     argv.push_back("-lstdc++exp");
   }
 }
@@ -427,7 +431,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       for (const auto& artifact : options.dependency_artifacts) {
         argv.push_back(artifact);
       }
-      append_windows_experimental_library(argv, options.target);
+      append_windows_experimental_library(argv, options.target, toolchain);
       argv.push_back("-o");
       argv.push_back(fs::generic_string(final_output));
       if (override != nullptr) {
@@ -522,7 +526,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       for (const auto& artifact : options.dependency_artifacts) {
         argv.push_back(artifact);
       }
-      append_windows_experimental_library(argv, options.target);
+      append_windows_experimental_library(argv, options.target, toolchain);
       argv.push_back("-o");
       argv.push_back(fs::generic_string(binary));
       if (override != nullptr) {
