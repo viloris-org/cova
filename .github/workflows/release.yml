@@ -212,6 +212,7 @@ jobs:
           # Native x86_64 build with the UCRT64 MinGW-w64 GCC.
           - runner: windows-latest
             asset_arch: x86_64
+            cova_arch: x86_64
             msystem: UCRT64
             compiler_package: mingw-w64-ucrt-x86_64-gcc
             python_package: mingw-w64-ucrt-x86_64-python
@@ -224,6 +225,7 @@ jobs:
           # the driver and archiver are not.
           - runner: windows-11-arm
             asset_arch: arm64
+            cova_arch: aarch64
             msystem: CLANGARM64
             compiler_package: mingw-w64-clang-aarch64-clang
             python_package: mingw-w64-clang-aarch64-python
@@ -290,8 +292,19 @@ jobs:
             echo "::error::cova.exe links a C++ runtime DLL that the MSI does not install"
             exit 1
           fi
+          machine="$("$dump" -f build/bin/cova.exe | sed -n 's/^architecture: //p')"
+          echo "architecture: $machine"
+          if [[ "${{ matrix.cova_arch }}" == "aarch64" ]]; then
+            [[ "$machine" == *aarch64* ]] || { echo "::error::expected an ARM64 cova.exe"; exit 1; }
+          else
+            [[ "$machine" == *x86-64* ]] || { echo "::error::expected an x86-64 cova.exe"; exit 1; }
+          fi
 
       - name: Build MSI
+        env:
+          # uname -m reports the MSYS2 process architecture, not the Windows
+          # host, so name the architecture explicitly.
+          COVA_ARCH: ${{ matrix.cova_arch }}
         run: |
           # The MSYS2 shell does not inherit the Windows PATH, so add the
           # directory chosen by the WiX install step explicitly.

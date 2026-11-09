@@ -16,6 +16,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 require wix
 resolve_defaults
 
+# On Windows Arm64, MSYS2's uname still reports x86_64 because the MSYS2
+# runtime is x64-emulated, so release builds set COVA_ARCH explicitly.
 case "$TARGET_ARCH" in
   x86_64|amd64|x64) msi_arch=x64; asset_arch=x86_64 ;;
   aarch64|arm64)    msi_arch=arm64; asset_arch=arm64 ;;
@@ -44,8 +46,11 @@ notice_file="$(native_path "$ROOT/NOTICE")"
 output_file="$(native_path "$output")"
 
 note "building $output"
+# Do not leave a .wixpdb in dist/: it is not an installable release asset and
+# SHA256SUMS only covers the installers.
 wix build \
   -arch "$msi_arch" \
+  -pdbtype none \
   -d "MsiVersion=$product_version" \
   -d "FullVersion=$COVA_VERSION" \
   -d "BinarySource=$binary_file" \

@@ -27,8 +27,10 @@
                   DowngradeErrorMessage="A newer version of Cova is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <Launch Condition="Installed OR VersionNT &gt;= 1000"
-            Message="Cova requires Windows 10 or later." />
+    <!-- Windows Installer reports VersionNT 603 (Windows 8.1) on Windows 10
+         and later for compatibility, so 1000 is not a usable floor here. -->
+    <Launch Condition="Installed OR VersionNT &gt;= 603"
+            Message="Cova requires Windows 8.1 or later." />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Cova">

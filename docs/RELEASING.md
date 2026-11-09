@@ -96,7 +96,9 @@ bash scripts/package/build-msi.sh
 
 It produces the same `cova-<version>-windows-<arch>.msi` layout as the release
 job. The release job runs `build-all.sh`, which selects `build-msi.sh` on
-MSYS2.
+MSYS2. On Windows Arm64, set `COVA_ARCH=arm64`: MSYS2's `uname -m` reports the
+emulated x86_64 MSYS2 process, not the Arm64 Windows host, so the architecture
+cannot be inferred from it.
 
 ## Signing
 
