@@ -195,11 +195,22 @@ std::string shared_library_suffix(const platform::Triple& target) {
 }
 
 // A Windows GNU program should not depend on the MinGW runtime DLLs.
+//
+// The static libstdc++ carries out-of-line definitions of the exception
+// classes, while GCC 16's C++26 headers define the same constructors inline
+// and emit them into every object. A PE image cannot hold both a COMDAT
+// definition from an object and an archive member's definition of the same
+// symbol, so keep the first definition, the way ELF resolves weak symbols.
+// Older GCC headers never define these constructors inline.
 void append_windows_static_runtime(std::vector<std::string>& argv,
-                                   const platform::Triple& target) {
+                                   const platform::Triple& target,
+                                   const toolchain::ResolvedToolchain& toolchain) {
   if (target.os == platform::Os::Windows && target.env == platform::Env::Gnu) {
     argv.push_back("-static-libstdc++");
     argv.push_back("-static-libgcc");
+    if (toolchain.descriptor.family == "gcc" && toolchain.descriptor.version.major >= 16) {
+      argv.push_back("-Wl,--allow-multiple-definition");
+    }
   }
 }
 
@@ -399,7 +410,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
     } else {
       argv.push_back(compiler_program(toolchain, false));
       append(argv, target_flags(toolchain, options.target));
-      append_windows_static_runtime(argv, options.target);
+      append_windows_static_runtime(argv, options.target, toolchain);
       if (manifest.build.kind == manifest::PackageKind::SharedLibrary) {
         argv.push_back("-shared");
         argv.push_back("-fPIC");
@@ -491,7 +502,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       std::vector<std::string> argv;
       argv.push_back(compiler_program(toolchain, false));
       append(argv, target_flags(toolchain, options.target));
-      append_windows_static_runtime(argv, options.target);
+      append_windows_static_runtime(argv, options.target, toolchain);
       append(argv, manifest.profile(options.profile).ld_flags());
       argv.push_back(fs::generic_string(test_object));
       for (const auto& object : objects) {
