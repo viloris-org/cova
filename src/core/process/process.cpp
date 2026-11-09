@@ -40,6 +40,8 @@
 
 #include <windows.h>
 
+#include <atomic>
+#include <semaphore>
 #include <thread>
 
 namespace cova::proc {
@@ -559,12 +561,22 @@ Result<ProcessResult> run(const ProcessSpec& spec) {
   }
 
   // Feed stdin from a writer thread: a large payload must never block the
-  // parent while it is still draining the child's stdout.
+  // parent while it is still draining the child's stdout. The thread publishes
+  // a real Win32 thread handle because MinGW's std::thread::native_handle() is
+  // a thread id rather than a HANDLE.
+  std::binary_semaphore writer_ready{0};
+  std::atomic<HANDLE> writer_thread{nullptr};
   std::thread writer;
   if (stdin_write.valid()) {
     HANDLE write_handle = stdin_write.release();
     const std::string* data = &*spec.stdin_data;
-    writer = std::thread([write_handle, data]() {
+    writer = std::thread([&, write_handle, data]() {
+      HANDLE self = nullptr;
+      if (::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(),
+                            ::GetCurrentProcess(), &self, THREAD_TERMINATE, FALSE, 0)) {
+        writer_thread.store(self);
+      }
+      writer_ready.release();
       std::size_t offset = 0;
       while (offset < data->size()) {
         const DWORD chunk =
@@ -640,8 +652,15 @@ Result<ProcessResult> run(const ProcessSpec& spec) {
   if (writer.joinable()) {
     // A child that never read stdin can leave the writer blocked on a full
     // pipe; cancel the outstanding write before joining so run() always returns.
-    ::CancelSynchronousIo(writer.native_handle());
+    writer_ready.acquire();
+    const HANDLE thread_handle = writer_thread.load();
+    if (thread_handle != nullptr) {
+      ::CancelSynchronousIo(thread_handle);
+    }
     writer.join();
+    if (thread_handle != nullptr) {
+      ::CloseHandle(thread_handle);
+    }
   }
 
   result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
