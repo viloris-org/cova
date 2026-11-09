@@ -257,14 +257,7 @@ def render() -> str:
     lines.append("  deps = gcc\n")
     lines.append("  description = CXX $in\n")
     lines.append("rule archive\n")
-    if IS_WINDOWS:
-        # Ninja starts commands directly, without a shell, so the delete has to
-        # be routed through cmd.exe explicitly.
-        lines.append(
-            '  command = cmd.exe /c "if exist $out del /f /q $out" & $ar rcs $out $in\n'
-        )
-    else:
-        lines.append("  command = rm -f $out && $ar rcs $out $in\n")
+    lines.append("  command = $ar rcs $out $in\n")
     lines.append("  description = AR $out\n")
     lines.append("rule link_exe\n")
     if IS_DARWIN:
@@ -329,6 +322,11 @@ def write_ninja() -> dict[str, Path]:
     (BUILD / "obj").mkdir(exist_ok=True)
     (BUILD / "lib").mkdir(exist_ok=True)
     (BUILD / "bin").mkdir(exist_ok=True)
+    # `ar rcs` replaces members but never drops one whose source was removed,
+    # and the archive rule cannot portably delete first (Ninja starts commands
+    # without a shell on Windows), so recreate the archives from scratch.
+    for archive in (BUILD / "lib").glob("*.a"):
+        archive.unlink()
     # Create obj subdirectories mirroring src layout.
     for module in MODULES:
         for src in sources_for(module):
