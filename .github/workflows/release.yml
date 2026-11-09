@@ -14,9 +14,9 @@
 #   macos-15           universal     .pkg .dmg .tar.gz
 #   windows-latest     x86_64 MinGW   .zip
 #
-# The Windows build uses MSYS2's MinGW-w64 GCC. Cova does not support MSVC as a
-# host toolchain yet (PRD §20.2 phase three), so the job builds with the GNU
-# toolchain and links libstdc++/libgcc/winpthreads statically.
+# The Windows build uses MSYS2's UCRT64 MinGW-w64 GCC. Cova does not support
+# MSVC as a host toolchain yet (PRD §20.2 phase three), so the job builds with
+# the GNU toolchain and links libstdc++/libgcc/winpthreads statically.
 name: release
 
 on:
@@ -213,12 +213,12 @@ jobs:
       - name: Install MinGW-w64 toolchain
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-python
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
             zip
 
       - name: Build
@@ -312,8 +312,10 @@ jobs:
           across distributions. The macOS binaries in the universal packages are
           signed ad-hoc, not with an Apple Developer ID: Gatekeeper asks for a
           one-time override, described in the README inside the image. The
-          Windows archive contains \`cova.exe\` linked against the static MinGW
-          runtime; unzip it and put the directory on \`PATH\`.
+          Windows archive contains \`cova.exe\` built with MSYS2's UCRT64 GCC,
+          which links the MinGW runtime statically but uses the system UCRT
+          (present on Windows 10 and later); unzip it and put the directory on
+          \`PATH\`.
 
           On Windows, Cova builds projects with a MinGW-w64 GCC from MSYS2 or
           winlibs. MSVC as a host toolchain is not supported yet.

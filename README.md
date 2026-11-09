@@ -116,9 +116,11 @@ Native packages are attached to each release:
 | Windows x86_64 | `.zip` with `cova.exe` |
 
 The Linux binaries are statically linked, so one package works across
-distributions. The Windows archive links the MinGW runtime statically: unzip it
-and add the directory to `PATH`. Cova builds Windows projects with a MinGW-w64
-GCC; MSVC as a host toolchain is not supported yet (PRD §20.2).
+distributions. The Windows archive is built with MSYS2's UCRT64 GCC and links
+the MinGW runtime statically: unzip it and add the directory to `PATH`. It uses
+the system UCRT (`ucrtbase.dll`), which ships with Windows 10 and later. Cova
+builds Windows projects with a MinGW-w64 GCC; MSVC as a host toolchain is not
+supported yet (PRD §20.2).
 
 ### Releasing
 

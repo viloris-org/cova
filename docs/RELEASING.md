@@ -51,9 +51,9 @@ CLI are the parts expected to settle first (PRD §26.2).
 Linux binaries are linked statically (`-static`), which is why one package runs
 across distributions. The macOS binaries are built per-architecture and joined
 with `lipo`; they link `libstdc++` statically but still use the system libc.
-The Windows binary is built by MSYS2's MinGW-w64 GCC with `-static`, so it needs
-no `libstdc++-6.dll`, `libgcc_s_seh-1.dll` or `libwinpthread-1.dll` beside it.
-The archive is not code-signed.
+The Windows binary is built by MSYS2's UCRT64 MinGW-w64 GCC with `-static`, so
+it needs no `libstdc++-6.dll`, `libgcc_s_seh-1.dll` or `libwinpthread-1.dll`
+beside it. The archive is not code-signed.
 
 ## Version spelling per package format
 
