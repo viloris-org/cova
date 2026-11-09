@@ -69,10 +69,20 @@ bool safe_relative_entry(std::string_view entry) {
   return true;
 }
 
-Result<std::vector<std::string>> list_tar(const fs::Path& archive) {
+// GNU tar reads an archive operand such as `D:/tmp/x.tar.gz` as a remote host
+// specification and tries to connect to host `D`. Every tar invocation
+// therefore runs from the archive's directory with a bare file name.
+proc::ProcessSpec tar_spec(const fs::Path& archive) {
   proc::ProcessSpec spec;
   spec.program = "tar";
-  spec.args = {"-tf", fs::generic_string(archive)};
+  const fs::Path directory = archive.parent_path();
+  spec.cwd = directory.empty() ? fs::Path(".") : directory;
+  return spec;
+}
+
+Result<std::vector<std::string>> list_tar(const fs::Path& archive) {
+  auto spec = tar_spec(archive);
+  spec.args = {"-tf", fs::generic_string(archive.filename())};
   spec.timeout = std::chrono::milliseconds(60000);
   auto result = proc::run(spec);
   if (!result || !result->success()) {
@@ -95,9 +105,8 @@ Result<std::vector<std::string>> list_tar(const fs::Path& archive) {
 
   // Validate link targets before extraction. A symlink or hardlink whose target
   // escapes the root can be abused by a later entry written through it.
-  proc::ProcessSpec verbose;
-  verbose.program = "tar";
-  verbose.args = {"-tvf", fs::generic_string(archive)};
+  auto verbose = tar_spec(archive);
+  verbose.args = {"-tvf", fs::generic_string(archive.filename())};
   verbose.timeout = std::chrono::milliseconds(60000);
   auto details = proc::run(verbose);
   if (details && details->success()) {
@@ -147,9 +156,8 @@ Result<std::vector<std::string>> list_zip(const fs::Path& archive) {
 
   // Validate link targets before extraction. A symlink or hardlink whose target
   // escapes the root can be abused by a later entry written through it.
-  proc::ProcessSpec verbose;
-  verbose.program = "tar";
-  verbose.args = {"-tvf", fs::generic_string(archive)};
+  auto verbose = tar_spec(archive);
+  verbose.args = {"-tvf", fs::generic_string(archive.filename())};
   verbose.timeout = std::chrono::milliseconds(60000);
   auto details = proc::run(verbose);
   if (details && details->success()) {
@@ -174,10 +182,9 @@ Result<std::vector<std::string>> list_zip(const fs::Path& archive) {
 }
 
 Status extract_tar(const fs::Path& archive, const fs::Path& dest) {
-  proc::ProcessSpec spec;
-  spec.program = "tar";
+  auto spec = tar_spec(archive);
   spec.args = {"-xf",
-               fs::generic_string(archive),
+               fs::generic_string(archive.filename()),
                "-C",
                fs::generic_string(dest),
                "--no-same-owner",
