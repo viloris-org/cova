@@ -332,7 +332,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "the installed cova.exe does not run" }
 
           $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if (-not (($machinePath -split ';') -contains $installDir)) {
+          Write-Host "machine PATH after install: $machinePath"
+          $machineEntries = $machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }
+          if (-not ($machineEntries -contains $installDir.TrimEnd('\'))) {
             throw "the MSI did not append $installDir to the system PATH"
           }
 
@@ -343,7 +345,8 @@ jobs:
           }
           if (Test-Path $exe) { throw "the uninstall left cova.exe behind" }
           $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if (($machinePath -split ';') -contains $installDir) {
+          $machineEntries = $machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }
+          if ($machineEntries -contains $installDir.TrimEnd('\')) {
             throw "the uninstall left $installDir on the system PATH"
           }
 
