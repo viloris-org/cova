@@ -59,6 +59,7 @@ constexpr std::array kOptionSpecs = {
     OptionSpec{"example", true, false},
     OptionSpec{"dry-run", false, false},
     OptionSpec{"keep-going", false, false},
+    OptionSpec{"inherit-env", false, false},
     OptionSpec{"runner", true, false},
     OptionSpec{"filter", true, false},
     OptionSpec{"manifest-path", true, false},
@@ -689,6 +690,7 @@ std::string help_text(std::string_view topic) {
                        "  --target <triple>    Cross-compile for a target\n"
                        "  --dry-run            Plan without executing\n"
                        "  --keep-going         Continue after a failed action\n"
+                       "  --inherit-env        Inherit the whole parent environment (disables cache reuse)\n"
                        "  --json               Emit machine-readable output\n");
   }
   if (topic == "check") {

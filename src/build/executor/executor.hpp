@@ -21,6 +21,12 @@ struct ActionOutcome {
   std::string failure_message;
   int exit_code = 0;
   std::chrono::milliseconds duration{0};
+  // ExecutionSucceeded, then each output exists (ArtifactValidated), then the
+  // environment and input closure permit sharing (ShareEligible). Committed is
+  // set by the caller that publishes the artifact cache entry.
+  bool artifact_validated = false;
+  bool share_eligible = false;
+  bool committed = false;
 };
 
 struct BuildResult {

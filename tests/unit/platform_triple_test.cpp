@@ -85,6 +85,8 @@ COVA_TEST_NAMED(platform, abi_signature_identity_is_stable) {
   signature.crt = cova::platform::Crt::Glibc;
   signature.libcpp = cova::platform::LibCpp::LibStdCpp;
   signature.threads = cova::platform::ThreadModel::Posix;
+  signature.exceptions_state = cova::platform::AbiFactState::Known;
+  signature.rtti_state = cova::platform::AbiFactState::Known;
   COVA_CHECK(!signature.fingerprint_key().empty());
   auto copy = signature;
   COVA_CHECK_EQ(copy.fingerprint_key(), signature.fingerprint_key());

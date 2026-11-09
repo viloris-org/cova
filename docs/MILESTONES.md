@@ -92,6 +92,22 @@ Windows/MSVC, WASI, Android NDK, CMake adaptation, remote execution/ caching,
 C++ modules and registry publishing are not implemented. Their PRD sections are
 planning material, not current promises.
 
+## Build correctness baseline (delivered in part)
+
+The audit's P0 correctness work is tracked in [CORRECTNESS.md](CORRECTNESS.md).
+Delivered: explicit child environments with tracked/rejected/untracked policy,
+environment identity and cache qualification; versioned action and ABI
+identities; compiler argument classification and effective ABI; versioned probe
+cache with metadata validation; dependency-scan input closure with stale-depfile
+recovery and post-execution stability checks; atomic artifact publication with
+conflict detection and integrity verification.
+
+Not yet delivered: remote cache transport, layered/exported-interface ABI
+evidence, full compiler-subprogram identity, scan-result caching and snapshots,
+MSVC probing, a user-facing `[build.env]` configuration, and independent
+Windows/macOS runs of the full environment matrix. These are not claimed as
+complete.
+
 ## Verification commands
 
 ```bash

@@ -7,6 +7,7 @@
 #include <string>
 
 #include "core/filesystem/filesystem.hpp"
+#include "core/process/environment.hpp"
 #include "core/process/process.hpp"
 #include "testing/test.hpp"
 
@@ -141,6 +142,30 @@ COVA_TEST_NAMED(core, process_reports_a_missing_program) {
       {"--version"}, std::nullopt);
   COVA_CHECK(!result.has_value());
   COVA_CHECK_EQ(result.error().code, std::string("cova::proc::not_found"));
+}
+
+COVA_TEST_NAMED(core, process_explicit_environment_hides_parent_variables) {
+  const Shell shell = host_shell();
+  if (!shell.available) {
+    return;
+  }
+  cova::test::ScopedEnv leaked("COVA_PARENT_ONLY", "leaked-value");
+  cova::proc::EnvironmentRequest request;
+  request.additions.push_back(
+      cova::proc::EnvironmentVariable{"COVA_EXPLICIT_VISIBLE", "visible-value", true});
+  auto environment = COVA_REQUIRE_OK(cova::proc::collect_environment(request));
+  auto spec = shell_spec(shell,
+#ifdef _WIN32
+                         "echo %COVA_EXPLICIT_VISIBLE%:%COVA_PARENT_ONLY%"
+#else
+                         "printf '%s:%s' \"$COVA_EXPLICIT_VISIBLE\" \"$COVA_PARENT_ONLY\""
+#endif
+  );
+  spec.environment = environment.variables();
+  auto result = COVA_REQUIRE_OK(cova::proc::run(spec));
+  COVA_CHECK(result.success());
+  COVA_CHECK_MSG(contains(result.stdout_text, "visible-value"), result.stdout_text);
+  COVA_CHECK_MSG(!contains(result.stdout_text, "leaked-value"), result.stdout_text);
 }
 
 COVA_TEST_MAIN()

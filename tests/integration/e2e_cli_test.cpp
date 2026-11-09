@@ -460,6 +460,46 @@ COVA_TEST_NAMED(integration, incremental_build_rebuilds_nothing_when_unchanged) 
   }
 }
 
+COVA_TEST_NAMED(integration, changing_the_build_environment_invalidates_artifacts) {
+  COVA_SKIP_UNLESS_CXX_DRIVER();
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path root = stdfs::path(temp.path()) / "envapp";
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "envapp"}).ok());
+  }
+  const stdfs::path inc_one = stdfs::path(temp.path()) / "inc-one";
+  const stdfs::path inc_two = stdfs::path(temp.path()) / "inc-two";
+  stdfs::create_directories(inc_one);
+  stdfs::create_directories(inc_two);
+  write_text(inc_one / "value.hpp", "#pragma once\n#define COVA_ENV_VALUE \"one\"\n");
+  write_text(inc_two / "value.hpp", "#pragma once\n#define COVA_ENV_VALUE \"two\"\n");
+  write_text(root / "src" / "main.cpp",
+             "#include <value.hpp>\n#include <iostream>\n"
+             "int main() { std::cout << COVA_ENV_VALUE << \"\\n\"; return 0; }\n");
+  ScopedCwd cwd(root);
+
+  {
+    cova::test::ScopedEnv cpath("CPATH", inc_one.string());
+    auto first = run_cli({"run"});
+    COVA_CHECK_MSG(first.ok(), first.combined());
+    COVA_CHECK_MSG(contains(first.combined(), "one"), first.combined());
+  }
+  {
+    cova::test::ScopedEnv cpath("CPATH", inc_two.string());
+    auto second = run_cli({"run"});
+    COVA_CHECK_MSG(second.ok(), second.combined());
+    COVA_CHECK_MSG(contains(second.combined(), "two"), second.combined());
+  }
+  {
+    cova::test::ScopedEnv cpath("CPATH", inc_one.string());
+    auto restored = run_cli({"run"});
+    COVA_CHECK_MSG(restored.ok(), restored.combined());
+    COVA_CHECK_MSG(contains(restored.combined(), "one"), restored.combined());
+  }
+}
+
 COVA_TEST_NAMED(integration, clean_removes_artifacts_but_keeps_sources) {
   COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;

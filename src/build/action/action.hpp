@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/common.hpp"
+#include "core/process/environment.hpp"
 #include "platform/abi/abi.hpp"
 #include "platform/triple/triple.hpp"
 
@@ -21,6 +22,10 @@ namespace cova::build {
 
 namespace stdfs = std::filesystem;
 using Path = stdfs::path;
+
+// Version of the action identity schema. A bump deliberately invalidates every
+// cache entry produced by an older meaning of the identity.
+inline constexpr std::string_view kActionIdentitySchemaVersion = "cova.action-identity/2";
 
 enum class ActionKind {
   Compile,
@@ -43,10 +48,21 @@ enum class ExecPlatform {
 
 std::string_view to_string(ExecPlatform platform);
 
+// Where an input was learned from. Discovered inputs are the provider's input
+// closure; observed inputs were verified during/after execution.
+enum class InputOrigin {
+  Declared,
+  Discovered,
+  Observed,
+};
+
+std::string_view to_string(InputOrigin origin);
+
 // One input file with its role ("source", "header", "object", "library").
 struct FileInput {
   Path path;
   std::string role;
+  InputOrigin origin = InputOrigin::Declared;
 };
 
 // One output file. `primary` marks the artifact the action exists to produce.
@@ -67,7 +83,17 @@ struct ActionEnvironment {
   platform::AbiSignature abi;
   std::string toolchain_fingerprint;
   std::string sysroot_fingerprint;
+  // The exact child environment. When `explicit_environment` is true the
+  // executor passes only these variables; otherwise the child inherits the
+  // parent environment (legacy behaviour, not cache-safe).
   std::map<std::string, std::string, std::less<>> environment;
+  bool explicit_environment = false;
+  proc::EnvironmentIsolation isolation = proc::EnvironmentIsolation::TrackedEnvironment;
+  // Shared/remote cache qualification; computed from the environment policy and
+  // the action's input closure.
+  bool shared_cache_eligible = false;
+  // Local incremental reuse qualification.
+  bool incremental_eligible = true;
 };
 
 struct Action {
@@ -83,12 +109,23 @@ struct Action {
   std::vector<std::string> argv;
   Path working_dir;
   bool cacheable = true;
+  // False until the provider's discovered input closure is complete (for a
+  // compile action: its depfile parsed successfully). An incomplete closure
+  // must not be reused across executions.
+  bool input_closure_complete = false;
   // Set by the executor before the incremental check; not part of planning.
   mutable std::string computed_key;
+  // Content hashes captured by the last cache_key computation, used to detect
+  // inputs changed by another process between discovery and execution.
+  mutable std::vector<std::pair<std::string, std::string>> computed_input_hashes;
 
-  // Deterministic cache identity over action type, argv, input contents,
-  // toolchain, sysroot, target, ABI and relevant environment (PRD §9.3).
+  // Deterministic cache identity over the identity schema, action type, argv
+  // (including response-file contents), input contents, include directories,
+  // toolchain, sysroot, target, effective ABI and relevant environment.
   std::string cache_key(const ActionEnvironment& env) const;
+  // Re-hashes the inputs captured by the last cache_key call. Returns false and
+  // sets `detail` when an input changed or disappeared.
+  bool inputs_stable(std::string* detail = nullptr) const;
   std::string label_with_output() const;
 };
 

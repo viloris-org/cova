@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@
 #include "core/diagnostics/diagnostic.hpp"
 #include "core/filesystem/filesystem.hpp"
 #include "core/json/json.hpp"
+#include "core/process/environment.hpp"
 #include "core/process/process.hpp"
 #include "platform/binary/binary.hpp"
 
@@ -56,6 +58,149 @@ struct PreparedBuild {
   build::PlanResult plan;
   LockState lock_state;
 };
+
+// Builds the explicit child environment every action receives. The environment
+// is part of the action identity, and an untracked environment makes the whole
+// build ineligible for cross-execution reuse.
+Result<build::ActionEnvironment> make_action_environment(const PreparedBuild& prepared,
+                                                         CommandContext& ctx) {
+  build::ActionEnvironment environment;
+  environment.target = prepared.target;
+  environment.abi = prepared.toolchain.abi_signature;
+  environment.toolchain_fingerprint = prepared.toolchain.fingerprint;
+  environment.sysroot_fingerprint = prepared.toolchain.sysroot_fingerprint.empty()
+                                        ? prepared.toolchain.sysroot_id
+                                        : prepared.toolchain.sysroot_fingerprint;
+
+  proc::EnvironmentRequest request;
+  request.inherit_untracked = ctx.flags.boolean("inherit-env");
+  auto snapshot = proc::collect_environment(request);
+  if (!snapshot) {
+    return std::unexpected(std::move(snapshot.error()));
+  }
+  environment.environment = snapshot->as_map();
+  environment.explicit_environment = true;
+  environment.isolation = snapshot->isolation;
+  environment.shared_cache_eligible = snapshot->shared_cache_eligible;
+  environment.incremental_eligible = snapshot->incremental_eligible;
+  if (!environment.shared_cache_eligible && ctx.global.verbose) {
+    ctx.ui->verbose(std::string("environment is ") + std::string(proc::to_string(environment.isolation)) +
+                    "; shared artifact reuse is disabled");
+  }
+  return environment;
+}
+
+// Asks the compiler for the translation unit's dependency closure before the
+// action runs. This is the provider-side discovery step: it catches a stale
+// depfile, a newly added higher-priority header, and a conditional include that
+// the previous depfile could not know about. The resulting header set is part
+// of the final action identity.
+Result<bool> refresh_compile_closure(const build::Action& action,
+                                     const build::ActionEnvironment& environment,
+                                     std::string& detail) {
+  if (action.kind != build::ActionKind::Compile || action.argv.empty()) {
+    return true;
+  }
+  auto scratch = fs::make_temp_dir(std::filesystem::temp_directory_path(), "cova-scan-");
+  if (!scratch) {
+    return fail<bool>(scratch.error());
+  }
+  const auto depfile = *scratch / "dependencies.d";
+  std::vector<std::string> argv;
+  argv.push_back(action.argv.front());
+  for (std::size_t index = 1; index < action.argv.size(); ++index) {
+    const std::string& argument = action.argv[index];
+    if (argument == "-MMD" || argument == "-MD" || argument == "-c") {
+      continue;
+    }
+    if (argument == "-MF" || argument == "-o") {
+      if (index + 1 < action.argv.size()) {
+        ++index;
+      }
+      continue;
+    }
+    if (argument.rfind("-MF", 0) == 0) {
+      continue;
+    }
+    argv.push_back(argument);
+  }
+  argv.push_back("-MM");
+  argv.push_back("-MF");
+  argv.push_back(fs::generic_string(depfile));
+
+  proc::ProcessSpec spec;
+  spec.program = argv.front();
+  spec.args.assign(argv.begin() + 1, argv.end());
+  spec.cwd = action.working_dir;
+  if (environment.explicit_environment) {
+    std::vector<std::pair<std::string, std::string>> variables;
+    variables.reserve(environment.environment.size());
+    for (const auto& [name, value] : environment.environment) {
+      variables.emplace_back(name, value);
+    }
+    spec.environment = std::move(variables);
+  }
+  auto result = proc::run(spec);
+  if (!result || !result->success()) {
+    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    (void)cleanup;
+    auto& mutable_action = const_cast<build::Action&>(action);
+    mutable_action.input_closure_complete = false;
+    Error error = Error::make("cova::build::dependency_scan",
+                              "the compiler could not scan the input closure");
+    if (result && !result->stderr_text.empty()) {
+      error.with(str::trim(result->stderr_text));
+    } else if (!result) {
+      error.with(result.error().message);
+    }
+    return fail<bool>(std::move(error));
+  }
+  auto parsed = build::Depfile::load(depfile, action.working_dir);
+  auto cleanup = fs::remove_tree(*scratch, *scratch);
+  (void)cleanup;
+  if (!parsed) {
+    auto& mutable_action = const_cast<build::Action&>(action);
+    mutable_action.input_closure_complete = false;
+    return fail<bool>(Error::make("cova::build::dependency_scan",
+                                  "the compiler did not produce a readable dependency file"));
+  }
+  auto& mutable_action = const_cast<build::Action&>(action);
+  // The scan is the authority on the discovered closure. Drop headers learned
+  // from an older depfile (including another target's configuration) so stale
+  // discoveries cannot accumulate in the identity.
+  mutable_action.inputs.erase(
+      std::remove_if(mutable_action.inputs.begin(), mutable_action.inputs.end(),
+                     [](const build::FileInput& input) {
+                       return input.origin != build::InputOrigin::Declared;
+                     }),
+      mutable_action.inputs.end());
+  std::set<std::string> known;
+  for (const auto& input : mutable_action.inputs) {
+    known.insert(fs::generic_string(fs::canonical_for_compare(input.path)));
+  }
+  for (const auto& dependency : parsed->dependencies) {
+    if (!fs::is_regular_file(dependency)) {
+      continue;
+    }
+    const std::string key = fs::generic_string(fs::canonical_for_compare(dependency));
+    if (known.insert(key).second) {
+      mutable_action.inputs.push_back(
+          build::FileInput{dependency, "header", build::InputOrigin::Discovered});
+    }
+  }
+  mutable_action.input_closure_complete = true;
+  // Publish the fresh closure at the provider's canonical depfile path. The
+  // next planning pass reads it before deciding whether anything is stale.
+  if (!mutable_action.outputs.empty()) {
+    fs::Path canonical_depfile = mutable_action.outputs.front().path;
+    canonical_depfile += ".d";
+    auto copied = fs::copy_file(depfile, canonical_depfile, true);
+    (void)copied;
+  }
+  mutable_action.cache_key(environment);
+  detail = "input closure refreshed by a compiler dependency scan";
+  return true;
+}
 
 // Runs the shared preparation pipeline. Returns nullopt when a diagnostic has
 // already been printed and the caller should just fail.
@@ -249,13 +394,11 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     local_state = std::move(*state);
   }
 
-  build::ActionEnvironment env;
-  env.target = prepared.target;
-  env.abi = prepared.toolchain.abi_signature;
-  env.toolchain_fingerprint = prepared.toolchain.fingerprint;
-  env.sysroot_fingerprint = prepared.toolchain.sysroot_fingerprint.empty()
-                                ? prepared.toolchain.sysroot_id
-                                : prepared.toolchain.sysroot_fingerprint;
+  auto environment = make_action_environment(prepared, ctx);
+  if (!environment) {
+    return report_error(environment.error(), ctx);
+  }
+  build::ActionEnvironment env = std::move(*environment);
 
   build::ExecuteOptions options;
   options.max_parallel = config->resolved_jobs();
@@ -271,19 +414,55 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
   const auto started = Clock::now();
   std::size_t restored = 0;
 
+  auto try_cache_restore = [&](const build::Action& action) -> bool {
+    // Sharing requires a hermetic environment and a complete input closure.
+    if (!cache.enabled || !action.cacheable || !env.shared_cache_eligible ||
+        !action.input_closure_complete) {
+      return false;
+    }
+    const std::string key = action.cache_key(env);
+    auto restored_ok = build::cache_restore(cache, action, key);
+    if (restored_ok && *restored_ok) {
+      ++restored;
+      return true;
+    }
+    return false;
+  };
   auto is_up_to_date = [&](const build::Action& action, std::string& reason) -> bool {
     // 1. The shared cache can restore every output without running anything.
-    if (cache.enabled && action.cacheable) {
-      const std::string key = action.cache_key(env);
-      auto restored_ok = build::cache_restore(cache, action, key);
-      if (restored_ok && *restored_ok) {
-        ++restored;
-        reason = "restored from cache";
-        return true;
+    if (try_cache_restore(action)) {
+      reason = "restored from cache";
+      return true;
+    }
+    // 2. The local incremental record says the outputs are current. An
+    //    untracked environment may not be reused across executions at all.
+    if (env.incremental_eligible && local_state.is_up_to_date(action, reason)) {
+      return true;
+    }
+    // 3. Both checks missed. Before running the action, ask the provider for
+    //    the real input closure, so a stale depfile or a newly included header
+    //    cannot be missed. The refreshed inputs produce the final identity.
+    if (action.kind == build::ActionKind::Compile && !dry_run) {
+      std::string detail;
+      auto refreshed = refresh_compile_closure(action, env, detail);
+      if (!refreshed) {
+        reason = "dependency discovery failed: " + refreshed.error().message;
+        return false;
+      }
+      if (*refreshed) {
+        if (try_cache_restore(action)) {
+          reason = "restored from cache after dependency discovery";
+          return true;
+        }
+        if (env.incremental_eligible && local_state.is_up_to_date(action, reason)) {
+          return true;
+        }
       }
     }
-    // 2. The local incremental record says the outputs are current.
-    return local_state.is_up_to_date(action, reason);
+    if (!env.incremental_eligible) {
+      reason = "environment is untracked";
+    }
+    return false;
   };
 
   if (dry_run) {
@@ -343,10 +522,11 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
 
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
 
-  // Persist incremental state for every action whose outputs are current,
-  // including ones skipped by this run. Successful compiles additionally record
-  // the headers discovered through their depfile so the next build can detect a
-  // header change without recompiling once just to learn the dependencies.
+  // Build the final records first; nothing is published until the whole build
+  // and its artifact validation succeed. Successful compiles additionally add
+  // the headers discovered through their depfile, so both the incremental
+  // record and the cache entry cover the real input closure.
+  std::vector<std::pair<build::Action, std::string>> publications;
   for (const auto& outcome : result->outcomes) {
     if (!outcome.succeeded) {
       continue;
@@ -356,6 +536,14 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
       continue;
     }
     build::Action key_action = *action;
+    bool closure_verified = true;
+    std::string stability_detail;
+    if (!action->inputs_stable(&stability_detail)) {
+      closure_verified = false;
+      if (ctx.global.verbose) {
+        ctx.ui->verbose(action->label + ": " + stability_detail);
+      }
+    }
     build::ActionRecord record;
     auto add_input = [&](const fs::Path& input) {
       const std::string path = fs::generic_string(input);
@@ -377,29 +565,45 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     for (const auto& input : action->inputs) {
       add_input(input.path);
     }
-    if (action->kind == build::ActionKind::Compile && !action->outputs.empty()) {
+    if (action->kind == build::ActionKind::Compile && !action->outputs.empty() &&
+        !outcome.skipped) {
       fs::Path depfile = action->outputs.front().path;
       depfile += ".d";
       auto parsed = build::Depfile::load(depfile, prepared.project.layout.root);
-      if (parsed) {
-        for (const auto& header : parsed->dependencies) {
-          if (!fs::is_regular_file(header)) {
-            continue;
-          }
-          add_input(header);
-          bool already_an_input = false;
-          for (const auto& input : key_action.inputs) {
-            if (fs::canonical_for_compare(input.path) ==
-                fs::canonical_for_compare(header)) {
-              already_an_input = true;
-              break;
-            }
-          }
-          if (!already_an_input) {
-            key_action.inputs.push_back(build::FileInput{header, "header"});
+      if (!parsed) {
+        // Without a depfile we cannot prove the input closure; the action may
+        // run again next time, but it must not be reused or published.
+        continue;
+      }
+      for (const auto& header : parsed->dependencies) {
+        if (!fs::is_regular_file(header)) {
+          continue;
+        }
+        add_input(header);
+        bool already_an_input = false;
+        for (const auto& input : key_action.inputs) {
+          if (fs::canonical_for_compare(input.path) ==
+              fs::canonical_for_compare(header)) {
+            already_an_input = true;
+            break;
           }
         }
+        if (!already_an_input) {
+          // A header the pre-execution scan did not see means the closure is
+          // not proven for this execution. The output may satisfy the user,
+          // but it must not become a reusable cache or incremental record.
+          closure_verified = false;
+          key_action.inputs.push_back(
+              build::FileInput{header, "header", build::InputOrigin::Observed});
+        }
       }
+      key_action.input_closure_complete = closure_verified;
+    }
+    if (!closure_verified) {
+      if (ctx.global.verbose) {
+        ctx.ui->verbose(action->label + ": input closure was not verified; not publishing");
+      }
+      continue;
     }
     record.cache_key = key_action.cache_key(env);
     record.toolchain_fingerprint = env.toolchain_fingerprint;
@@ -409,13 +613,11 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
             .count());
     record.duration_ms = static_cast<std::uint32_t>(outcome.duration.count());
     record.succeeded = true;
-    local_state.record(std::move(record));
-  }
-  if (local_state.size() > 0) {
-    auto save = local_state.save(state_file);
-    if (!save) {
-      ctx.ui->verbose("could not persist build state: " + save.error().message);
+    if (!outcome.skipped && env.shared_cache_eligible && action->cacheable &&
+        key_action.input_closure_complete) {
+      publications.emplace_back(std::move(key_action), record.cache_key);
     }
+    local_state.record(std::move(record));
   }
 
   if (!result->succeeded) {
@@ -435,6 +637,28 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
   auto verified = verify_artifacts(prepared, ctx);
   if (!verified) {
     return report_error(verified.error(), ctx);
+  }
+
+  // Publish only after execution succeeded, every output exists, and the
+  // artifact-level verification passed. A failed or partial build leaves no
+  // cache entry and no incremental record that a later build could trust.
+  for (auto& [action, key] : publications) {
+    auto stored = build::cache_store(cache, action, key);
+    if (!stored) {
+      if (stored.error().code == "cova::build::cache_nondeterminism") {
+        ctx.ui->warn("cache entry for `" + action.label +
+                     "` was not replaced: the same identity produced different artifacts");
+      } else if (ctx.global.verbose) {
+        ctx.ui->verbose("could not publish cache entry for " + action.label + ": " +
+                        stored.error().message);
+      }
+    }
+  }
+  if (local_state.size() > 0) {
+    auto save = local_state.save(state_file);
+    if (!save) {
+      ctx.ui->verbose("could not persist build state: " + save.error().message);
+    }
   }
 
   if (ctx.global.json) {
@@ -581,13 +805,11 @@ int cmd_check(CommandContext& ctx) {
   if (!config) {
     return report_error(config.error(), ctx);
   }
-  build::ActionEnvironment env;
-  env.target = prepared.target;
-  env.abi = prepared.toolchain.abi_signature;
-  env.toolchain_fingerprint = prepared.toolchain.fingerprint;
-  env.sysroot_fingerprint = prepared.toolchain.sysroot_fingerprint.empty()
-                                ? prepared.toolchain.sysroot_id
-                                : prepared.toolchain.sysroot_fingerprint;
+  auto environment = make_action_environment(prepared, ctx);
+  if (!environment) {
+    return report_error(environment.error(), ctx);
+  }
+  build::ActionEnvironment env = std::move(*environment);
 
   auto state = build::BuildState::load(prepared.project.layout.target_dir /
                                        target_dir_component(prepared.target) / ".cova" /
@@ -629,6 +851,10 @@ int cmd_check(CommandContext& ctx) {
           // Skip everything that is not a compile step.
           reason = "check does not link";
           return true;
+        }
+        if (!env.incremental_eligible) {
+          reason = "environment is untracked";
+          return false;
         }
         return local_state.is_up_to_date(action, reason);
       });

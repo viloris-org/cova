@@ -8,6 +8,7 @@
 #include "platform/triple/triple.hpp"
 #include "testing/test.hpp"
 #include "toolchain/discovery/discovery.hpp"
+#include "toolchain/probe/probe.hpp"
 #include "toolchain/resolver/resolver.hpp"
 
 namespace {
@@ -287,6 +288,75 @@ COVA_TEST_NAMED(toolchain, offline_cross_without_sysroot_names_the_restriction) 
   if (!report.rejected.empty()) {
     COVA_CHECK(report.rejected.front().reason ==
                cova::platform::RejectionReason::OfflineRestriction);
+  }
+}
+
+COVA_TEST_NAMED(toolchain, probe_cache_is_versioned_and_rejects_mismatch) {
+  cova::test::TempDir temp;
+  const auto cache = std::filesystem::path(temp.path()) / "cache";
+  cova::toolchain::ProbeOptions options;
+  options.target = cova::platform::host_triple();
+  options.environment_identity = "env-one";
+  options.required = {"cpp", "link"};
+
+  cova::toolchain::ToolchainDescriptor descriptor;
+  descriptor.id = "dummy-gcc";
+  descriptor.family = "gcc";
+  descriptor.version = cova::Version{1, 2, 3};
+  descriptor.content_hash = "content-hash";
+
+  cova::toolchain::ProbeReport report;
+  report.capabilities.cpp_compilation = true;
+  report.abi_facts["_GLIBCXX_USE_CXX11_ABI"] = "1";
+  report.notes.push_back("a probe note");
+  COVA_CHECK(cova::toolchain::store_cached_probe(cache, descriptor, options, report, "variant")
+                 .has_value());
+
+  auto loaded = COVA_REQUIRE_OK(
+      cova::toolchain::load_cached_probe(cache, descriptor, options, "variant"));
+  COVA_CHECK(loaded.capabilities.cpp_compilation);
+  COVA_CHECK_EQ(loaded.abi_facts.at("_GLIBCXX_USE_CXX11_ABI"), std::string("1"));
+  COVA_CHECK_EQ(loaded.notes.size(), std::size_t{1});
+
+  // A different effective environment is a different probe identity.
+  options.environment_identity = "env-two";
+  auto changed = cova::toolchain::load_cached_probe(cache, descriptor, options, "variant");
+  COVA_CHECK(!changed.has_value());
+  COVA_CHECK_EQ(changed.error().code, std::string("cova::toolchain::probe_cache_miss"));
+
+  // An older schema on disk is a miss, never silently compatible.
+  options.environment_identity = "env-one";
+  for (const auto& entry : std::filesystem::directory_iterator(cache / "probes")) {
+    auto text = COVA_REQUIRE_OK(cova::fs::read_file(entry.path()));
+    text = cova::str::replace_all(text, "cova.probe/2", "cova.probe/1");
+    COVA_CHECK(cova::fs::write_file(entry.path(), text).has_value());
+    break;
+  }
+  auto old_schema = cova::toolchain::load_cached_probe(cache, descriptor, options, "variant");
+  COVA_CHECK(!old_schema.has_value());
+  COVA_CHECK_EQ(old_schema.error().code, std::string("cova::toolchain::probe_cache_miss"));
+}
+
+COVA_TEST_NAMED(toolchain, abi_probe_extracts_core_macros) {
+  auto discovered = COVA_REQUIRE_OK(cova::toolchain::discover({}));
+  if (discovered.empty()) {
+    return;
+  }
+  cova::toolchain::ProbeOptions options;
+  options.target = cova::platform::host_triple();
+  const auto& descriptor = discovered.front();
+  auto facts = cova::toolchain::probe_abi_facts(descriptor, options);
+  if (!facts) {
+    // A compiler that cannot dump macros leaves facts Unknown; that is a
+    // supported state, not a test failure on exotic hosts.
+    return;
+  }
+  const bool gcc_or_clang = descriptor.family.find("gcc") != std::string::npos ||
+                            descriptor.family.find("clang") != std::string::npos;
+  if (gcc_or_clang) {
+    COVA_CHECK_MSG(facts->count("__EXCEPTIONS") == 1, "__EXCEPTIONS was not observed");
+    COVA_CHECK_MSG(facts->count("__SIZEOF_POINTER__") == 1,
+                   "__SIZEOF_POINTER__ was not observed");
   }
 }
 
