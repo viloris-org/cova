@@ -10,17 +10,13 @@
 
 namespace {
 
-std::string quote_shell(std::string_view value) {
-  std::string out = "'";
-  for (char c : value) {
-    if (c == '\'') {
-      out += "'\\''";
-    } else {
-      out.push_back(c);
-    }
-  }
-  out.push_back('\'');
-  return out;
+// GNU tar reads an absolute Windows path such as `D:/...` as a remote host, so
+// the fixture runs from the temp root with relative paths instead.
+cova::Result<cova::proc::ProcessResult> create_test_archive(const std::filesystem::path& base) {
+  return cova::proc::run(
+      "tar",
+      {"-czf", "registry/archives/test-musl.tar.gz", "-C", "stage", "aarch64-linux-musl"},
+      base);
 }
 
 } // namespace
@@ -112,9 +108,7 @@ COVA_TEST_NAMED(sysroot, registry_installs_verified_archive) {
   const auto registry = base / "registry";
   const auto archive = registry / "archives" / "test-musl.tar.gz";
   COVA_CHECK(cova::fs::create_directories(archive.parent_path()).has_value());
-  auto tar = cova::proc::run_line(
-      "tar -czf " + quote_shell(cova::fs::generic_string(archive)) + " -C " +
-      quote_shell(cova::fs::generic_string(base / "stage")) + " aarch64-linux-musl");
+  auto tar = create_test_archive(base);
   COVA_CHECK_MSG(tar.has_value() && tar->success(),
                  "could not create the test archive: " +
                      (tar ? tar->stderr_trimmed() : std::string("tar did not start")));
