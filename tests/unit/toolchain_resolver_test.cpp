@@ -383,11 +383,12 @@ COVA_TEST_NAMED(toolchain, descriptor_fingerprint_covers_compiler_subprograms) {
     COVA_CHECK_MSG(!component->sha256.empty(), std::string(role));
     COVA_CHECK_MSG(!component->path.empty(), std::string(role));
   }
-  const bool gcc_or_clang = descriptor.family.find("gcc") != std::string::npos ||
-                            descriptor.family.find("clang") != std::string::npos;
-  if (gcc_or_clang) {
+  // Clang's frontend runs in-process, so a Clang descriptor legitimately has
+  // no separate cc1/cc1plus/collect2 binaries to hash; the driver binary is
+  // already part of the fingerprint. GCC always has those subprograms.
+  if (descriptor.family.find("gcc") != std::string::npos) {
     COVA_CHECK_MSG(found_subprogram,
-                   "the GCC/Clang descriptor recorded no compiler subprogram");
+                   "the GCC descriptor recorded no compiler subprogram");
   }
 }
 

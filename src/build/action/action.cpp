@@ -56,6 +56,9 @@ void add_auxiliary_file_identity(ResponseContext& context, const Path& file,
 // GCC's response-file reader splits on whitespace, strips single/double quotes
 // and honours backslash escapes in and outside quotes. Using the generic
 // command-line splitter here would mis-resolve a nested `@spaced\ file.rsp`.
+// A backslash only escapes whitespace, a quote or another backslash: treating
+// every backslash as an escape would turn the Windows path `C:\dir\nested.rsp`
+// into `C:dirnested.rsp` and lose the nested file's identity.
 std::vector<std::string> split_response_tokens(std::string_view text) {
   std::vector<std::string> tokens;
   std::string current;
@@ -74,7 +77,8 @@ std::vector<std::string> split_response_tokens(std::string_view text) {
       continue;
     }
     if (in_double) {
-      if (character == '\\' && index + 1 < text.size()) {
+      if (character == '\\' && index + 1 < text.size() &&
+          (text[index + 1] == '"' || text[index + 1] == '\\')) {
         current.push_back(text[++index]);
         has_token = true;
       } else if (character == '"') {
@@ -86,9 +90,14 @@ std::vector<std::string> split_response_tokens(std::string_view text) {
       continue;
     }
     if (character == '\\' && index + 1 < text.size()) {
-      current.push_back(text[++index]);
-      has_token = true;
-      continue;
+      const char next = text[index + 1];
+      if (std::isspace(static_cast<unsigned char>(next)) != 0 || next == '\'' ||
+          next == '"' || next == '\\') {
+        current.push_back(next);
+        ++index;
+        has_token = true;
+        continue;
+      }
     }
     if (character == '\'') {
       in_single = true;

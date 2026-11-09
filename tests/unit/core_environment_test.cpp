@@ -3,6 +3,7 @@
 #include <map>
 #include <string>
 
+#include "core/common.hpp"
 #include "core/process/environment.hpp"
 #include "testing/test.hpp"
 
@@ -130,9 +131,16 @@ COVA_TEST_NAMED(core, environment_removals_are_never_forwarded) {
 COVA_TEST_NAMED(core, process_environment_reads_the_host) {
   const auto environment = cova::proc::process_environment();
   COVA_CHECK(!environment.empty());
+  // Windows environment names are case-insensitive, so the Windows reader
+  // orders them case-insensitively; the POSIX reader keeps the exact order.
   const bool sorted = std::is_sorted(environment.begin(), environment.end(),
                                      [](const auto& left, const auto& right) {
+#ifdef _WIN32
+                                       return cova::str::to_lower(left.first) <
+                                              cova::str::to_lower(right.first);
+#else
                                        return left.first < right.first;
+#endif
                                      });
   COVA_CHECK(sorted);
 }
