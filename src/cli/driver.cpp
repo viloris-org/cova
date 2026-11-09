@@ -8,8 +8,6 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 #include "cli/cli.hpp"
 #include "cli/common.hpp"
 #include "core/filesystem/filesystem.hpp"
@@ -99,13 +97,13 @@ int run(int argc, char** argv, std::ostream& out_stream, std::ostream& err_strea
     return 0;
   }
 
-  const bool tty_out = ::isatty(STDOUT_FILENO) != 0;
+  const bool tty_out = stdout_is_tty();
   const bool color = parsed.invocation.global.use_color(tty_out);
   const bool verbose = parsed.invocation.global.verbose;
   const bool quiet = parsed.invocation.global.quiet;
 
   StreamUi ui(out_stream, err_stream, color, verbose, quiet);
-  ui.set_interactive(::isatty(STDIN_FILENO) != 0);
+  ui.set_interactive(stdin_is_tty());
   ui.set_progress_live(stderr_is_tty());
 
   CommandContext ctx = make_context(std::move(parsed.invocation), ui);

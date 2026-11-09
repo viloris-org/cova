@@ -80,7 +80,13 @@ only a C++ compiler, Ninja and Python (Stage 0). A `cova.toml` at the repository
 root allows the built binary to build the project itself (Stage 1); the bootstrap
 script remains the authoritative clean-room path.
 
-## Milestone 5 — Ecosystem expansion (not started)
+## Milestone 5 — Ecosystem expansion (Windows GNU host delivered)
+
+Native Windows x86_64 builds with MinGW-w64 GCC work: `src/core/process/process.cpp`
+executes children through `CreateProcessW` with pipes, a job object for timeouts,
+UTF-8/UTF-16 command lines and an inherited environment, and
+`scripts/devbuild.py` emits Windows-safe Ninja rules. Windows binaries are
+published as a `.zip`.
 
 Windows/MSVC, WASI, Android NDK, CMake adaptation, remote execution/ caching,
 C++ modules and registry publishing are not implemented. Their PRD sections are

@@ -3,9 +3,8 @@
 // POSIX: fork/execvp with pipes. No shell is ever involved, so argv entries are
 // passed literally and never re-split (PRD §7.6, §9.4).
 //
-// Windows ships a stub that returns honest "unsupported" errors; Cova's Milestone
-// targets are Linux/macOS hosts, and pretending to run a process there would be
-// worse than failing loudly.
+// Windows uses CreateProcessW with anonymous pipes; see the backend below. Both
+// backends share ProcessSpec/ProcessResult, so callers never branch on the host.
 #include "core/process/process.hpp"
 
 #include <algorithm>
@@ -23,19 +22,638 @@
 
 #ifdef _WIN32
 
+// Windows uses CreateProcessW with anonymous pipes. Arguments are encoded with
+// the quoting rules the MSVC runtime and CommandLineToArgvW understand, so an
+// argument is never re-split by a shell (PRD §7.6, §9.4). The child is placed in
+// a job object, so a timeout terminates the whole process tree, matching the
+// POSIX process-group behaviour.
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
+#include <windows.h>
+
+#include <thread>
+
 namespace cova::proc {
+namespace {
+
+constexpr std::chrono::milliseconds kPollSlice{20};
+
+// Owns a Win32 handle and closes it on scope exit.
+class WinHandle {
+ public:
+  WinHandle() = default;
+  explicit WinHandle(HANDLE handle) : handle_(handle) {}
+  ~WinHandle() { reset(); }
+
+  WinHandle(const WinHandle&) = delete;
+  WinHandle& operator=(const WinHandle&) = delete;
+
+  WinHandle(WinHandle&& other) noexcept : handle_(other.release()) {}
+  WinHandle& operator=(WinHandle&& other) noexcept {
+    if (this != &other) {
+      reset(other.release());
+    }
+    return *this;
+  }
+
+  HANDLE get() const { return handle_; }
+  bool valid() const { return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE; }
+  HANDLE release() {
+    const HANDLE value = handle_;
+    handle_ = INVALID_HANDLE_VALUE;
+    return value;
+  }
+  void reset(HANDLE value = INVALID_HANDLE_VALUE) {
+    if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
+      ::CloseHandle(handle_);
+    }
+    handle_ = value;
+  }
+
+ private:
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+
+std::wstring widen(std::string_view text) {
+  if (text.empty()) {
+    return {};
+  }
+  const int length = ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                           static_cast<int>(text.size()), nullptr, 0);
+  if (length <= 0) {
+    return {};
+  }
+  std::wstring out(static_cast<std::size_t>(length), L'\0');
+  ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(),
+                        length);
+  return out;
+}
+
+std::string narrow(std::wstring_view text) {
+  if (text.empty()) {
+    return {};
+  }
+  const int length = ::WideCharToMultiByte(CP_UTF8, 0, text.data(),
+                                           static_cast<int>(text.size()), nullptr, 0, nullptr,
+                                           nullptr);
+  if (length <= 0) {
+    return {};
+  }
+  std::string out(static_cast<std::size_t>(length), '\0');
+  ::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(),
+                        length, nullptr, nullptr);
+  return out;
+}
+
+std::string windows_error(DWORD code) {
+  std::wstring message;
+  wchar_t* buffer = nullptr;
+  const DWORD length = ::FormatMessageW(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+          FORMAT_MESSAGE_IGNORE_INSERTS,
+      nullptr, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      reinterpret_cast<wchar_t*>(&buffer), 0, nullptr);
+  if (length > 0 && buffer != nullptr) {
+    message.assign(buffer, length);
+    ::LocalFree(buffer);
+  }
+  const std::string text = str::trim(narrow(message));
+  if (text.empty()) {
+    return std::to_string(code);
+  }
+  return std::to_string(code) + " (" + text + ")";
+}
+
+bool same_name(std::wstring_view left, std::wstring_view right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (std::size_t index = 0; index < left.size(); ++index) {
+    wchar_t a = left[index];
+    wchar_t b = right[index];
+    if (a >= L'A' && a <= L'Z') {
+      a = static_cast<wchar_t>(a - L'A' + L'a');
+    }
+    if (b >= L'A' && b <= L'Z') {
+      b = static_cast<wchar_t>(b - L'A' + L'a');
+    }
+    if (a != b) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Quotes one argument for a CreateProcessW command line. This is the inverse of
+// the MSVC runtime / CommandLineToArgvW rules: backslashes are only special
+// before a quote, and a quote is escaped with a backslash.
+std::wstring quote_argument(std::wstring_view argument) {
+  if (!argument.empty() && argument.find_first_of(L" \t\n\v\"") == std::wstring_view::npos) {
+    return std::wstring(argument);
+  }
+  std::wstring out;
+  out.push_back(L'"');
+  std::size_t backslashes = 0;
+  for (const wchar_t character : argument) {
+    if (character == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (character == L'"') {
+      out.append(backslashes * 2 + 1, L'\\');
+      out.push_back(L'"');
+      backslashes = 0;
+      continue;
+    }
+    out.append(backslashes, L'\\');
+    backslashes = 0;
+    out.push_back(character);
+  }
+  out.append(backslashes * 2, L'\\');
+  out.push_back(L'"');
+  return out;
+}
+
+std::wstring build_command_line(const Path& program, const std::vector<std::string>& args) {
+  std::wstring line = quote_argument(program.native());
+  for (const std::string& argument : args) {
+    line.push_back(L' ');
+    line += quote_argument(widen(argument));
+  }
+  return line;
+}
+
+// Returns the parent environment as name/value pairs. Entries beginning with
+// '=' (per-drive current directories) are preserved.
+std::vector<std::pair<std::wstring, std::wstring>> current_environment() {
+  std::vector<std::pair<std::wstring, std::wstring>> entries;
+  wchar_t* block = ::GetEnvironmentStringsW();
+  if (block == nullptr) {
+    return entries;
+  }
+  const wchar_t* cursor = block;
+  while (*cursor != L'\0') {
+    const std::wstring entry(cursor);
+    cursor += entry.size() + 1;
+    std::size_t equals = entry.find(L'=');
+    if (equals == 0) {
+      equals = entry.find(L'=', 1);
+    }
+    if (equals == std::wstring::npos) {
+      continue;
+    }
+    entries.emplace_back(entry.substr(0, equals), entry.substr(equals + 1));
+  }
+  ::FreeEnvironmentStringsW(block);
+  return entries;
+}
+
+// Builds a sorted, double-NUL-terminated UTF-16 environment block.
+std::wstring build_environment(const ProcessSpec& spec) {
+  std::vector<std::pair<std::wstring, std::wstring>> entries = current_environment();
+
+  for (const std::string& removed : spec.env_remove) {
+    const std::wstring name = widen(removed);
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                 [&name](const auto& entry) {
+                                   return same_name(entry.first, name);
+                                 }),
+                  entries.end());
+  }
+  for (const auto& [name_text, value_text] : spec.env_overrides) {
+    const std::wstring name = widen(name_text);
+    const std::wstring value = widen(value_text);
+    auto found = std::find_if(entries.begin(), entries.end(), [&name](const auto& entry) {
+      return same_name(entry.first, name);
+    });
+    if (found == entries.end()) {
+      entries.emplace_back(name, value);
+    } else {
+      found->second = value;
+    }
+  }
+
+  std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+    return str::to_lower(narrow(left.first)) < str::to_lower(narrow(right.first));
+  });
+
+  std::wstring block;
+  for (const auto& [name, value] : entries) {
+    block += name;
+    block.push_back(L'=');
+    block += value;
+    block.push_back(L'\0');
+  }
+  block.push_back(L'\0');
+  return block;
+}
+
+HANDLE duplicate_inheritable(DWORD which) {
+  const HANDLE source = ::GetStdHandle(which);
+  if (source == nullptr || source == INVALID_HANDLE_VALUE) {
+    return INVALID_HANDLE_VALUE;
+  }
+  HANDLE copy = INVALID_HANDLE_VALUE;
+  if (!::DuplicateHandle(::GetCurrentProcess(), source, ::GetCurrentProcess(), &copy, 0, TRUE,
+                         DUPLICATE_SAME_ACCESS)) {
+    return INVALID_HANDLE_VALUE;
+  }
+  return copy;
+}
+
+HANDLE open_null(DWORD access) {
+  SECURITY_ATTRIBUTES attributes{};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = TRUE;
+  return ::CreateFileW(L"NUL", access, FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes,
+                       OPEN_EXISTING, 0, nullptr);
+}
+
+// Prepares the child's end of a standard stream that must be inherited. Falls
+// back to the NUL device when the parent has no usable handle.
+HANDLE inherited_std_handle(DWORD which, DWORD fallback_access, bool& owned) {
+  const HANDLE copy = duplicate_inheritable(which);
+  if (copy != INVALID_HANDLE_VALUE) {
+    owned = true;
+    return copy;
+  }
+  const HANDLE original = ::GetStdHandle(which);
+  if (original != nullptr && original != INVALID_HANDLE_VALUE) {
+    // Console handles are inherited without duplication; do not close this.
+    owned = false;
+    return original;
+  }
+  const HANDLE null_handle = open_null(fallback_access);
+  owned = null_handle != INVALID_HANDLE_VALUE;
+  return null_handle;
+}
+
+Result<Path> resolve_program(const Path& program) {
+  if (program.empty()) {
+    return std::unexpected(Error::make("cova::proc::invalid", "empty program path"));
+  }
+  const std::optional<Path> found = fs::find_in_path(program.string());
+  if (!found) {
+    if (program.has_parent_path()) {
+      return std::unexpected(Error::make("cova::proc::not_found", "program does not exist")
+                                 .with("program: " + program.string()));
+    }
+    return std::unexpected(Error::make("cova::proc::not_found", "program not found on PATH")
+                               .with("program: " + program.string()));
+  }
+  return *found;
+}
+
+void drain_pipe(HANDLE pipe, std::string& sink) {
+  std::array<char, 65536> buffer{};
+  for (;;) {
+    DWORD available = 0;
+    if (!::PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr) || available == 0) {
+      return;
+    }
+    const DWORD wanted = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
+    DWORD read = 0;
+    if (!::ReadFile(pipe, buffer.data(), wanted, &read, nullptr) || read == 0) {
+      return;
+    }
+    sink.append(buffer.data(), static_cast<std::size_t>(read));
+  }
+}
+
+}  // namespace
 
 std::string ProcessResult::stdout_trimmed() const { return str::trim(stdout_text); }
 std::string ProcessResult::stderr_trimmed() const { return str::trim(stderr_text); }
 
 std::string ProcessResult::to_string() const {
-  return "exit=" + std::to_string(exit_code) + (timed_out ? " (timed out)" : "");
+  std::string out = "exit=" + std::to_string(exit_code);
+  if (timed_out) {
+    out += " timed_out";
+  }
+  out += " duration=" + std::to_string(duration.count()) + "ms";
+  return out;
 }
 
 Result<ProcessResult> run(const ProcessSpec& spec) {
-  return std::unexpected(
-      Error::make("cova::proc::unsupported", "process execution is not implemented on Windows")
-          .with("program: " + spec.program.string()));
+  auto resolved_result = resolve_program(spec.program);
+  if (!resolved_result) {
+    return std::unexpected(std::move(resolved_result.error()));
+  }
+  const Path resolved = std::move(*resolved_result);
+
+  if (spec.cwd && !fs::is_directory(*spec.cwd)) {
+    return std::unexpected(Error::make("cova::proc::cwd", "working directory does not exist")
+                               .with("cwd: " + spec.cwd->string()));
+  }
+
+  SECURITY_ATTRIBUTES attributes{};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = TRUE;
+
+  const bool needs_stdin_pipe = spec.stdin_data.has_value() && !spec.inherit_stdin;
+
+  WinHandle stdout_read;
+  WinHandle stderr_read;
+  WinHandle stdin_write;
+
+  HANDLE child_in = INVALID_HANDLE_VALUE;
+  HANDLE child_out = INVALID_HANDLE_VALUE;
+  HANDLE child_err = INVALID_HANDLE_VALUE;
+  bool own_in = false;
+  bool own_out = false;
+  bool own_err = false;
+
+  auto close_child_ends = [&]() {
+    if (own_in && child_in != INVALID_HANDLE_VALUE) {
+      ::CloseHandle(child_in);
+    }
+    if (own_out && child_out != INVALID_HANDLE_VALUE) {
+      ::CloseHandle(child_out);
+    }
+    if (own_err && child_err != INVALID_HANDLE_VALUE) {
+      ::CloseHandle(child_err);
+    }
+    child_in = child_out = child_err = INVALID_HANDLE_VALUE;
+    own_in = own_out = own_err = false;
+  };
+
+  auto setup_captured_output = [&](DWORD which, bool inherit, WinHandle& read_end,
+                                   HANDLE& child_end, bool& child_owns, const char* label) {
+    if (inherit) {
+      child_end = inherited_std_handle(which, GENERIC_WRITE, child_owns);
+      if (child_end == INVALID_HANDLE_VALUE) {
+        return Status(std::unexpected(
+            Error::make("cova::proc::pipe", std::string("cannot inherit ") + label)
+                .with("windows_error: " + windows_error(::GetLastError()))));
+      }
+      return ok();
+    }
+    HANDLE raw_read = INVALID_HANDLE_VALUE;
+    HANDLE raw_write = INVALID_HANDLE_VALUE;
+    if (!::CreatePipe(&raw_read, &raw_write, &attributes, 0)) {
+      return Status(std::unexpected(
+          Error::make("cova::proc::pipe", std::string("cannot create ") + label)
+              .with("windows_error: " + windows_error(::GetLastError()))));
+    }
+    if (!::SetHandleInformation(raw_read, HANDLE_FLAG_INHERIT, 0)) {
+      ::CloseHandle(raw_read);
+      ::CloseHandle(raw_write);
+      return Status(std::unexpected(
+          Error::make("cova::proc::pipe", std::string("cannot secure ") + label)
+              .with("windows_error: " + windows_error(::GetLastError()))));
+    }
+    read_end.reset(raw_read);
+    child_end = raw_write;
+    child_owns = true;
+    return ok();
+  };
+
+  if (Status prepared =
+          setup_captured_output(STD_OUTPUT_HANDLE, spec.inherit_stdout, stdout_read, child_out,
+                                own_out, "stdout pipe");
+      !prepared) {
+    close_child_ends();
+    return std::unexpected(std::move(prepared.error()));
+  }
+  if (Status prepared =
+          setup_captured_output(STD_ERROR_HANDLE, spec.inherit_stderr, stderr_read, child_err,
+                                own_err, "stderr pipe");
+      !prepared) {
+    close_child_ends();
+    return std::unexpected(std::move(prepared.error()));
+  }
+
+  if (spec.inherit_stdin) {
+    child_in = inherited_std_handle(STD_INPUT_HANDLE, GENERIC_READ, own_in);
+    if (child_in == INVALID_HANDLE_VALUE) {
+      close_child_ends();
+      return std::unexpected(Error::make("cova::proc::pipe", "cannot inherit stdin")
+                                 .with("windows_error: " + windows_error(::GetLastError())));
+    }
+  } else if (needs_stdin_pipe) {
+    HANDLE raw_read = INVALID_HANDLE_VALUE;
+    HANDLE raw_write = INVALID_HANDLE_VALUE;
+    if (!::CreatePipe(&raw_read, &raw_write, &attributes, 0)) {
+      close_child_ends();
+      return std::unexpected(Error::make("cova::proc::pipe", "cannot create stdin pipe")
+                                 .with("windows_error: " + windows_error(::GetLastError())));
+    }
+    if (!::SetHandleInformation(raw_write, HANDLE_FLAG_INHERIT, 0)) {
+      ::CloseHandle(raw_read);
+      ::CloseHandle(raw_write);
+      close_child_ends();
+      return std::unexpected(Error::make("cova::proc::pipe", "cannot secure stdin pipe")
+                                 .with("windows_error: " + windows_error(::GetLastError())));
+    }
+    child_in = raw_read;
+    own_in = true;
+    stdin_write.reset(raw_write);
+  } else {
+    child_in = open_null(GENERIC_READ);
+    if (child_in == INVALID_HANDLE_VALUE) {
+      close_child_ends();
+      return std::unexpected(Error::make("cova::proc::pipe", "cannot open the NUL device")
+                                 .with("windows_error: " + windows_error(::GetLastError())));
+    }
+    own_in = true;
+  }
+
+  std::wstring command_line = build_command_line(resolved, spec.args);
+  std::wstring environment = build_environment(spec);
+
+  STARTUPINFOEXW startup{};
+  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup.StartupInfo.hStdInput = child_in;
+  startup.StartupInfo.hStdOutput = child_out;
+  startup.StartupInfo.hStdError = child_err;
+  startup.StartupInfo.cb = sizeof(STARTUPINFOW);
+
+  // Restrict inheritance to exactly the three standard handles. Without this,
+  // a child would inherit the pipe ends of every concurrently running action,
+  // delaying EOF for them until this child exits.
+  std::array<HANDLE, 3> inherited_handles{};
+  std::size_t inherited_count = 0;
+  for (const HANDLE handle : {child_in, child_out, child_err}) {
+    if (handle == INVALID_HANDLE_VALUE) {
+      continue;
+    }
+    bool duplicate = false;
+    for (std::size_t index = 0; index < inherited_count; ++index) {
+      duplicate = duplicate || inherited_handles[index] == handle;
+    }
+    if (!duplicate) {
+      inherited_handles[inherited_count++] = handle;
+    }
+  }
+
+  LPPROC_THREAD_ATTRIBUTE_LIST attribute_list = nullptr;
+  bool extended_startup = false;
+  SIZE_T attributes_size = 0;
+  ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
+  if (attributes_size > 0) {
+    attribute_list = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+        ::HeapAlloc(::GetProcessHeap(), 0, attributes_size));
+    if (attribute_list != nullptr) {
+      const bool initialized =
+          ::InitializeProcThreadAttributeList(attribute_list, 1, 0, &attributes_size);
+      if (initialized &&
+          ::UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                      inherited_handles.data(),
+                                      inherited_count * sizeof(HANDLE), nullptr, nullptr)) {
+        extended_startup = true;
+        startup.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+      } else {
+        if (initialized) {
+          ::DeleteProcThreadAttributeList(attribute_list);
+        }
+        ::HeapFree(::GetProcessHeap(), 0, attribute_list);
+        attribute_list = nullptr;
+      }
+    }
+  }
+
+  PROCESS_INFORMATION information{};
+  const wchar_t* working_directory = spec.cwd ? spec.cwd->native().c_str() : nullptr;
+  DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT;
+  if (extended_startup) {
+    creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
+  }
+  const BOOL created = ::CreateProcessW(
+      resolved.native().c_str(), command_line.data(), nullptr, nullptr, TRUE, creation_flags,
+      environment.data(), working_directory, &startup.StartupInfo, &information);
+  if (attribute_list != nullptr) {
+    ::DeleteProcThreadAttributeList(attribute_list);
+    ::HeapFree(::GetProcessHeap(), 0, attribute_list);
+  }
+  if (!created) {
+    const DWORD error = ::GetLastError();
+    close_child_ends();
+    return std::unexpected(Error::make("cova::proc::spawn", "cannot start process")
+                               .with("program: " + resolved.string())
+                               .with("windows_error: " + windows_error(error)));
+  }
+  close_child_ends();
+
+  WinHandle process(information.hProcess);
+  WinHandle process_thread(information.hThread);
+
+  // Timeouts kill the whole tree; when job assignment is refused (for example,
+  // because the parent already sits in a restrictive job), fall back to killing
+  // only the direct child.
+  WinHandle job;
+  if (HANDLE raw_job = ::CreateJobObjectW(nullptr, nullptr); raw_job != nullptr) {
+    if (::AssignProcessToJobObject(raw_job, process.get())) {
+      job.reset(raw_job);
+    } else {
+      ::CloseHandle(raw_job);
+    }
+  }
+
+  // Feed stdin from a writer thread: a large payload must never block the
+  // parent while it is still draining the child's stdout.
+  std::thread writer;
+  if (stdin_write.valid()) {
+    HANDLE write_handle = stdin_write.release();
+    const std::string* data = &*spec.stdin_data;
+    writer = std::thread([write_handle, data]() {
+      std::size_t offset = 0;
+      while (offset < data->size()) {
+        const DWORD chunk =
+            static_cast<DWORD>(std::min<std::size_t>(data->size() - offset, 65536));
+        DWORD written = 0;
+        if (!::WriteFile(write_handle, data->data() + offset, chunk, &written, nullptr) ||
+            written == 0) {
+          break;
+        }
+        offset += written;
+      }
+      ::CloseHandle(write_handle);
+    });
+  }
+
+  ProcessResult result;
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = spec.timeout.count() > 0
+                            ? started + spec.timeout
+                            : std::chrono::steady_clock::time_point::max();
+  bool timed_out = false;
+  DWORD exit_code = 0;
+
+  for (;;) {
+    if (stdout_read.valid()) {
+      drain_pipe(stdout_read.get(), result.stdout_text);
+    }
+    if (stderr_read.valid()) {
+      drain_pipe(stderr_read.get(), result.stderr_text);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (spec.timeout.count() > 0 && now >= deadline) {
+      timed_out = true;
+      if (job.valid()) {
+        ::TerminateJobObject(job.get(), 1);
+      } else {
+        ::TerminateProcess(process.get(), 1);
+      }
+      ::WaitForSingleObject(process.get(), INFINITE);
+      ::GetExitCodeProcess(process.get(), &exit_code);
+      break;
+    }
+
+    DWORD wait_ms = static_cast<DWORD>(kPollSlice.count());
+    if (spec.timeout.count() > 0) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+      if (remaining.count() <= 0) {
+        wait_ms = 0;
+      } else if (remaining.count() < static_cast<long long>(wait_ms)) {
+        wait_ms = static_cast<DWORD>(remaining.count());
+      }
+    }
+
+    const DWORD status = ::WaitForSingleObject(process.get(), wait_ms);
+    if (status == WAIT_OBJECT_0) {
+      ::GetExitCodeProcess(process.get(), &exit_code);
+      break;
+    }
+    if (status == WAIT_FAILED) {
+      ::GetExitCodeProcess(process.get(), &exit_code);
+      break;
+    }
+  }
+
+  if (stdout_read.valid()) {
+    drain_pipe(stdout_read.get(), result.stdout_text);
+  }
+  if (stderr_read.valid()) {
+    drain_pipe(stderr_read.get(), result.stderr_text);
+  }
+
+  if (writer.joinable()) {
+    // A child that never read stdin can leave the writer blocked on a full
+    // pipe; cancel the outstanding write before joining so run() always returns.
+    ::CancelSynchronousIo(writer.native_handle());
+    writer.join();
+  }
+
+  result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+
+  if (timed_out) {
+    result.timed_out = true;
+    result.exit_code = -1;
+    return result;
+  }
+  result.exit_code = static_cast<int>(exit_code);
+  return result;
 }
 
 Result<ProcessResult> run(const Path& program, const std::vector<std::string>& args,
@@ -64,22 +682,31 @@ Result<std::string> capture(const Path& program, const std::vector<std::string>&
     return std::unexpected(std::move(result.error()));
   }
   if (!result->success()) {
-    return std::unexpected(Error::make("cova::proc::failed", "command failed")
-                               .with("exit_code: " + std::to_string(result->exit_code))
-                               .with("stderr: " + result->stderr_trimmed()));
+    Error error = Error::make("cova::proc::failed", "command failed");
+    ProcessSpec described;
+    described.program = program;
+    described.args = args;
+    error.with("command: " + format_command_line(described));
+    error.with("exit_code: " + std::to_string(result->exit_code));
+    if (!result->stderr_text.empty()) {
+      error.with("stderr: " + result->stderr_trimmed());
+    }
+    return std::unexpected(std::move(error));
   }
   return result->stdout_text;
 }
 
-bool is_executable(const Path& program) {
-  return fs::is_regular_file(program);
-}
+bool is_executable(const Path& program) { return fs::is_regular_file(program); }
 
 std::string format_command_line(const ProcessSpec& spec) {
   std::string out = spec.program.string();
   for (const std::string& arg : spec.args) {
     out.push_back(' ');
-    out += arg.find(' ') == std::string::npos ? arg : str::quote(arg);
+    if (arg.find(' ') != std::string::npos || arg.find('\t') != std::string::npos) {
+      out += str::quote(arg);
+    } else {
+      out += arg;
+    }
   }
   return out;
 }

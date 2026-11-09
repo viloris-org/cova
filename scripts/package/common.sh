@@ -43,7 +43,9 @@ resolve_defaults() {
   if [[ -z "$BINARY" ]]; then
     for candidate in \
       "$ROOT/build/bootstrap/bin/cova" \
-      "$ROOT/build/bin/cova"; do
+      "$ROOT/build/bootstrap/bin/cova.exe" \
+      "$ROOT/build/bin/cova" \
+      "$ROOT/build/bin/cova.exe"; do
       if [[ -x "$candidate" ]]; then
         BINARY="$candidate"
         break

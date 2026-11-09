@@ -95,9 +95,19 @@ bool is_cxx_driver(const DriverMatch& match) {
 std::optional<stdfs::path> find_first(const stdfs::path& directory,
                                       const std::vector<std::string>& names) {
   for (const auto& name : names) {
-    const auto candidate = directory / name;
-    if (fs::is_regular_file(candidate)) {
-      return candidate;
+    // On Windows, sibling tools carry the .exe suffix; try it before falling
+    // back to PATH so a managed toolchain never picks up an unrelated host tool.
+    std::vector<std::string> candidates{name};
+#ifdef _WIN32
+    if (!str::ends_with(str::to_lower(name), ".exe")) {
+      candidates.push_back(name + ".exe");
+    }
+#endif
+    for (const std::string& candidate_name : candidates) {
+      const auto candidate = directory / candidate_name;
+      if (fs::is_regular_file(candidate)) {
+        return candidate;
+      }
     }
     if (auto path = fs::find_in_path(name)) {
       return path;
@@ -178,6 +188,9 @@ std::optional<platform::Triple> target_from_executable(std::string_view filename
   if (!match || match->prefix.empty()) {
     return std::nullopt;
   }
+  // The triple parser also understands MinGW spellings such as
+  // `x86_64-w64-mingw32`. A prefix that does not parse means the driver does
+  // not encode a target.
   auto parsed = platform::Triple::parse(match->prefix);
   if (!parsed) {
     return std::nullopt;

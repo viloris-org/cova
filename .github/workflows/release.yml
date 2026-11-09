@@ -12,9 +12,11 @@
 #   macos-15-intel     x86_64 Mach-O  feeds the universal build
 #   macos-15           arm64 Mach-O   feeds the universal build
 #   macos-15           universal     .pkg .dmg .tar.gz
+#   windows-latest     x86_64 MinGW   .zip
 #
-# Windows is deliberately absent: its process-execution backend is an explicit
-# "unsupported" stub, so a Windows binary could not compile or link anything.
+# The Windows build uses MSYS2's MinGW-w64 GCC. Cova does not support MSVC as a
+# host toolchain yet (PRD §20.2 phase three), so the job builds with the GNU
+# toolchain and links libstdc++/libgcc/winpthreads statically.
 name: release
 
 on:
@@ -197,9 +199,57 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-python
+            zip
+
+      - name: Build
+        env:
+          COVA_CXX: g++
+          COVA_CXXFLAGS: -O2 -DNDEBUG -static
+          COVA_LDFLAGS: -static
+        run: |
+          g++ --version | head -1
+          python scripts/devbuild.py build -j "$(nproc)"
+
+      - name: Test
+        env:
+          COVA_CXX: g++
+          COVA_CXXFLAGS: -O2 -DNDEBUG -static
+          COVA_LDFLAGS: -static
+        run: python scripts/devbuild.py test -j "$(nproc)"
+
+      - name: Build .zip
+        run: bash scripts/package/build-windows.sh
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: publish
-    needs: [linux, macos-universal]
+    needs: [linux, macos-universal, windows]
     runs-on: ubuntu-24.04
     steps:
       - name: Resolve tag
@@ -256,15 +306,17 @@ jobs:
           |---|---|
           | Linux x86_64 / aarch64 | \`.deb\`, \`.rpm\`, pacman \`.pkg.tar.zst\`, \`.tar.gz\` |
           | macOS Intel + Apple Silicon | universal \`.pkg\`, \`.dmg\`, \`.tar.gz\` |
+          | Windows x86_64 | \`.zip\` |
 
           The Linux binaries are statically linked, so the same package works
           across distributions. The macOS binaries in the universal packages are
           signed ad-hoc, not with an Apple Developer ID: Gatekeeper asks for a
-          one-time override, described in the README inside the image.
+          one-time override, described in the README inside the image. The
+          Windows archive contains \`cova.exe\` linked against the static MinGW
+          runtime; unzip it and put the directory on \`PATH\`.
 
-          Windows is not published in this release. Cova's Windows
-          process-execution backend is an explicit "unsupported" stub, so a
-          Windows build could not compile or link anything.
+          On Windows, Cova builds projects with a MinGW-w64 GCC from MSYS2 or
+          winlibs. MSVC as a host toolchain is not supported yet.
 
           ## What works
 

@@ -112,8 +112,9 @@ COVA_TEST_NAMED(sysroot, registry_installs_verified_archive) {
   const auto registry = base / "registry";
   const auto archive = registry / "archives" / "test-musl.tar.gz";
   COVA_CHECK(cova::fs::create_directories(archive.parent_path()).has_value());
-  auto tar = cova::proc::run_line("tar -czf " + quote_shell(archive.string()) + " -C " +
-                                  quote_shell((base / "stage").string()) + " aarch64-linux-musl");
+  auto tar = cova::proc::run_line(
+      "tar -czf " + quote_shell(cova::fs::generic_string(archive)) + " -C " +
+      quote_shell(cova::fs::generic_string(base / "stage")) + " aarch64-linux-musl");
   COVA_CHECK_MSG(tar.has_value() && tar->success(), "could not create the test archive");
 
   const std::string digest = *cova::Sha256::hex_of_file(archive);

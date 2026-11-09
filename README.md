@@ -37,6 +37,17 @@ Cross compilation is a first-class command, not a configuration project:
 cova build --target aarch64-unknown-linux-musl
 ```
 
+Windows GNU targets use the same model. With a MinGW-w64 cross toolchain
+installed, either spelling works:
+
+```bash
+cova build --target x86_64-pc-windows-gnu
+cova build --target x86_64-w64-mingw32   # MinGW's own triple
+```
+
+Cova discovers prefixed drivers such as `x86_64-w64-mingw32-g++`, links a PE
+executable and verifies its architecture after linking.
+
 ## Status
 
 This repository implements **Milestone 0 (architecture foundation)**,
@@ -69,6 +80,7 @@ What works today:
 | Compilation database | Every `build` and `check` emits `compile_commands.json` with the exact compile arguments; a workspace gets one file covering its members |
 | Workspace | Discovery, ordering, shared settings and multi-package builds |
 | Self-hosting | A root `cova.toml` lets a built Cova build, test and run itself (Stage 1) |
+| Host platforms | Linux and macOS x86_64/aarch64, and Windows x86_64 with MinGW-w64 GCC (MSVC is not supported yet) |
 
 What deliberately does **not** work yet, by design:
 
@@ -101,11 +113,12 @@ Native packages are attached to each release:
 |---|---|
 | Linux x86_64 / aarch64 | `.deb`, `.rpm`, pacman `.pkg.tar.zst`, `.tar.gz` |
 | macOS Intel + Apple Silicon | universal `.pkg`, `.dmg`, `.tar.gz` |
+| Windows x86_64 | `.zip` with `cova.exe` |
 
 The Linux binaries are statically linked, so one package works across
-distributions. Windows is not published: its process-execution backend is an
-explicit "unsupported" stub, so a Windows binary could not compile or link
-anything.
+distributions. The Windows archive links the MinGW runtime statically: unzip it
+and add the directory to `PATH`. Cova builds Windows projects with a MinGW-w64
+GCC; MSVC as a host toolchain is not supported yet (PRD §20.2).
 
 ### Releasing
 
@@ -127,6 +140,17 @@ COVA_CXX=clang++ ./bootstrap/build.sh
 The bootstrap script probes the compiler for the C++26 baseline features Cova
 actually uses (`<expected>`, `<print>`, concepts, ranges, designated
 initializers) — it does not infer support from a version number (PRD §16.4).
+
+On Windows the bootstrap shell script needs MSYS2. A native build works without
+it as long as a MinGW-w64 GCC, Ninja and Python 3 are on `PATH`:
+
+```powershell
+python scripts/devbuild.py build
+python scripts/devbuild.py test
+```
+
+`scripts/devbuild.py` handles Windows command lines and `.exe`/`.a` naming for
+MinGW; MSVC (`cl.exe`) is not a supported host toolchain yet.
 
 Cova can also build itself once a Stage 0 binary exists (PRD §16.2):
 

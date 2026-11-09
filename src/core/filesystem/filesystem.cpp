@@ -34,11 +34,11 @@ namespace cova::fs {
 namespace {
 
 #ifdef _WIN32
-constexpr char kSeparator = '\\';
+[[maybe_unused]] constexpr char kSeparator = '\\';
 int process_id() { return _getpid(); }
 bool access_executable(const Path& p) { return ::_access(p.string().c_str(), 0) == 0; }
 #else
-constexpr char kSeparator = '/';
+[[maybe_unused]] constexpr char kSeparator = '/';
 int process_id() { return static_cast<int>(::getpid()); }
 bool access_executable(const Path& p) { return ::access(p.string().c_str(), X_OK) == 0; }
 #endif
@@ -364,7 +364,7 @@ Result<std::string> read_file_head(const Path& p, std::size_t limit) {
 
 namespace {
 
-Status write_all_fd(int fd, const char* data, std::size_t size) {
+[[maybe_unused]] Status write_all_fd(int fd, const char* data, std::size_t size) {
   std::size_t written = 0;
   while (written < size) {
 #ifdef _WIN32
@@ -440,6 +440,16 @@ Status write_file_atomic(const Path& p, std::string_view data) {
 
   std::error_code ec;
   stdfs::rename(temp, p, ec);
+#ifdef _WIN32
+  if (ec) {
+    // Some Windows C runtimes refuse to rename onto an existing file. Replace
+    // it explicitly so lockfile and manifest rewrites still succeed.
+    std::error_code remove_ec;
+    stdfs::remove(p, remove_ec);
+    ec.clear();
+    stdfs::rename(temp, p, ec);
+  }
+#endif
   if (ec) {
     std::error_code remove_ec;
     stdfs::remove(temp, remove_ec);
@@ -907,8 +917,22 @@ Result<CovaDirs> cova_dirs() {
   Path root;
   if (const std::optional<std::string> home = get_env("COVA_HOME"); home && !home->empty()) {
     root = Path(*home);
-  } else if (const std::optional<std::string> xdg = get_env("XDG_DATA_HOME");
-             xdg && !xdg->empty()) {
+  }
+#ifdef _WIN32
+  else if (const std::optional<std::string> local = get_env("LOCALAPPDATA");
+           local && !local->empty()) {
+    root = Path(*local) / "cova";
+  } else if (const std::optional<std::string> profile = get_env("USERPROFILE");
+             profile && !profile->empty()) {
+    root = Path(*profile) / ".cova";
+  } else {
+    return std::unexpected(
+        Error::make("cova::fs::home", "cannot determine a Cova data directory")
+            .with("hint: set COVA_HOME, LOCALAPPDATA or USERPROFILE"));
+  }
+#else
+  else if (const std::optional<std::string> xdg = get_env("XDG_DATA_HOME");
+           xdg && !xdg->empty()) {
     root = Path(*xdg) / "cova";
   } else if (const std::optional<std::string> home_dir = get_env("HOME");
              home_dir && !home_dir->empty()) {
@@ -918,6 +942,7 @@ Result<CovaDirs> cova_dirs() {
         Error::make("cova::fs::home", "cannot determine a Cova data directory")
             .with("hint: set COVA_HOME or HOME"));
   }
+#endif
   CovaDirs dirs;
   dirs.root = absolute_normalized(root);
   dirs.toolchains = dirs.root / "toolchains";
@@ -1005,21 +1030,63 @@ std::vector<Path> path_entries() {
   return entries;
 }
 
+namespace {
+
+// Windows resolves a bare program name by appending PATHEXT, exactly as the
+// shell and CreateProcess do. Without this, `g++` would never find `g++.exe`.
+std::vector<std::string> executable_names(std::string_view name) {
+  std::vector<std::string> names{std::string(name)};
+#ifdef _WIN32
+  const std::string text(name);
+  const std::optional<std::string> pathext = get_env("PATHEXT");
+  const std::string extensions = pathext ? *pathext : ".COM;.EXE;.BAT;.CMD";
+  const std::string lowered = str::to_lower(text);
+  bool already_named = false;
+  for (const std::string& extension : str::split(extensions, ';')) {
+    if (!extension.empty() && str::ends_with(lowered, str::to_lower(extension))) {
+      already_named = true;
+      break;
+    }
+  }
+  if (already_named) {
+    return names;
+  }
+  for (std::string extension : str::split(extensions, ';')) {
+    if (extension.empty()) {
+      continue;
+    }
+    if (extension.front() != '.') {
+      extension.insert(extension.begin(), '.');
+    }
+    names.push_back(text + extension);
+    names.push_back(text + str::to_lower(extension));
+  }
+#endif
+  return names;
+}
+
+}  // namespace
+
 std::optional<Path> find_in_path(std::string_view executable) {
   if (executable.empty()) {
     return std::nullopt;
   }
   const Path candidate(executable);
   if (candidate.has_parent_path()) {
-    if (is_file(candidate) && access_executable(candidate)) {
-      return candidate;
+    for (const std::string& name : executable_names(executable)) {
+      const Path full(name);
+      if (is_file(full) && access_executable(full)) {
+        return full;
+      }
     }
     return std::nullopt;
   }
   for (const Path& directory : path_entries()) {
-    const Path full = directory / candidate;
-    if (is_file(full) && access_executable(full)) {
-      return full;
+    for (const std::string& name : executable_names(executable)) {
+      const Path full = directory / name;
+      if (is_file(full) && access_executable(full)) {
+        return full;
+      }
     }
   }
   return std::nullopt;

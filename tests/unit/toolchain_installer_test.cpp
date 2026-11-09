@@ -50,6 +50,9 @@ struct Fixture {
   std::string digest;
 
   bool build() {
+#ifdef _WIN32
+    return false;  // the fixture driver is a POSIX shell script
+#endif
     if (!cova::fs::find_in_path("tar").has_value()) {
       return false;
     }
@@ -66,8 +69,9 @@ struct Fixture {
     if (!cova::fs::create_directories(archive.parent_path())) {
       return false;
     }
-    auto tar = cova::proc::run_line("tar -czf " + quote_shell(archive.string()) + " -C " +
-                                    quote_shell((base / "stage").string()) + " fake-cross");
+    auto tar = cova::proc::run_line(
+        "tar -czf " + quote_shell(cova::fs::generic_string(archive)) + " -C " +
+        quote_shell(cova::fs::generic_string(base / "stage")) + " fake-cross");
     if (!tar || !tar->success()) {
       return false;
     }

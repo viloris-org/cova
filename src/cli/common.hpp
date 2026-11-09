@@ -144,6 +144,9 @@ bool stdout_is_tty();
 // uses stderr, so this is what decides whether it can redraw in place.
 bool stderr_is_tty();
 
+// True when stdin is a terminal; interactive `cova run` forwards it.
+bool stdin_is_tty();
+
 // Width in columns of the terminal on stderr, or 80 when it cannot be queried.
 int terminal_width();
 

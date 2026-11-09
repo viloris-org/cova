@@ -46,14 +46,14 @@ CLI are the parts expected to settle first (PRD §26.2).
 | `ubuntu-24.04` | Linux x86_64 | `.deb`, `.rpm`, pacman `.pkg.tar.zst`, `.tar.gz` |
 | `ubuntu-24.04-arm` | Linux aarch64 | `.deb`, `.rpm`, pacman `.pkg.tar.zst`, `.tar.gz` |
 | `macos-15-intel` + `macos-15` | macOS universal | `.pkg`, `.dmg`, `.tar.gz` |
+| `windows-latest` (MSYS2) | Windows x86_64 MinGW | `.zip` |
 
 Linux binaries are linked statically (`-static`), which is why one package runs
 across distributions. The macOS binaries are built per-architecture and joined
 with `lipo`; they link `libstdc++` statically but still use the system libc.
-
-Windows is not built. `src/core/process/process.cpp` returns an explicit
-"unsupported" error on Windows, so a Windows binary could not compile or link
-anything. Shipping one would be worse than not shipping it.
+The Windows binary is built by MSYS2's MinGW-w64 GCC with `-static`, so it needs
+no `libstdc++-6.dll`, `libgcc_s_seh-1.dll` or `libwinpthread-1.dll` beside it.
+The archive is not code-signed.
 
 ## Version spelling per package format
 
@@ -82,6 +82,8 @@ On a host without `dpkg-deb` or `rpmbuild` (and no root to install them), point
 private `rpmbuild` and config.
 
 macOS packaging uses `pkgbuild` and `hdiutil`, so those steps only run on macOS.
+Windows packaging uses `zip` and runs under MSYS2 (`build-windows.sh`); it
+produces the same `cova-<version>-windows-<arch>.zip` layout as the release job.
 
 ## Signing
 
@@ -92,7 +94,10 @@ separate step that needs a Developer ID certificate and is not automated here.
 
 ## Installing from a release
 
-`install.sh` in the repository root is the one-line installer. It resolves the
-newest beta, verifies the checksum and installs the binary. Because `latest`
-in the GitHub API ignores pre-releases, the script lists releases and filters
-for one instead.
+`install.sh` in the repository root is the one-line installer for Linux and
+macOS. It resolves the newest beta, verifies the checksum and installs the
+binary. Because `latest` in the GitHub API ignores pre-releases, the script
+lists releases and filters for one instead.
+
+Windows has no shell installer: download the `.zip` asset, extract it, and add
+the extracted directory to `PATH`.

@@ -26,6 +26,13 @@ bool is_os_component(std::string_view text) {
   return os_from_string(text).has_value();
 }
 
+// MinGW spells its Windows GNU ABI in the environment slot (`x86_64-w64-mingw32`)
+// or, in shortened form, as the whole second component (`x86_64-mingw32`).
+bool is_mingw_component(std::string_view text) {
+  const std::string lower = str::to_lower(str::trim_view(text));
+  return lower == "mingw" || lower == "mingw32" || lower == "mingw64";
+}
+
 // Fills the OS-dependent defaults that make a triple complete enough for the
 // resolver: ABI, CRT, stdlib and the conventional environment.
 void apply_os_defaults(Triple& triple) {
@@ -395,20 +402,30 @@ Result<Triple> Triple::parse(std::string_view text) {
   triple.arch = *arch;
 
   if (parts.size() == 2) {
-    auto os = os_from_string(parts[1]);
-    if (!os) {
-      return fail<Triple>(
-          Error::make("cova::target::os_unknown", "unknown target OS `" + parts[1] + "`")
-              .with("supported: linux, windows, macos, wasi, none, ..."));
+    if (is_mingw_component(parts[1])) {
+      triple.vendor = Vendor::Pc;
+      triple.os = Os::Windows;
+      triple.env = Env::Gnu;
+    } else {
+      auto os = os_from_string(parts[1]);
+      if (!os) {
+        return fail<Triple>(
+            Error::make("cova::target::os_unknown", "unknown target OS `" + parts[1] + "`")
+                .with("supported: linux, windows, macos, wasi, none, ..."));
+      }
+      triple.os = *os;
     }
-    triple.os = *os;
   } else if (parts.size() == 3) {
     const bool vendor_second = is_vendor_component(parts[1]);
     const bool os_second = is_os_component(parts[1]);
     const bool os_third = is_os_component(parts[2]);
     const bool env_third = env_from_string(parts[2]).has_value();
 
-    if (vendor_second && os_third) {
+    if (vendor_second && is_mingw_component(parts[2])) {
+      triple.vendor = *vendor_from_string(parts[1]);
+      triple.os = Os::Windows;
+      triple.env = Env::Gnu;
+    } else if (vendor_second && os_third) {
       triple.vendor = *vendor_from_string(parts[1]);
       triple.os = *os_from_string(parts[2]);
     } else if (os_second && env_third) {
@@ -658,7 +675,12 @@ const Triple& host_triple() {
 
 #if defined(_WIN32)
     triple.os = Os::Windows;
+    triple.vendor = Vendor::Pc;
+#if defined(__MINGW32__) || defined(__MINGW64__)
+    triple.env = Env::Gnu;
+#else
     triple.env = Env::Msvc;
+#endif
 #elif defined(__APPLE__)
     triple.os = Os::Macos;
     triple.env = Env::None;
@@ -675,7 +697,6 @@ const Triple& host_triple() {
 #else
     triple.os = Os::Unknown;
 #endif
-    triple.vendor = Vendor::UnknownVendor;
     return triple;
   }();
   return host;

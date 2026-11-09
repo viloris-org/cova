@@ -20,6 +20,7 @@
 #include "core/json/json.hpp"
 #include "core/process/process.hpp"
 #include "manifest/manifest.hpp"
+#include "platform/binary/binary.hpp"
 #include "platform/triple/triple.hpp"
 #include "testing/test.hpp"
 
@@ -185,6 +186,83 @@ fi
 exit 0
 )SH";
 
+// A MinGW-shaped compiler stand-in. It writes a minimal PE/COFF stub (x86_64
+// machine) to every `-o`, so the whole cross path — discovery, probing,
+// planning, `.exe` naming and artifact verification — runs without needing a
+// real MinGW installation.
+constexpr std::string_view kFakeMingwCompiler = R"SH(#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'g++ (GCC) 14.2.0'
+  exit 0
+fi
+if [ "$1" = "-print-resource-dir" ]; then
+  dirname "$0"
+  exit 0
+fi
+out=""
+mf=""
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    -o) out="$arg" ;;
+    -MF) mf="$arg" ;;
+  esac
+  prev="$arg"
+done
+if [ -n "$mf" ]; then
+  mkdir -p "$(dirname "$mf")"
+  : > "$mf"
+fi
+if [ -n "$out" ]; then
+  mkdir -p "$(dirname "$out")"
+  cp "$(dirname "$0")/pe-fixture" "$out"
+fi
+exit 0
+)SH";
+
+void write_pe_stub(const stdfs::path& path) {
+  std::vector<unsigned char> bytes(0x40, 0);
+  bytes[0] = 'M';
+  bytes[1] = 'Z';
+  bytes[0x3c] = 0x40; // e_lfanew points at the PE signature.
+  bytes.push_back('P');
+  bytes.push_back('E');
+  bytes.push_back(0);
+  bytes.push_back(0);
+  bytes.push_back(0x64); // 0x8664 = IMAGE_FILE_MACHINE_AMD64.
+  bytes.push_back(0x86);
+  std::ofstream stream(path, std::ios::binary);
+  stream.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+}
+
+stdfs::path find_extension(const stdfs::path& root, std::string_view extension) {
+  std::error_code ec;
+  for (stdfs::recursive_directory_iterator it(root, ec), end; !ec && it != end;
+       it.increment(ec)) {
+    if (it->is_regular_file(ec) && it->path().extension().string() == extension) {
+      return it->path();
+    }
+  }
+  return {};
+}
+
+// Creates a fresh project and builds it for a Windows GNU target. Returns the
+// first `.exe` the build produced, or an empty path on failure.
+stdfs::path build_windows_project(const stdfs::path& root, std::string_view target,
+                                  std::string_view compiler) {
+  {
+    ScopedCwd cwd(root);
+    auto created = run_cli({"new", "winapp"});
+    COVA_CHECK_MSG(created.ok(), created.combined());
+  }
+  ScopedCwd cwd(root / "winapp");
+  auto built = run_cli({"build", "--target", std::string(target), "--compiler",
+                        std::string(compiler)});
+  COVA_CHECK_MSG(built.ok(), built.combined());
+  return find_extension(root / "winapp", ".exe");
+}
+
 } // namespace
 
 COVA_TEST_NAMED(integration, new_creates_a_complete_project) {
@@ -343,10 +421,11 @@ COVA_TEST_NAMED(integration, end_to_end_new_build_run) {
   COVA_CHECK_MSG(contains(built.err, "Compiling `hello`"), built.err);
   COVA_CHECK_MSG(contains(built.err, "compile src/main.cpp"), built.err);
 
-  // The binary exists and is a real ELF executable.
+  // The binary exists and is a real host executable.
+  const std::string executable = "hello" + cova::platform::host_triple().executable_suffix();
   const stdfs::path binary = stdfs::path(temp.path()) / "hello" / "target" /
                              cova::cli::target_dir_component(cova::platform::host_triple()) /
-                             "dev" / "bin" / "hello";
+                             "dev" / "bin" / executable;
   COVA_CHECK_MSG(cova::fs::is_regular_file(binary), "expected binary at " + binary.string());
 
   auto run = run_cli({"run"});
@@ -485,6 +564,9 @@ COVA_TEST_NAMED(integration, shell_escapes_are_never_interpreted) {
 }
 
 COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) {
+#ifdef _WIN32
+  return;  // the fixture driver is a POSIX shell script
+#endif
   COVA_SKIP_UNLESS_TOOL("tar");
   const std::string target_text = non_host_linux_target();
   const std::string driver = non_host_driver_prefix() + "-g++";
@@ -534,6 +616,56 @@ COVA_TEST_NAMED(integration, cross_build_rejects_a_wrong_architecture_artifact) 
   COVA_CHECK(!built.ok());
   COVA_CHECK(contains(built.combined(), "cannot inspect") ||
              contains(built.combined(), "artifact"));
+}
+
+COVA_TEST_NAMED(integration, cross_plans_and_verifies_a_windows_gnu_executable) {
+#ifdef _WIN32
+  return; // the fixture driver is a POSIX shell script
+#endif
+  COVA_SKIP_UNLESS_TOOL("cp");
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path bin = stdfs::path(temp.path()) / "mingw-bin";
+  stdfs::create_directories(bin);
+  write_text(bin / "x86_64-w64-mingw32-g++", kFakeMingwCompiler);
+  make_executable(bin / "x86_64-w64-mingw32-g++");
+  write_pe_stub(bin / "pe-fixture");
+  cova::test::ScopedEnv path_env(
+      "PATH", bin.string() + ":" + cova::fs::get_env("PATH").value_or(""));
+
+  // MinGW's own spelling is accepted, canonicalised and used end to end.
+  const stdfs::path exe = build_windows_project(temp.path(), "x86_64-w64-mingw32", "gcc");
+  COVA_CHECK_MSG(!exe.empty(), "the cross build produced no .exe artifact");
+  if (!exe.empty()) {
+    auto info = cova::platform::inspect_binary(exe);
+    COVA_CHECK(info.has_value());
+    if (info) {
+      COVA_CHECK(info->format == cova::platform::BinaryFormat::Pe);
+      COVA_CHECK(info->arch == cova::platform::Arch::X86_64);
+    }
+  }
+}
+
+COVA_TEST_NAMED(integration, cross_builds_a_windows_executable_with_a_real_mingw_toolchain) {
+#ifdef _WIN32
+  return;
+#endif
+  if (!cova::fs::find_in_path("x86_64-w64-mingw32-g++").has_value()) {
+    return; // requires a MinGW-w64 cross toolchain on the host
+  }
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+
+  const stdfs::path exe = build_windows_project(temp.path(), "x86_64-pc-windows-gnu", "gcc");
+  COVA_CHECK_MSG(!exe.empty(), "the cross build produced no .exe artifact");
+  if (!exe.empty()) {
+    auto info = cova::platform::inspect_binary(exe);
+    COVA_CHECK(info.has_value());
+    if (info) {
+      COVA_CHECK(info->format == cova::platform::BinaryFormat::Pe);
+      COVA_CHECK(info->arch == cova::platform::Arch::X86_64);
+    }
+  }
 }
 
 

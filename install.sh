@@ -32,6 +32,9 @@ detect_os() {
   case "$(uname -s)" in
     Linux) echo linux ;;
     Darwin) echo macos ;;
+    MINGW*|MSYS*|CYGWIN*)
+      die "Windows releases are .zip archives; download one from https://github.com/$REPO/releases and extract it"
+      ;;
     *) die "unsupported operating system: $(uname -s)" ;;
   esac
 }

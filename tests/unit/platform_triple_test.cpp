@@ -32,6 +32,24 @@ COVA_TEST_NAMED(platform, accepts_common_aliases) {
   COVA_CHECK(mac.vendor == cova::platform::Vendor::Apple);
 }
 
+COVA_TEST_NAMED(platform, accepts_mingw_triple_spellings) {
+  auto mingw = COVA_REQUIRE_OK(Triple::parse("x86_64-w64-mingw32"));
+  COVA_CHECK(mingw.arch == cova::platform::Arch::X86_64);
+  COVA_CHECK(mingw.vendor == cova::platform::Vendor::Pc);
+  COVA_CHECK(mingw.os == cova::platform::Os::Windows);
+  COVA_CHECK(mingw.env == cova::platform::Env::Gnu);
+  COVA_CHECK_EQ(mingw.to_string(), std::string("x86_64-pc-windows-gnu"));
+
+  auto shortened = COVA_REQUIRE_OK(Triple::parse("x86_64-mingw64"));
+  COVA_CHECK(shortened.os == cova::platform::Os::Windows);
+  COVA_CHECK(shortened.env == cova::platform::Env::Gnu);
+
+  // The user-facing spelling resolves to the canonical known target.
+  auto resolved = COVA_REQUIRE_OK(cova::platform::resolve_target("x86_64-w64-mingw32"));
+  COVA_CHECK_EQ(resolved.to_string(), std::string("x86_64-pc-windows-gnu"));
+  COVA_CHECK(cova::platform::is_known_target("x86_64-w64-mingw32"));
+}
+
 COVA_TEST_NAMED(platform, normalises_pc_vendor_for_linux) {
   auto triple = COVA_REQUIRE_OK(Triple::parse("x86_64-pc-linux-gnu"));
   COVA_CHECK(triple.vendor == cova::platform::Vendor::UnknownVendor);

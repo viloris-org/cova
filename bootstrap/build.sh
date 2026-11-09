@@ -19,6 +19,7 @@ cd "$ROOT"
 
 CXX="${COVA_CXX:-}"
 JOBS="${COVA_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+PYTHON="${COVA_PYTHON:-}"
 BUILD_DIR="${COVA_BUILD_DIR:-$ROOT/build/bootstrap}"
 RUN_TESTS=0
 CLEAN=0
@@ -51,6 +52,20 @@ if ! command -v ninja >/dev/null 2>&1; then
   echo "  Debian/Ubuntu: sudo apt install ninja-build" >&2
   echo "  Fedora:        sudo dnf install ninja-build" >&2
   echo "  macOS:         brew install ninja" >&2
+  exit 2
+fi
+
+# MSYS2 calls it `python`, most Unix hosts call it `python3`.
+if [[ -z "$PYTHON" ]]; then
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "$PYTHON" ]] || ! command -v "$PYTHON" >/dev/null 2>&1; then
+  echo "error: Python 3 is required for the bootstrap build" >&2
   exit 2
 fi
 
@@ -126,7 +141,7 @@ echo "    jobs: $JOBS"
 echo
 
 # --- Build ------------------------------------------------------------------
-COVA_BUILD_DIR="$BUILD_DIR" python3 "$ROOT/scripts/devbuild.py" build -j "$JOBS"
+COVA_BUILD_DIR="$BUILD_DIR" "$PYTHON" "$ROOT/scripts/devbuild.py" build -j "$JOBS"
 
 echo
 echo "==> built: $BUILD_DIR/bin/cova"
@@ -161,7 +176,7 @@ fi
 if [[ "$RUN_TESTS" == "1" ]]; then
   echo
   echo "==> running the test suite"
-  COVA_BUILD_DIR="$BUILD_DIR" python3 "$ROOT/scripts/devbuild.py" test -j "$JOBS"
+  COVA_BUILD_DIR="$BUILD_DIR" "$PYTHON" "$ROOT/scripts/devbuild.py" test -j "$JOBS"
 fi
 
 echo

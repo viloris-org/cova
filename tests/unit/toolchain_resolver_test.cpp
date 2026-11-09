@@ -156,9 +156,22 @@ COVA_TEST_NAMED(toolchain, recognises_cross_and_versioned_driver_names) {
   COVA_CHECK_EQ(target->to_string(), std::string("aarch64-unknown-linux-musl"));
   COVA_CHECK(!cova::toolchain::target_from_executable("g++-14").has_value());
   COVA_CHECK(!cova::toolchain::target_from_executable("clang++").has_value());
+
+  // MinGW driver prefixes use its own spelling; they still mean Windows GNU.
+  auto mingw = cova::toolchain::target_from_executable("x86_64-w64-mingw32-g++");
+  COVA_CHECK(mingw.has_value());
+  COVA_CHECK_EQ(mingw->to_string(), std::string("x86_64-pc-windows-gnu"));
+  auto mingw32 = cova::toolchain::target_from_executable("i686-w64-mingw32-g++");
+  COVA_CHECK(mingw32.has_value());
+  COVA_CHECK(mingw32->arch == cova::platform::Arch::X86);
+  COVA_CHECK(mingw32->os == cova::platform::Os::Windows);
+  COVA_CHECK(mingw32->env == cova::platform::Env::Gnu);
 }
 
 COVA_TEST_NAMED(toolchain, discovery_recognises_prefixed_cross_driver) {
+#ifdef _WIN32
+  return;  // the fixture driver is a POSIX shell script
+#endif
   cova::test::TempDir temp;
   const auto bin = std::filesystem::path(temp.path()) / "bin";
   write_cross_driver_script(bin / (non_host_driver_prefix() + "-g++"));
@@ -179,6 +192,32 @@ COVA_TEST_NAMED(toolchain, discovery_recognises_prefixed_cross_driver) {
   const auto& supported = discovered.front().supported_targets;
   COVA_CHECK(std::find(supported.begin(), supported.end(), non_host_linux_target()) !=
              supported.end());
+}
+
+COVA_TEST_NAMED(toolchain, discovery_recognises_mingw_cross_driver) {
+#ifdef _WIN32
+  return; // the fixture driver is a POSIX shell script
+#endif
+  cova::test::TempDir temp;
+  const auto bin = std::filesystem::path(temp.path()) / "bin";
+  write_cross_driver_script(bin / "x86_64-w64-mingw32-g++");
+
+  cova::toolchain::DiscoveryOptions options;
+  options.include_system = false;
+  options.include_managed = false;
+  options.include_user_path = true;
+  options.extra_roots = {bin};
+  options.families = {"gcc"};
+  auto discovered = COVA_REQUIRE_OK(cova::toolchain::discover(options));
+  COVA_CHECK_EQ(discovered.size(), std::size_t{1});
+  if (discovered.size() != 1) {
+    return;
+  }
+  const auto& descriptor = discovered.front();
+  const auto& supported = descriptor.supported_targets;
+  COVA_CHECK(std::find(supported.begin(), supported.end(),
+                       "x86_64-pc-windows-gnu") != supported.end());
+  COVA_CHECK(descriptor.self_contained); // MinGW carries its own CRT and libstdc++
 }
 
 COVA_TEST_NAMED(toolchain, host_gcc_cannot_satisfy_a_cross_target) {

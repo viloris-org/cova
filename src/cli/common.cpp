@@ -9,8 +9,13 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
 #include <sys/ioctl.h>
 #include <unistd.h>
+#endif
 
 #include "core/diagnostics/diagnostic.hpp"
 #include "core/filesystem/filesystem.hpp"
@@ -33,9 +38,29 @@ void split_compiler_spec(std::string_view spec, std::string& family, std::string
 
 }  // namespace
 
+#ifdef _WIN32
+bool stdout_is_tty() { return ::_isatty(_fileno(stdout)) != 0; }
+
+bool stderr_is_tty() { return ::_isatty(_fileno(stderr)) != 0; }
+
+bool stdin_is_tty() { return ::_isatty(_fileno(stdin)) != 0; }
+
+int terminal_width() {
+  CONSOLE_SCREEN_BUFFER_INFO info{};
+  if (::GetConsoleScreenBufferInfo(::GetStdHandle(STD_ERROR_HANDLE), &info)) {
+    const int columns = info.srWindow.Right - info.srWindow.Left + 1;
+    if (columns > 0) {
+      return columns;
+    }
+  }
+  return 80;
+}
+#else
 bool stdout_is_tty() { return ::isatty(STDOUT_FILENO) != 0; }
 
 bool stderr_is_tty() { return ::isatty(STDERR_FILENO) != 0; }
+
+bool stdin_is_tty() { return ::isatty(STDIN_FILENO) != 0; }
 
 int terminal_width() {
   struct winsize size {};
@@ -44,6 +69,7 @@ int terminal_width() {
   }
   return 80;
 }
+#endif
 
 std::string format_duration(std::chrono::milliseconds duration) {
   const auto ms = duration.count();
