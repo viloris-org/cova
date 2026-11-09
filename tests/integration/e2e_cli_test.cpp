@@ -579,6 +579,42 @@ COVA_TEST_NAMED(integration, dependency_scans_run_only_when_the_closure_is_unkno
   COVA_CHECK_EQ(count_occurrences(changed.combined(), "dependency scan:"), std::size_t{1});
 }
 
+COVA_TEST_NAMED(integration, dry_run_does_not_restore_cache_outputs) {
+  COVA_SKIP_UNLESS_CXX_DRIVER();
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path root = stdfs::path(temp.path()) / "drycache";
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "drycache"}).ok());
+  }
+  ScopedCwd cwd(root);
+  auto built = run_cli({"build"});
+  COVA_CHECK_MSG(built.ok(), built.combined());
+  COVA_CHECK_MSG(run_cli({"clean"}).ok(), "clean failed");
+  auto dry = run_cli({"build", "--dry-run"});
+  COVA_CHECK_MSG(dry.ok(), dry.combined());
+
+  auto count_objects = [&]() {
+    std::size_t count = 0;
+    std::error_code ec;
+    for (const auto& entry : stdfs::recursive_directory_iterator(root, ec)) {
+      if (ec) {
+        break;
+      }
+      if (!entry.is_regular_file(ec)) {
+        continue;
+      }
+      const std::string extension = entry.path().extension().string();
+      if (extension == ".o" || extension == ".obj") {
+        ++count;
+      }
+    }
+    return count;
+  };
+  COVA_CHECK_EQ(count_objects(), std::size_t{0});
+}
+
 COVA_TEST_NAMED(integration, clean_removes_artifacts_but_keeps_sources) {
   COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;

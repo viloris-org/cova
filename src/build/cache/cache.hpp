@@ -20,7 +20,7 @@ using Path = stdfs::path;
 
 // Versions of the persisted schemas. A mismatch is a miss, never a silent
 // compatibility decision.
-inline constexpr std::string_view kBuildStateSchemaVersion = "cova.build-state/2";
+inline constexpr std::string_view kBuildStateSchemaVersion = "cova.build-state/3";
 inline constexpr std::string_view kArtifactCacheSchemaVersion = "cova.artifact-cache/2";
 
 // One persisted record of a successfully completed action.
@@ -29,6 +29,9 @@ struct ActionRecord {
   std::vector<std::string> output_paths;
   std::vector<std::string> input_paths;
   std::vector<std::pair<std::string, std::string>> input_hashes;
+  // Content hashes of the produced outputs, so a corrupt output that still
+  // exists is not mistaken for a current one.
+  std::vector<std::pair<std::string, std::string>> output_hashes;
   std::string toolchain_fingerprint;
   std::string sysroot_fingerprint;
   std::uint64_t completed_at_ns = 0;

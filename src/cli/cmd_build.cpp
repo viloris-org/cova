@@ -109,7 +109,9 @@ Result<bool> refresh_compile_closure(const build::Action& action,
   if (action.kind != build::ActionKind::Compile || action.argv.empty()) {
     return true;
   }
-  const_cast<build::Action&>(action).input_closure_checked = true;
+  auto& mutable_action = const_cast<build::Action&>(action);
+  mutable_action.input_closure_checked = true;
+  mutable_action.input_closure_scan_failed = false;
   auto scratch = fs::make_temp_dir(std::filesystem::temp_directory_path(), "cova-scan-");
   if (!scratch) {
     return fail<bool>(scratch.error());
@@ -153,8 +155,8 @@ Result<bool> refresh_compile_closure(const build::Action& action,
   if (!result || !result->success()) {
     auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
-    auto& mutable_action = const_cast<build::Action&>(action);
     mutable_action.input_closure_complete = false;
+    mutable_action.input_closure_scan_failed = true;
     Error error = Error::make("cova::build::dependency_scan",
                               "the compiler could not scan the input closure");
     if (result && !result->stderr_text.empty()) {
@@ -168,12 +170,11 @@ Result<bool> refresh_compile_closure(const build::Action& action,
   auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
   (void)cleanup;
   if (!parsed) {
-    auto& mutable_action = const_cast<build::Action&>(action);
     mutable_action.input_closure_complete = false;
+    mutable_action.input_closure_scan_failed = true;
     return fail<bool>(Error::make("cova::build::dependency_scan",
                                   "the compiler did not produce a readable dependency file"));
   }
-  auto& mutable_action = const_cast<build::Action&>(action);
   // The scan is the authority on the discovered closure. Drop headers learned
   // from an older depfile (including another target's configuration) so stale
   // discoveries cannot accumulate in the identity.
@@ -238,7 +239,16 @@ void run_cold_dependency_scans(const build::BuildGraph& graph,
                                int requested_workers, CommandContext& ctx) {
   std::vector<const build::Action*> actions;
   for (const build::Action* action : graph.actions_in_order()) {
-    if (action->kind == build::ActionKind::Compile && !action->input_closure_checked) {
+    if (action->kind != build::ActionKind::Compile) {
+      continue;
+    }
+    // A compile that depends on another action may consume generated sources
+    // or headers. Scanning it before its dependency has run would be wrong;
+    // fall back to the executor's dependency-ordered checks.
+    if (!action->dependencies.empty()) {
+      return;
+    }
+    if (!action->input_closure_checked) {
       actions.push_back(action);
     }
   }
@@ -534,7 +544,9 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
   };
   auto is_up_to_date = [&](const build::Action& action, std::string& reason) -> bool {
     // 1. The shared cache can restore every output without running anything.
-    if (try_cache_restore(action)) {
+    //    A dry run must not write artifacts, so it consults the incremental
+    //    record only and reports a cache-only hit as stale.
+    if (!dry_run && try_cache_restore(action)) {
       reason = "restored from cache";
       return true;
     }
@@ -673,6 +685,13 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
       continue;
     }
     build::Action key_action = *action;
+    if (action->input_closure_scan_failed) {
+      if (ctx.global.verbose) {
+        ctx.ui->verbose(action->label +
+                        ": dependency scan failed; not recording or publishing");
+      }
+      continue;
+    }
     if (!action->input_identity_complete) {
       if (ctx.global.verbose) {
         ctx.ui->verbose(action->label + ": incomplete input identity; not publishing");
@@ -703,7 +722,12 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
       }
     };
     for (const auto& output : action->outputs) {
-      record.output_paths.push_back(fs::generic_string(output.path));
+      const std::string path = fs::generic_string(output.path);
+      record.output_paths.push_back(path);
+      auto digest = build::FileHasher{}.hash_file(output.path);
+      if (digest) {
+        record.output_hashes.emplace_back(path, cova::to_hex(*digest));
+      }
     }
     for (const auto& input : action->inputs) {
       add_input(input.path);

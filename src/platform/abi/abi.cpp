@@ -395,7 +395,24 @@ void apply_argument_effect(AbiSignature& signature, std::string_view effect) {
     if (auto parsed = libcpp_from_name(value)) {
       signature.libcpp = *parsed;
     }
-    add_feature(signature, text);
+    replace_feature(signature, "libcpp=", text);
+    return;
+  }
+  if (name == "short-enums") {
+    replace_feature(signature, "short-enums=", text);
+    return;
+  }
+  if (name == "short-wchar") {
+    replace_feature(signature, "short-wchar=", text);
+    return;
+  }
+  if (name == "pack-struct") {
+    replace_feature(signature, "pack-struct=", text);
+    return;
+  }
+  if (name == "mabi" || name == "data-model" || name == "float-model" ||
+      name == "float-abi" || name == "fabi-version" || name == "fclang-abi-compat") {
+    replace_feature(signature, name + "=", text);
     return;
   }
   add_feature(signature, text);
@@ -411,7 +428,7 @@ AbiFact make_fact(std::string name, std::string value, AbiFactState state,
   fact.subject = std::move(subject);
   fact.configuration = std::move(configuration);
   fact.source = "probe:preprocessor-macro";
-  fact.producer_version = "cova-probe/2";
+  fact.producer_version = "cova-probe/3";
   return fact;
 }
 
@@ -454,12 +471,28 @@ AbiArgument classify_abi_argument(std::string_view argument) {
     affecting("short-enums=1");
     return result;
   }
+  if (argument == "-fno-short-enums") {
+    affecting("short-enums=0");
+    return result;
+  }
   if (starts_with(argument, "-fpack-struct")) {
-    affecting(argument == "-fpack-struct" ? "pack-struct=1" : std::string(argument));
+    std::string value = argument.size() > 13 ? std::string(argument.substr(13)) : std::string();
+    if (!value.empty() && value.front() == '=') {
+      value.erase(value.begin());
+    }
+    affecting("pack-struct=" + (value.empty() ? std::string("1") : value));
+    return result;
+  }
+  if (argument == "-fno-pack-struct") {
+    affecting("pack-struct=0");
     return result;
   }
   if (argument == "-fshort-wchar") {
     affecting("short-wchar=1");
+    return result;
+  }
+  if (argument == "-fno-short-wchar") {
+    affecting("short-wchar=0");
     return result;
   }
   if (argument == "-static") {
@@ -471,7 +504,7 @@ AbiArgument classify_abi_argument(std::string_view argument) {
     return result;
   }
   if (starts_with(argument, "-mabi=")) {
-    affecting(std::string(argument));
+    affecting("mabi=" + std::string(argument.substr(6)));
     return result;
   }
   if (argument == "-m32" || argument == "-m64" || argument == "-mx32") {
@@ -479,19 +512,23 @@ AbiArgument classify_abi_argument(std::string_view argument) {
     return result;
   }
   if (argument == "-msoft-float" || argument == "-mhard-float") {
-    affecting(std::string(argument));
+    affecting("float-model=" + std::string(argument.substr(2)));
     return result;
   }
   if (starts_with(argument, "-mfloat-abi=")) {
-    affecting(std::string(argument));
+    affecting("float-abi=" + std::string(argument.substr(12)));
     return result;
   }
   if (starts_with(argument, "-stdlib=")) {
     affecting("libcpp=" + std::string(argument.substr(8)));
     return result;
   }
-  if (starts_with(argument, "-fabi-version=") || starts_with(argument, "-fclang-abi-compat=")) {
-    affecting(std::string(argument));
+  if (starts_with(argument, "-fabi-version=")) {
+    affecting("fabi-version=" + std::string(argument.substr(14)));
+    return result;
+  }
+  if (starts_with(argument, "-fclang-abi-compat=")) {
+    affecting("fclang-abi-compat=" + std::string(argument.substr(19)));
     return result;
   }
   if (starts_with(argument, "-D")) {
