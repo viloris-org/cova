@@ -595,6 +595,11 @@ COVA_TEST_NAMED(build, planner_links_windows_print_through_libstdcxxexp) {
     saw_app_link = true;
     const auto exp = std::find(action->argv.begin(), action->argv.end(), "-lstdc++exp");
     COVA_CHECK_MSG(exp != action->argv.end(), action->label);
+    // GCC 16 emits the C++26 exception constructors in every object, and the
+    // static libstdc++ defines them too; the two cannot share a PE image.
+    const auto multiple =
+        std::find(action->argv.begin(), action->argv.end(), "-Wl,--allow-multiple-definition");
+    COVA_CHECK_MSG(multiple != action->argv.end(), action->label);
     // A static archive only resolves references from objects that precede it.
     const auto object = std::find_if(action->argv.begin(), action->argv.end(),
                                      [](const std::string& argument) {
@@ -604,6 +609,31 @@ COVA_TEST_NAMED(build, planner_links_windows_print_through_libstdcxxexp) {
     COVA_CHECK_MSG(object != action->argv.end() && object < exp, action->label);
   }
   COVA_CHECK(saw_app_link);
+}
+
+COVA_TEST_NAMED(build, planner_keeps_duplicate_definition_checks_for_clang) {
+  cova::test::TempDir temp;
+  auto fixture = make_path_dependency_fixture(temp.path());
+  cova::build::WorkspaceProject project;
+  project.members = {fixture.base, fixture.math, fixture.app};
+  project.roots = {"app"};
+
+  auto toolchain = dummy_toolchain("/usr/bin/x86_64-w64-mingw32-ar");
+  toolchain.descriptor.family = "clang";
+  cova::build::PlanOptions options;
+  options.target = COVA_REQUIRE_OK(cova::platform::Triple::parse("x86_64-pc-windows-gnu"));
+  options.profile = "dev";
+  auto plan = COVA_REQUIRE_OK(cova::build::plan_workspace(
+      project, toolchain, options, std::filesystem::path(temp.path()) / "target"));
+
+  for (const auto* action : plan.graph.actions_in_order()) {
+    if (action->kind != cova::build::ActionKind::Link) {
+      continue;
+    }
+    const auto multiple =
+        std::find(action->argv.begin(), action->argv.end(), "-Wl,--allow-multiple-definition");
+    COVA_CHECK_MSG(multiple == action->argv.end(), action->label);
+  }
 }
 
 COVA_TEST_MAIN()
