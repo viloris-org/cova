@@ -142,7 +142,7 @@ Result<bool> refresh_compile_closure(const build::Action& action,
   }
   auto result = proc::run(spec);
   if (!result || !result->success()) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     auto& mutable_action = const_cast<build::Action&>(action);
     mutable_action.input_closure_complete = false;
@@ -156,7 +156,7 @@ Result<bool> refresh_compile_closure(const build::Action& action,
     return fail<bool>(std::move(error));
   }
   auto parsed = build::Depfile::load(depfile, action.working_dir);
-  auto cleanup = fs::remove_tree(*scratch, *scratch);
+  auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
   (void)cleanup;
   if (!parsed) {
     auto& mutable_action = const_cast<build::Action&>(action);
@@ -417,10 +417,13 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
   auto try_cache_restore = [&](const build::Action& action) -> bool {
     // Sharing requires a hermetic environment and a complete input closure.
     if (!cache.enabled || !action.cacheable || !env.shared_cache_eligible ||
-        !action.input_closure_complete) {
+        !action.input_closure_complete || !action.input_identity_complete) {
       return false;
     }
     const std::string key = action.cache_key(env);
+    if (!action.input_identity_complete) {
+      return false;
+    }
     auto restored_ok = build::cache_restore(cache, action, key);
     if (restored_ok && *restored_ok) {
       ++restored;
@@ -435,14 +438,28 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
       return true;
     }
     // 2. The local incremental record says the outputs are current. An
-    //    untracked environment may not be reused across executions at all.
+    //    untracked environment or an incomplete input identity may not be
+    //    reused across executions at all.
+    if (!action.input_identity_complete) {
+      reason = "the input identity is incomplete";
+      return false;
+    }
     if (env.incremental_eligible && local_state.is_up_to_date(action, reason)) {
       return true;
+    }
+    if (env.incremental_eligible && local_state.inputs_match(action)) {
+      // The recorded closure is still exact; only the output is missing or
+      // stale. Reuse the recorded closure instead of paying for a scan.
+      reason = "inputs match the previous record; rebuilding the output";
+      return false;
     }
     // 3. Both checks missed. Before running the action, ask the provider for
     //    the real input closure, so a stale depfile or a newly included header
     //    cannot be missed. The refreshed inputs produce the final identity.
     if (action.kind == build::ActionKind::Compile && !dry_run) {
+      if (ctx.global.verbose) {
+        ctx.ui->verbose("dependency scan: " + action.label);
+      }
       std::string detail;
       auto refreshed = refresh_compile_closure(action, env, detail);
       if (!refreshed) {
@@ -450,6 +467,10 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
         return false;
       }
       if (*refreshed) {
+        if (!action.input_identity_complete) {
+          reason = "the input identity is incomplete";
+          return false;
+        }
         if (try_cache_restore(action)) {
           reason = "restored from cache after dependency discovery";
           return true;
@@ -536,6 +557,12 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
       continue;
     }
     build::Action key_action = *action;
+    if (!action->input_identity_complete) {
+      if (ctx.global.verbose) {
+        ctx.ui->verbose(action->label + ": incomplete input identity; not publishing");
+      }
+      continue;
+    }
     bool closure_verified = true;
     std::string stability_detail;
     if (!action->inputs_stable(&stability_detail)) {
@@ -606,6 +633,13 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
       continue;
     }
     record.cache_key = key_action.cache_key(env);
+    if (!key_action.input_identity_complete) {
+      if (ctx.global.verbose) {
+        ctx.ui->verbose(action->label +
+                        ": input identity became incomplete; not recording or publishing");
+      }
+      continue;
+    }
     record.toolchain_fingerprint = env.toolchain_fingerprint;
     record.sysroot_fingerprint = env.sysroot_fingerprint;
     record.completed_at_ns = static_cast<std::uint64_t>(
@@ -614,7 +648,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     record.duration_ms = static_cast<std::uint32_t>(outcome.duration.count());
     record.succeeded = true;
     if (!outcome.skipped && env.shared_cache_eligible && action->cacheable &&
-        key_action.input_closure_complete) {
+        key_action.input_closure_complete && key_action.input_identity_complete) {
       publications.emplace_back(std::move(key_action), record.cache_key);
     }
     local_state.record(std::move(record));

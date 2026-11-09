@@ -111,7 +111,7 @@ ActionOutcome Executor::run_action(const Action& action) {
   // action the planner marks shareable. The caller publishes under the final
   // (post-depfile) identity.
   outcome.share_eligible = action.cacheable && environment_.shared_cache_eligible &&
-                           action.input_closure_complete;
+                           action.input_closure_complete && action.input_identity_complete;
   return outcome;
 }
 

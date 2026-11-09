@@ -46,6 +46,10 @@ class BuildState {
   // A record is current when its key matches, all outputs exist, and every
   // recorded input still has the recorded content hash.
   bool is_up_to_date(const Action& action, std::string& reason) const;
+  // True when the recorded identity and every recorded input hash match the
+  // action, independent of whether its outputs still exist. Used to avoid a
+  // dependency scan when only an output needs rebuilding.
+  bool inputs_match(const Action& action) const;
 
   void record(ActionRecord record);
   std::size_t size() const { return records_.size(); }

@@ -198,6 +198,30 @@ bool BuildState::is_up_to_date(const Action& action, std::string& reason) const 
   return true;
 }
 
+bool BuildState::inputs_match(const Action& action) const {
+  if (action.computed_key.empty()) {
+    return false;
+  }
+  const ActionRecord* match = nullptr;
+  for (const auto& record : records_) {
+    if (record.cache_key == action.computed_key) {
+      match = &record;
+      break;
+    }
+  }
+  if (match == nullptr || !match->succeeded) {
+    return false;
+  }
+  FileHasher hasher;
+  for (const auto& [input, expected] : match->input_hashes) {
+    auto digest = hasher.hash_file(input);
+    if (!digest || cova::to_hex(*digest) != expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void BuildState::record(ActionRecord record) {
   if (!record.cache_key.empty()) {
     for (auto& existing : records_) {

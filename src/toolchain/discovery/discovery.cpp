@@ -297,6 +297,102 @@ Result<stdfs::path> query_default_sysroot(const stdfs::path& compiler_path) {
   return candidate;
 }
 
+Result<stdfs::path> query_program(const stdfs::path& compiler_path,
+                                   std::string_view query) {
+  proc::ProcessSpec spec;
+  spec.program = compiler_path;
+  spec.args = {std::string(query)};
+  spec.timeout = std::chrono::milliseconds(3000);
+  auto result = proc::run(spec);
+  if (!result || !result->success()) {
+    return fail<stdfs::path>(Error::make("cova::toolchain::subprogram",
+                                         "the compiler did not answer a subprogram query"));
+  }
+  for (const auto& line : str::split(result->stdout_text, '\n')) {
+    const std::string trimmed = str::trim(line);
+    if (!trimmed.empty()) {
+      return stdfs::path(trimmed);
+    }
+  }
+  return fail<stdfs::path>(Error::make("cova::toolchain::subprogram",
+                                       "the compiler reported no subprogram"));
+}
+
+stdfs::path resolve_reported_tool(const stdfs::path& compiler_directory,
+                                  stdfs::path reported) {
+  if (reported.empty()) {
+    return {};
+  }
+  if (reported.is_absolute()) {
+    return fs::is_regular_file(reported) ? reported : stdfs::path{};
+  }
+  if (reported.has_parent_path()) {
+    const stdfs::path relative_to_compiler = compiler_directory / reported;
+    if (fs::is_regular_file(relative_to_compiler)) {
+      return relative_to_compiler;
+    }
+    return fs::is_regular_file(reported) ? reported : stdfs::path{};
+  }
+  std::vector<stdfs::path> candidates{compiler_directory / reported};
+#ifdef _WIN32
+  if (reported.extension().empty()) {
+    candidates.push_back(compiler_directory / (reported.string() + ".exe"));
+  }
+#endif
+  for (const auto& candidate : candidates) {
+    if (fs::is_regular_file(candidate)) {
+      return candidate;
+    }
+  }
+  if (auto found = fs::find_in_path(reported.string())) {
+    return *found;
+  }
+  return {};
+}
+
+void add_subprogram_component(ToolchainDescriptor& descriptor, const stdfs::path& compiler_path,
+                              std::string role, std::string_view query) {
+  if (descriptor.component(role) != nullptr) {
+    return;
+  }
+  auto reported = query_program(compiler_path, query);
+  if (!reported) {
+    return;
+  }
+  const stdfs::path compiler_directory =
+      compiler_path.has_parent_path() ? compiler_path.parent_path() : stdfs::path(".");
+  const stdfs::path resolved = resolve_reported_tool(compiler_directory, *reported);
+  if (resolved.empty()) {
+    // GCC prints the literal name when it has no such file (for example
+    // `-print-file-name=specs` on clang); that is not a tool identity.
+    return;
+  }
+  ToolComponent component;
+  component.role = std::move(role);
+  component.path = fs::canonical_for_compare(resolved);
+  component.sha256 = Sha256::hex_of_file(component.path).value_or("");
+  descriptor.components.push_back(std::move(component));
+}
+
+// Driver subprograms are real inputs: replacing `as`, `ld`, `cc1plus`,
+// `collect2`, `lto-wrapper` or a specs file changes the produced artifact even
+// when the driver executable is byte-identical.
+void add_compiler_subprogram_components(ToolchainDescriptor& descriptor,
+                                        const stdfs::path& compiler_path) {
+  static constexpr std::pair<std::string_view, std::string_view> kQueries[] = {
+      {"cc1", "-print-prog-name=cc1"},
+      {"cc1plus", "-print-prog-name=cc1plus"},
+      {"assembler", "-print-prog-name=as"},
+      {"collect2", "-print-prog-name=collect2"},
+      {"lto-wrapper", "-print-prog-name=lto-wrapper"},
+      {"specs", "-print-file-name=specs"},
+  };
+  for (const auto& [role, query] : kQueries) {
+    add_subprogram_component(descriptor, compiler_path, std::string(role), query);
+  }
+  add_subprogram_component(descriptor, compiler_path, "linker", "-print-prog-name=ld");
+}
+
 std::vector<std::string> query_supported_targets(const stdfs::path& compiler_path) {
   proc::ProcessSpec spec;
   spec.program = compiler_path;
@@ -460,6 +556,17 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   descriptor.capabilities.debug_info = true;
   descriptor.content_hash = descriptor.compute_fingerprint();
   return descriptor;
+}
+
+void enrich_compiler_subprograms(ToolchainDescriptor& descriptor) {
+  stdfs::path compiler = descriptor.component_path("cxx");
+  if (compiler.empty()) {
+    compiler = descriptor.component_path("cc");
+  }
+  if (compiler.empty()) {
+    return;
+  }
+  add_compiler_subprogram_components(descriptor, compiler);
 }
 
 Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& options) {

@@ -145,6 +145,16 @@ bool contains(const std::string& haystack, std::string_view needle) {
   return haystack.find(needle) != std::string::npos;
 }
 
+std::size_t count_occurrences(const std::string& haystack, std::string_view needle) {
+  std::size_t count = 0;
+  std::size_t offset = 0;
+  while ((offset = haystack.find(needle, offset)) != std::string::npos) {
+    ++count;
+    offset += needle.size();
+  }
+  return count;
+}
+
 void make_executable(const stdfs::path& path) {
   std::error_code ec;
   stdfs::permissions(
@@ -498,6 +508,75 @@ COVA_TEST_NAMED(integration, changing_the_build_environment_invalidates_artifact
     COVA_CHECK_MSG(restored.ok(), restored.combined());
     COVA_CHECK_MSG(contains(restored.combined(), "one"), restored.combined());
   }
+}
+
+COVA_TEST_NAMED(integration, response_files_follow_compiler_nested_resolution) {
+  COVA_SKIP_UNLESS_CXX_DRIVER();
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path root = stdfs::path(temp.path()) / "rspapp";
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "rspapp"}).ok());
+  }
+  write_text(root / "rsp" / "main.rsp", "@nested.rsp\n");
+  write_text(root / "nested.rsp", "-DRSP_VALUE=1\n");
+  write_text(root / "rsp" / "nested.rsp", "-DRSP_VALUE=2\n");
+  write_text(root / "src" / "main.cpp",
+             "#include <cstdio>\n"
+             "#ifndef RSP_VALUE\n#define RSP_VALUE 0\n#endif\n"
+             "int main() { std::printf(\"rsp=%d\\n\", RSP_VALUE); return 0; }\n");
+  const std::string manifest = read_text(root / "cova.toml");
+  write_text(root / "cova.toml",
+             cova::str::replace_all(manifest, "[build]",
+                                    "[build]\ncompile-options = [\"@rsp/main.rsp\"]"));
+  ScopedCwd cwd(root);
+
+  auto first = run_cli({"run", "--verbose"});
+  COVA_CHECK_MSG(first.ok(), first.combined());
+  COVA_CHECK_MSG(contains(first.combined(), "rsp=1"), first.combined());
+
+  // GCC and Clang resolve the nested @file against the driver's cwd. Changing
+  // the file next to main.rsp must not invalidate the action.
+  write_text(root / "rsp" / "nested.rsp", "-DRSP_VALUE=3\n");
+  auto unused = run_cli({"run", "--verbose"});
+  COVA_CHECK_MSG(unused.ok(), unused.combined());
+  COVA_CHECK_MSG(contains(unused.combined(), "rsp=1"), unused.combined());
+  COVA_CHECK_MSG(contains(unused.combined(), "restored from cache") ||
+                     contains(unused.combined(), "up to date"),
+                 unused.combined());
+
+  // Changing the file the compiler actually read must rebuild.
+  write_text(root / "nested.rsp", "-DRSP_VALUE=4\n");
+  auto used = run_cli({"run", "--verbose"});
+  COVA_CHECK_MSG(used.ok(), used.combined());
+  COVA_CHECK_MSG(contains(used.combined(), "rsp=4"), used.combined());
+}
+
+COVA_TEST_NAMED(integration, dependency_scans_run_only_when_the_closure_is_unknown) {
+  COVA_SKIP_UNLESS_CXX_DRIVER();
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path root = stdfs::path(temp.path()) / "scanapp";
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "scanapp"}).ok());
+  }
+  write_text(root / "src" / "extra.cpp", "int extra_value() { return 1; }\n");
+  ScopedCwd cwd(root);
+
+  auto cold = run_cli({"build", "--verbose"});
+  COVA_CHECK_MSG(cold.ok(), cold.combined());
+  COVA_CHECK_EQ(count_occurrences(cold.combined(), "dependency scan:"), std::size_t{2});
+
+  auto hot = run_cli({"build", "--verbose"});
+  COVA_CHECK_MSG(hot.ok(), hot.combined());
+  COVA_CHECK_EQ(count_occurrences(hot.combined(), "dependency scan:"), std::size_t{0});
+
+  write_text(root / "src" / "extra.cpp", "int extra_value() { return 2; }\n");
+  auto changed = run_cli({"build", "--verbose"});
+  COVA_CHECK_MSG(changed.ok(), changed.combined());
+  COVA_CHECK_EQ(count_occurrences(changed.combined(), "dependency scan:"), std::size_t{1});
 }
 
 COVA_TEST_NAMED(integration, clean_removes_artifacts_but_keeps_sources) {

@@ -75,7 +75,7 @@ Status run_probe_command(const ToolchainDescriptor& descriptor, const ProbeOptio
   }
   auto write = fs::write_file(source, source_text);
   if (!write) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return write;
   }
@@ -94,13 +94,13 @@ Status run_probe_command(const ToolchainDescriptor& descriptor, const ProbeOptio
   apply_probe_environment(options, spec);
   auto result = proc::run(spec);
   if (!result) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return fail(result.error());
   }
   const bool success = result->success() && fs::is_regular_file(output);
   if (!options.keep_artifacts) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
   }
   if (!success) {
@@ -199,7 +199,7 @@ Status probe_static_library(const ToolchainDescriptor& descriptor, const ProbeOp
   const auto archive = *scratch / "libcova_probe.a";
   auto write = fs::write_file(source, "int cova_probe() { return 0; }\n");
   if (!write) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return write;
   }
@@ -216,7 +216,7 @@ Status probe_static_library(const ToolchainDescriptor& descriptor, const ProbeOp
   apply_probe_environment(options, compile_spec);
   auto compiled = proc::run(compile_spec);
   if (!compiled || !compiled->success()) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return fail(Error::make("cova::toolchain::probe_failed",
                             "the archive probe could not compile its input"));
@@ -224,7 +224,7 @@ Status probe_static_library(const ToolchainDescriptor& descriptor, const ProbeOp
 
   const auto archiver = descriptor.component_path("archiver");
   if (archiver.empty()) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return fail(Error::make("cova::toolchain::probe_failed",
                             "the toolchain has no archiver component"));
@@ -237,7 +237,7 @@ Status probe_static_library(const ToolchainDescriptor& descriptor, const ProbeOp
   apply_probe_environment(options, archive_spec);
   auto archived = proc::run(archive_spec);
   const bool success = archived && archived->success() && fs::is_regular_file(archive);
-  auto cleanup = fs::remove_tree(*scratch, *scratch);
+  auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
   (void)cleanup;
   if (!success) {
     return fail(Error::make("cova::toolchain::probe_failed",
@@ -263,7 +263,7 @@ Status probe_stdlib_headers(const ToolchainDescriptor& descriptor,
                               "#include <map>\n#include <memory>\n"
                               "int main() { std::vector<int> v; return v.size(); }\n");
   if (!write) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return write;
   }
@@ -278,7 +278,7 @@ Status probe_stdlib_headers(const ToolchainDescriptor& descriptor,
   apply_probe_environment(options, spec);
   auto result = proc::run(spec);
   const bool success = result && result->success() && fs::is_regular_file(object);
-  auto cleanup = fs::remove_tree(*scratch, *scratch);
+  auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
   (void)cleanup;
   if (!success) {
     return fail(Error::make("cova::toolchain::probe_failed",
@@ -319,7 +319,7 @@ int main() {
   const auto source = *scratch / "baseline.cpp";
   auto write = fs::write_file(source, source_text);
   if (!write) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return write;
   }
@@ -335,7 +335,7 @@ int main() {
   apply_probe_environment(options, spec);
   auto result = proc::run(spec);
   const bool success = result && result->success() && fs::is_regular_file(output);
-  auto cleanup = fs::remove_tree(*scratch, *scratch);
+  auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
   (void)cleanup;
   if (!success) {
     Error error = Error::make("cova::toolchain::probe_failed",
@@ -361,7 +361,7 @@ Result<std::map<std::string, std::string, std::less<>>> probe_abi_facts(
   auto write = fs::write_file(source,
                               "#include <cstddef>\n#include <string>\n#include <vector>\n");
   if (!write) {
-    auto cleanup = fs::remove_tree(*scratch, *scratch);
+    auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
     (void)cleanup;
     return fail<std::map<std::string, std::string, std::less<>>>(write.error());
   }
@@ -375,7 +375,7 @@ Result<std::map<std::string, std::string, std::less<>>> probe_abi_facts(
   spec.timeout = std::chrono::milliseconds(options.timeout_ms);
   apply_probe_environment(options, spec);
   auto result = proc::run(spec);
-  auto cleanup = fs::remove_tree(*scratch, *scratch);
+  auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
   (void)cleanup;
   if (!result) {
     return fail<std::map<std::string, std::string, std::less<>>>(result.error());
@@ -483,7 +483,7 @@ Result<ProbeReport> probe(const ToolchainDescriptor& descriptor, const ProbeOpti
                                                                 "preprocessing failed")),
                report.capabilities.preprocess, false);
       }
-      auto cleanup = fs::remove_tree(*scratch, *scratch);
+      auto cleanup = fs::remove_tree(*scratch, scratch->parent_path());
       (void)cleanup;
     }
   }

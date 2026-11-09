@@ -39,6 +39,14 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
 // tests and by `--toolchain <path>`.
 Result<ToolchainDescriptor> describe_compiler(const std::filesystem::path& compiler_path,
                                               ToolchainSource source);
+// Adds hashed driver subprograms (cc1/cc1plus/as/collect2/lto-wrapper/specs and
+// a linker fallback) to a descriptor. Call this for the selected toolchain only:
+// querying every discovery candidate is unnecessarily expensive. The
+// descriptor's `content_hash` is deliberately left unchanged so lockfiles keep
+// their existing identity; `compute_fingerprint()` (used by the build cache key)
+// includes the added components.
+void enrich_compiler_subprograms(ToolchainDescriptor& descriptor);
+
 
 // Parses `clang version 23.1.4 (...)` / `g++ (GCC) 16.2.1 20260810`.
 // Returns nullopt when the banner is not recognised.
