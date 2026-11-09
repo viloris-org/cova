@@ -556,6 +556,10 @@ ResolutionReport resolve(const ResolutionRequest& request) {
 
     ResolvedToolchain resolved;
     resolved.descriptor = probed;
+    // The build cache key must cover the driver's subprograms, but lockfiles
+    // keep the descriptor's original content hash. Enrich only the selected
+    // candidate instead of every discovery candidate.
+    enrich_compiler_subprograms(resolved.descriptor);
     resolved.target = request.target;
     resolved.abi_signature = make_abi_signature(probed, request.target);
     if (!abi_facts.empty()) {

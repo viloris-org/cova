@@ -2,6 +2,11 @@
 #include <algorithm>
 #include <string>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "build/cache/cache.hpp"
 #include "build/graph/graph.hpp"
 #include "build/planner.hpp"
@@ -778,6 +783,148 @@ succeeded = true
                  .has_value());
   auto state = COVA_REQUIRE_OK(cova::build::BuildState::load(path));
   COVA_CHECK_EQ(state.size(), std::size_t{0});
+}
+
+COVA_TEST_NAMED(build, action_identity_resolves_nested_response_files_against_cwd) {
+  cova::test::TempDir temp;
+  const std::filesystem::path root(temp.path());
+  COVA_CHECK(cova::fs::create_directories(root / "rsp").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "rsp" / "main.rsp", "@nested.rsp\n").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "nested.rsp", "-DVALUE=1\n").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "rsp" / "nested.rsp", "-DVALUE=2\n").has_value());
+
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.working_dir = root;
+  action.argv = {"cc", "@rsp/main.rsp", "-c", "unit.cpp"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+
+  // GCC and Clang resolve nested @-files relative to the driver's cwd, not the
+  // containing response file. The unused `rsp/nested.rsp` must not affect the
+  // identity; the cwd file must.
+  COVA_CHECK(cova::fs::write_file(root / "rsp" / "nested.rsp", "-DVALUE=20\n").has_value());
+  COVA_CHECK_EQ(first, action.cache_key(environment));
+  COVA_CHECK(cova::fs::write_file(root / "nested.rsp", "-DVALUE=10\n").has_value());
+  COVA_CHECK(first != action.cache_key(environment));
+
+  // Multi-level nesting is followed as well.
+  COVA_CHECK(cova::fs::write_file(root / "rsp" / "main.rsp", "@mid.rsp\n").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "mid.rsp", "@deep.rsp\n").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "deep.rsp", "-DVALUE=3\n").has_value());
+  const std::string multi = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(root / "deep.rsp", "-DVALUE=4\n").has_value());
+  COVA_CHECK(multi != action.cache_key(environment));
+
+  // Backslash-escaped spaces are part of GCC's response-file syntax.
+  COVA_CHECK(cova::fs::write_file(root / "rsp" / "main.rsp", "@spaced\\ file.rsp\n")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(root / "spaced file.rsp", "-DVALUE=5\n").has_value());
+  const std::string spaced = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(root / "spaced file.rsp", "-DVALUE=6\n").has_value());
+  COVA_CHECK(spaced != action.cache_key(environment));
+}
+
+COVA_TEST_NAMED(build, action_identity_tracks_linker_response_files) {
+  cova::test::TempDir temp;
+  const std::filesystem::path root(temp.path());
+  COVA_CHECK(cova::fs::write_file(root / "link.rsp", "@nested.rsp\n").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "nested.rsp", "--as-needed\n").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Link;
+  action.working_dir = root;
+  action.argv = {"cc", "-Wl,@link.rsp", "-o", "program"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(root / "nested.rsp", "--no-as-needed\n").has_value());
+  COVA_CHECK(first != action.cache_key(environment));
+}
+
+COVA_TEST_NAMED(build, action_identity_detects_response_file_cycles) {
+  cova::test::TempDir temp;
+  const std::filesystem::path root(temp.path());
+  COVA_CHECK(cova::fs::write_file(root / "a.rsp", "@b.rsp\n").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "b.rsp", "@a.rsp\n").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.working_dir = root;
+  action.argv = {"cc", "@a.rsp", "-c", "unit.cpp"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+  const std::string second = action.cache_key(environment);
+  COVA_CHECK_EQ(first, second);
+  COVA_CHECK(!action.input_identity_complete);
+}
+
+COVA_TEST_NAMED(build, action_identity_tracks_plugin_and_specs_files) {
+  cova::test::TempDir temp;
+  const std::filesystem::path root(temp.path());
+  const auto plugin = root / "plugin.so";
+  const auto specs = root / "cova.specs";
+  COVA_CHECK(cova::fs::write_file(plugin, "plugin-one").has_value());
+  COVA_CHECK(cova::fs::write_file(specs, "specs-one").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.working_dir = root;
+  action.argv = {"cc", "-fplugin=" + plugin.string(), "-specs=" + specs.string(), "-c",
+                 "unit.cpp"};
+  auto environment = host_environment();
+  const std::string first = action.cache_key(environment);
+  COVA_CHECK(cova::fs::write_file(plugin, "plugin-two").has_value());
+  COVA_CHECK(first != action.cache_key(environment));
+  COVA_CHECK(cova::fs::write_file(specs, "specs-two").has_value());
+  COVA_CHECK(first != action.cache_key(environment));
+}
+
+#ifndef _WIN32
+COVA_TEST_NAMED(build, unreadable_include_directory_makes_identity_incomplete) {
+  if (::geteuid() == 0) {
+    return;  // root can read a 0000 directory, so the case is not reproducible.
+  }
+  cova::test::TempDir temp;
+  const std::filesystem::path include = std::filesystem::path(temp.path()) / "include";
+  COVA_CHECK(cova::fs::create_directories(include).has_value());
+  COVA_CHECK(cova::fs::write_file(include / "a.hpp", "#pragma once\n").has_value());
+  COVA_CHECK(::chmod(include.c_str(), 0) == 0);
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.argv = {"cc", "-I" + include.string(), "-c", "unit.cpp"};
+  action.cache_key(host_environment());
+  const bool incomplete = !action.input_identity_complete;
+  COVA_CHECK(::chmod(include.c_str(), 0700) == 0);
+  COVA_CHECK(incomplete);
+}
+#endif
+
+COVA_TEST_NAMED(build, state_inputs_match_is_independent_of_output_presence) {
+  cova::test::TempDir temp;
+  const auto input = std::filesystem::path(temp.path()) / "input.cpp";
+  const auto output = std::filesystem::path(temp.path()) / "out.o";
+  COVA_CHECK(cova::fs::write_file(input, "int a = 1;\n").has_value());
+  cova::build::Action action;
+  action.kind = cova::build::ActionKind::Compile;
+  action.argv = {"cc", "-c", cova::fs::generic_string(input), "-o",
+                 cova::fs::generic_string(output)};
+  action.inputs.push_back(cova::build::FileInput{input, "source"});
+  action.outputs.push_back(cova::build::FileOutput{output, true});
+  auto environment = host_environment();
+  const std::string key = action.cache_key(environment);
+
+  cova::build::ActionRecord record;
+  record.cache_key = key;
+  record.output_paths.push_back(cova::fs::generic_string(output));
+  record.input_hashes.emplace_back(
+      cova::fs::generic_string(input),
+      cova::to_hex(*cova::build::FileHasher{}.hash_file(input)));
+  record.succeeded = true;
+  cova::build::BuildState state;
+  state.record(std::move(record));
+
+  COVA_CHECK(state.inputs_match(action));
+  std::string reason;
+  COVA_CHECK(!state.is_up_to_date(action, reason));
+  COVA_CHECK(cova::fs::write_file(output, "object\n").has_value());
+  COVA_CHECK(state.is_up_to_date(action, reason));
 }
 
 COVA_TEST_MAIN()

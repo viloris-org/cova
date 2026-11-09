@@ -115,6 +115,10 @@ struct Action {
   bool input_closure_complete = false;
   // Set by the executor before the incremental check; not part of planning.
   mutable std::string computed_key;
+  // False when an identity input could not be enumerated/read completely
+  // (for example an unreadable include directory). Such an action must not be
+  // reused from the cache or from incremental state.
+  mutable bool input_identity_complete = true;
   // Content hashes captured by the last cache_key computation, used to detect
   // inputs changed by another process between discovery and execution.
   mutable std::vector<std::pair<std::string, std::string>> computed_input_hashes;

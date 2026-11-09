@@ -71,10 +71,19 @@ key covers:
 * output paths and primary flags.
 
 Response files are hashed as real inputs: content, order and nested files all
-participate. A missing response file is a distinct identity, so its later
-appearance changes the key. Path normalisation beyond the raw representation is
-intentionally not performed: without a provider-specific proof of equivalence,
-the original representation is preserved.
+participate. Nested `@file` paths are resolved against the driver's working
+directory, which is what GCC (libiberty `expandargv`) and Clang actually do;
+resolving them against the containing response file would hash the wrong file.
+A missing response file is a distinct identity, so its later appearance changes
+the key. Recursive `@file` cycles are detected, recorded and marked incomplete;
+both GCC and Clang reject them, so no artifact is published. Linker/assembler
+response files passed through `-Wl,`, `-Wa,` or `-Wp,` are expanded too, and
+plugin, specs, linker-script and symbol files named on the command line are
+content-hashed because the driver or its subprograms read them separately.
+
+Path normalisation beyond the raw representation is intentionally not
+performed: without a provider-specific proof of equivalence, the original
+representation is preserved.
 
 `BuildState` and the artifact cache carry their own schema versions
 (`cova.build-state/2`, `cova.artifact-cache/2`). An older state file is ignored;
@@ -156,15 +165,28 @@ After execution:
 
 Include-directory listings and symlink targets are part of the identity, so a
 new higher-priority same-name header, a renamed/deleted header or a changed
-symlink target changes the key even before a scan. A missing or corrupt depfile
-causes a fresh scan; it cannot cause a false hit. Actions with an unproven
-closure may run, but they are not marked hermetic and cannot enter shared
-caches.
+symlink target changes the key even before a scan. A missing include directory
+is complete evidence (its listing is empty) and a later appearance changes the
+key. An enumeration error (unreadable directory, I/O failure) is **not**
+treated as a partial listing: the identity is marked incomplete, the action may
+run, but no cache or incremental record is reused or published. A missing or
+corrupt depfile causes a fresh scan; it cannot cause a false hit. Actions with an
+unproven closure may run, but they are not marked hermetic and cannot enter
+shared caches.
 
-Remaining limitation: there is no scan-result cache; each action that misses
-reuse pays for one preprocessing run. Inputs are not snapshotted, so the
-post-execution hash re-check is a detection mechanism, not a filesystem
-transaction.
+A dependency scan is only paid when the closure is genuinely unknown. A hot
+build is answered by the recorded identity and state. If the recorded identity
+and all input hashes still match but only an output is missing, the previous
+closure is reused without a scan (`BuildState::inputs_match`). A change to one
+translation unit scans only that unit. A cold build has no previous closure and
+therefore scans every compile action before its first execution; that is the
+price of proving the closure before publishing, and it is the main remaining
+performance cost. The verbose log reports each `dependency scan:` so the cost is
+visible.
+
+Remaining limitation: there is no persistent scan-result cache and inputs are
+not snapshotted; the post-execution hash re-check is a detection mechanism, not
+a filesystem transaction.
 
 ## 6. Execution and artifact publication (FR-14 baseline)
 
@@ -208,8 +230,15 @@ is a miss. `cova build` reports "restored from cache" separately from
 * Layered ABI evidence (Layer B per compile action, Layer C artifact evidence)
   and exported-interface inspection. The model and scopes exist; only toolchain
   baseline evidence is produced today.
-* Full compiler-subprogram identity (cc1/as/ld/specs/plugins) beyond the
-  descriptor's hashed components and resource directory.
+* Full compiler-subprogram identity is improved for the selected toolchain:
+  `cc1`, `cc1plus`, the assembler, `collect2`, `lto-wrapper`, `specs` and a
+  linker fallback are queried and content-hashed into the build fingerprint.
+  The descriptor's lockfile `content_hash` is deliberately unchanged, so
+  existing lockfiles remain valid; build keys use `compute_fingerprint()`, which
+  includes the enriched components. Plugins, specs, linker scripts and symbol
+  files named on the action command line are hashed into the action identity.
+  Toolchain-supplied plugins discovered outside the command line remain a
+  follow-up.
 * A scan-result cache and filesystem snapshots/overlay to close the
   discovery-to-execution TOCTOU window rather than only detect it.
 * Windows MSVC probing (the current probe matrix is GCC/Clang oriented) and

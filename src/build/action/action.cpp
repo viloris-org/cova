@@ -2,6 +2,7 @@
 #include "build/action/action.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <set>
 #include <string>
 #include <system_error>
@@ -17,47 +18,190 @@ namespace {
 
 constexpr int kMaxResponseFileDepth = 8;
 
-void add_response_file_identity(Fingerprint& fingerprint, const std::string& argument,
-                                const Path& working_dir, int depth);
+struct ResponseContext {
+  Fingerprint& fingerprint;
+  Path working_dir;
+  std::set<std::string> active;
+  int depth = 0;
+  bool identity_complete = true;
+};
 
-void add_argument_identity(Fingerprint& fingerprint, const std::string& argument,
-                           const Path& working_dir, int depth) {
-  fingerprint.add(argument);
-  if (argument.size() < 2 || argument.front() != '@') {
-    return;
+Path resolve_relative(Path path, const Path& working_dir) {
+  if (path.is_relative() && !working_dir.empty()) {
+    path = working_dir / path;
   }
-  Path response = Path(argument.substr(1));
-  if (response.is_relative()) {
-    response = working_dir.empty() ? response : working_dir / response;
-  }
-  auto contents = fs::read_file(response);
-  if (!contents) {
-    fingerprint.add("response-file-missing");
-    fingerprint.add(fs::generic_string(response));
-    return;
-  }
-  fingerprint.add("response-file");
-  // Hash the raw bytes: this captures ordering, quoting, escaping and encoding
-  // changes even when a higher-level reader would normalise them.
-  fingerprint.add(*contents);
-  add_response_file_identity(fingerprint, fs::generic_string(response), working_dir, depth + 1);
+  return path;
 }
 
-void add_response_file_identity(Fingerprint& fingerprint, const std::string& path,
-                                const Path& working_dir, int depth) {
-  if (depth > kMaxResponseFileDepth) {
-    fingerprint.add("response-file-depth-limit");
+// Files the driver or its subprograms read but that are not expressed as a
+// normal argv input: plugins, linker scripts, specs and symbol files. Their
+// contents decide the artifact just like an object file does.
+void add_auxiliary_file_identity(ResponseContext& context, const Path& file,
+                                 std::string_view role) {
+  const Path resolved = resolve_relative(file, context.working_dir);
+  context.fingerprint.add(role);
+  context.fingerprint.add(fs::generic_string(resolved));
+  auto digest = Sha256::hex_of_file(resolved);
+  if (digest) {
+    context.fingerprint.add(*digest);
+  } else {
+    context.fingerprint.add("missing");
+    if (fs::is_regular_file(resolved)) {
+      // The file exists but cannot be read: the identity is not proven.
+      context.identity_complete = false;
+    }
+  }
+}
+
+// GCC's response-file reader splits on whitespace, strips single/double quotes
+// and honours backslash escapes in and outside quotes. Using the generic
+// command-line splitter here would mis-resolve a nested `@spaced\ file.rsp`.
+std::vector<std::string> split_response_tokens(std::string_view text) {
+  std::vector<std::string> tokens;
+  std::string current;
+  bool has_token = false;
+  bool in_single = false;
+  bool in_double = false;
+  for (std::size_t index = 0; index < text.size(); ++index) {
+    const char character = text[index];
+    if (in_single) {
+      if (character == '\'') {
+        in_single = false;
+      } else {
+        current.push_back(character);
+        has_token = true;
+      }
+      continue;
+    }
+    if (in_double) {
+      if (character == '\\' && index + 1 < text.size()) {
+        current.push_back(text[++index]);
+        has_token = true;
+      } else if (character == '"') {
+        in_double = false;
+      } else {
+        current.push_back(character);
+        has_token = true;
+      }
+      continue;
+    }
+    if (character == '\\' && index + 1 < text.size()) {
+      current.push_back(text[++index]);
+      has_token = true;
+      continue;
+    }
+    if (character == '\'') {
+      in_single = true;
+      has_token = true;
+      continue;
+    }
+    if (character == '"') {
+      in_double = true;
+      has_token = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(character)) != 0) {
+      if (has_token) {
+        tokens.push_back(current);
+        current.clear();
+        has_token = false;
+      }
+      continue;
+    }
+    current.push_back(character);
+    has_token = true;
+  }
+  if (has_token) {
+    tokens.push_back(current);
+  }
+  return tokens;
+}
+
+void add_response_file_identity(ResponseContext& context, const Path& file) {
+  if (context.depth > kMaxResponseFileDepth) {
+    context.fingerprint.add("response-file-depth-limit");
+    context.fingerprint.add(fs::generic_string(file));
+    context.identity_complete = false;
     return;
   }
-  auto contents = fs::read_file(Path(path));
+  const Path resolved = resolve_relative(file, context.working_dir);
+  const std::string key = fs::generic_string(fs::canonical_for_compare(resolved));
+  if (context.active.find(key) != context.active.end()) {
+    // GCC and Clang both reject recursive @-file expansion. Record the cycle
+    // deterministically and refuse reuse rather than recursing forever.
+    context.fingerprint.add("response-file-cycle");
+    context.fingerprint.add(key);
+    context.identity_complete = false;
+    return;
+  }
+  auto contents = fs::read_file(resolved);
+  context.fingerprint.add("response-file");
+  context.fingerprint.add(key);
   if (!contents) {
+    context.fingerprint.add("response-file-missing");
     return;
   }
-  // Nested response files are part of the real input closure. The compiler
-  // expands them, so the identity must follow them too.
-  for (const auto& token : str::split_whitespace_quoted(*contents)) {
+  // Hash the raw bytes: this captures ordering, quoting, escaping and encoding
+  // changes even when a higher-level reader would normalise them.
+  context.fingerprint.add(*contents);
+  context.active.insert(key);
+  ++context.depth;
+  for (const auto& token : split_response_tokens(*contents)) {
     if (token.size() > 1 && token.front() == '@') {
-      add_argument_identity(fingerprint, token, working_dir, depth);
+      add_response_file_identity(context, Path(token.substr(1)));
+    }
+  }
+  --context.depth;
+  context.active.erase(key);
+}
+
+void add_comma_separated_identity(ResponseContext& context, std::string_view rest,
+                                  std::string_view role) {
+  const auto parts = str::split(rest, ',');
+  for (std::size_t index = 0; index < parts.size(); ++index) {
+    const std::string& part = parts[index];
+    if (part.size() > 1 && part.front() == '@') {
+      add_response_file_identity(context, Path(part.substr(1)));
+      continue;
+    }
+    for (const std::string_view prefix : {"--script=", "--version-script=",
+                                          "--dynamic-list=", "--retain-symbols-file=",
+                                          "--just-symbols="}) {
+      if (part.size() > prefix.size() && part.substr(0, prefix.size()) == prefix) {
+        add_auxiliary_file_identity(context, Path(part.substr(prefix.size())), role);
+      }
+    }
+    if ((part == "-T" || part == "-R" || part == "--script" || part == "--version-script" ||
+         part == "--dynamic-list" || part == "--retain-symbols-file" ||
+         part == "--just-symbols" || part == "-plugin") &&
+        index + 1 < parts.size()) {
+      add_auxiliary_file_identity(context, Path(parts[++index]), role);
+    }
+    if (part.rfind("-plugin=", 0) == 0 && part.size() > 8) {
+      add_auxiliary_file_identity(context, Path(part.substr(8)), role);
+    }
+  }
+}
+
+void add_argument_identity(ResponseContext& context, const std::string& argument) {
+  context.fingerprint.add(argument);
+  if (argument.size() > 1 && argument.front() == '@') {
+    add_response_file_identity(context, Path(argument.substr(1)));
+    return;
+  }
+  for (const std::string_view prefix : {"-Wl,", "-Wa,", "-Wp,"}) {
+    if (argument.size() > prefix.size() && argument.substr(0, prefix.size()) == prefix) {
+      add_comma_separated_identity(context, std::string_view(argument).substr(prefix.size()),
+                                   prefix == "-Wl," ? "linker-input" : "tool-input");
+      return;
+    }
+  }
+  for (const std::string_view prefix : {"-fplugin=", "-specs=", "--specs=", "--script=",
+                                        "--version-script=", "--dynamic-list=",
+                                        "--retain-symbols-file=", "--just-symbols="}) {
+    if (argument.size() > prefix.size() && argument.substr(0, prefix.size()) == prefix) {
+      add_auxiliary_file_identity(context, Path(argument.substr(prefix.size())), "driver-input");
+      return;
     }
   }
 }
@@ -83,42 +227,73 @@ std::string directory_entry_kind(const stdfs::directory_entry& entry) {
 // Adding, removing or renaming an entry in an include directory changes which
 // header a `#include <name>` resolves to. Hashing the directory listing makes
 // that change visible even before the depfile is regenerated.
-void add_directory_identity(Fingerprint& fingerprint, std::string_view text,
+bool add_directory_identity(Fingerprint& fingerprint, std::string_view text,
                             std::set<std::string>& seen) {
   const Path directory(text);
   const std::string key = fs::generic_string(directory);
   if (!seen.insert(key).second) {
-    return;
+    return true;
   }
   fingerprint.add(key);
   std::error_code ec;
-  if (!stdfs::is_directory(directory, ec)) {
+  const bool is_directory = stdfs::is_directory(directory, ec);
+  if (ec) {
+    // The directory status could not be established (for example a permission
+    // error on a parent). This is not equivalent to a missing directory.
+    fingerprint.add("directory-check-incomplete");
+    return false;
+  }
+  if (!is_directory) {
+    // A missing include directory is complete evidence: its listing is empty.
+    // If the directory appears later, the key changes.
     fingerprint.add("directory-missing");
-    return;
+    return true;
   }
   std::vector<std::string> entries;
-  for (auto it = stdfs::directory_iterator(directory, ec);
-       it != stdfs::directory_iterator(); it.increment(ec)) {
-    if (ec) {
-      break;
-    }
+  bool complete = true;
+  stdfs::directory_iterator it(directory, ec);
+  if (ec) {
+    complete = false;
+  }
+  const stdfs::directory_iterator end;
+  while (!ec && it != end) {
     const std::string name = it->path().filename().string();
+    const std::string kind = directory_entry_kind(*it);
+    if (kind == "?") {
+      // An entry whose type cannot be established makes the listing partial.
+      complete = false;
+    }
     std::string line = name;
     line.push_back('\t');
-    line += directory_entry_kind(*it);
-    if (stdfs::is_symlink(it->path(), ec)) {
-      std::error_code link_error;
-      const Path target = stdfs::read_symlink(it->path(), link_error);
+    line += kind;
+    std::error_code link_error;
+    if (stdfs::is_symlink(it->path(), link_error)) {
+      if (link_error) {
+        complete = false;
+      }
+      std::error_code target_error;
+      const Path target = stdfs::read_symlink(it->path(), target_error);
       line += "\t->";
-      line += link_error ? std::string("<unreadable>") : fs::generic_string(target);
+      line += target_error ? std::string("<unreadable>") : fs::generic_string(target);
+      if (target_error) {
+        complete = false;
+      }
     }
     entries.push_back(std::move(line));
+    it.increment(ec);
+  }
+  if (ec) {
+    // A partial listing is not a proof of the input closure. Keep the entries
+    // for diagnostics, but mark the identity incomplete so nothing is reused.
+    complete = false;
+    fingerprint.add("directory-enumeration-incomplete");
   }
   std::sort(entries.begin(), entries.end());
   fingerprint.add("directory-listing");
   for (const auto& entry : entries) {
     fingerprint.add(entry);
   }
+  return complete;
 }
 
 
@@ -228,8 +403,20 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
   fingerprint.add(std::string(to_string(env.isolation)));
   fingerprint.add(env.explicit_environment ? "environment=explicit" : "environment=inherited");
 
-  for (const auto& argument : argv) {
-    add_argument_identity(fingerprint, argument, working_dir, 0);
+  input_identity_complete = true;
+  ResponseContext response_context{fingerprint, working_dir, {}, 0, true};
+  for (std::size_t index = 0; index < argv.size(); ++index) {
+    add_argument_identity(response_context, argv[index]);
+    if ((argv[index] == "-T" || argv[index] == "-specs" || argv[index] == "--specs") &&
+        index + 1 < argv.size()) {
+      add_auxiliary_file_identity(response_context, Path(argv[index + 1]), "driver-input");
+    }
+    if (argv[index] == "-Xclang" && index + 2 < argv.size() && argv[index + 1] == "-load") {
+      add_auxiliary_file_identity(response_context, Path(argv[index + 2]), "plugin");
+    }
+  }
+  if (!response_context.identity_complete) {
+    input_identity_complete = false;
   }
   // The executable itself is an input. A bare command name is resolved by the
   // toolchain identity (which hashes every component); an explicit path is
@@ -296,9 +483,12 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
   if (kind == ActionKind::Compile) {
     std::set<std::string> seen;
     for (const auto& directory : include_directories(*this, env)) {
-      add_directory_identity(fingerprint, directory, seen);
+      if (!add_directory_identity(fingerprint, directory, seen)) {
+        input_identity_complete = false;
+      }
     }
   }
+  fingerprint.add(input_identity_complete ? "identity=complete" : "identity=incomplete");
 
   std::string key = fingerprint.finish_hex();
   computed_key = key;
@@ -306,6 +496,12 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
 }
 
 bool Action::inputs_stable(std::string* detail) const {
+  if (!input_identity_complete) {
+    if (detail != nullptr) {
+      *detail = "the input identity is incomplete";
+    }
+    return false;
+  }
   FileHasher hasher;
   for (const auto& [path, expected] : computed_input_hashes) {
     auto digest = hasher.hash_file(Path(path));

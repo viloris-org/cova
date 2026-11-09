@@ -360,4 +360,30 @@ COVA_TEST_NAMED(toolchain, abi_probe_extracts_core_macros) {
   }
 }
 
+COVA_TEST_NAMED(toolchain, descriptor_fingerprint_covers_compiler_subprograms) {
+  auto discovered = COVA_REQUIRE_OK(cova::toolchain::discover({}));
+  if (discovered.empty()) {
+    return;
+  }
+  bool found_subprogram = false;
+  auto descriptor = discovered.front();
+  cova::toolchain::enrich_compiler_subprograms(descriptor);
+  for (const std::string_view role :
+       {"cc1", "cc1plus", "assembler", "collect2", "lto-wrapper", "specs"}) {
+    const auto* component = descriptor.component(role);
+    if (component == nullptr) {
+      continue;
+    }
+    found_subprogram = true;
+    COVA_CHECK_MSG(!component->sha256.empty(), std::string(role));
+    COVA_CHECK_MSG(!component->path.empty(), std::string(role));
+  }
+  const bool gcc_or_clang = descriptor.family.find("gcc") != std::string::npos ||
+                            descriptor.family.find("clang") != std::string::npos;
+  if (gcc_or_clang) {
+    COVA_CHECK_MSG(found_subprogram,
+                   "the GCC/Clang descriptor recorded no compiler subprogram");
+  }
+}
+
 COVA_TEST_MAIN()
