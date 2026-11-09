@@ -115,7 +115,9 @@ COVA_TEST_NAMED(sysroot, registry_installs_verified_archive) {
   auto tar = cova::proc::run_line(
       "tar -czf " + quote_shell(cova::fs::generic_string(archive)) + " -C " +
       quote_shell(cova::fs::generic_string(base / "stage")) + " aarch64-linux-musl");
-  COVA_CHECK_MSG(tar.has_value() && tar->success(), "could not create the test archive");
+  COVA_CHECK_MSG(tar.has_value() && tar->success(),
+                 "could not create the test archive: " +
+                     (tar ? tar->stderr_trimmed() : std::string("tar did not start")));
 
   const std::string digest = *cova::Sha256::hex_of_file(archive);
   const std::string index = "[[sysroot]]\n"

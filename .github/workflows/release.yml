@@ -219,6 +219,8 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
+            gzip
+            tar
             zip
 
       - name: Build

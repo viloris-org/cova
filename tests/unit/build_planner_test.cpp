@@ -409,10 +409,12 @@ COVA_TEST_NAMED(build, planner_propagates_public_interfaces_and_link_order) {
   COVA_CHECK(base_position > math_position);
 
   COVA_CHECK(plan.runnable_binary.has_value());
-  COVA_CHECK_EQ(plan.runnable_binary->filename().string(), std::string("app"));
+  const std::string executable =
+      std::string("app") + cova::platform::host_triple().executable_suffix();
+  COVA_CHECK_EQ(plan.runnable_binary->filename().string(), executable);
   // Only the root contributes reported artifacts.
   COVA_CHECK_EQ(plan.expected_outputs.size(), std::size_t{1});
-  COVA_CHECK(plan.expected_outputs.front().filename() == "app");
+  COVA_CHECK(plan.expected_outputs.front().filename() == executable);
 }
 
 COVA_TEST_NAMED(build, dev_dependencies_are_only_wired_for_test_plans) {

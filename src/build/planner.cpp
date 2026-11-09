@@ -194,6 +194,16 @@ std::string shared_library_suffix(const platform::Triple& target) {
   return ".so";
 }
 
+// MinGW's shared libstdc++ does not export the `<print>` terminal helpers, so
+// a Windows GNU link has to use the static C++ runtime.
+void append_windows_static_runtime(std::vector<std::string>& argv,
+                                   const platform::Triple& target) {
+  if (target.os == platform::Os::Windows && target.env == platform::Env::Gnu) {
+    argv.push_back("-static-libstdc++");
+    argv.push_back("-static-libgcc");
+  }
+}
+
 std::string compiler_program(const toolchain::ResolvedToolchain& toolchain, bool c_source) {
   const auto role = c_source ? "cc" : "cxx";
   const auto path = toolchain.descriptor.component_path(role);
@@ -380,6 +390,7 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
     } else {
       argv.push_back(compiler_program(toolchain, false));
       append(argv, target_flags(toolchain, options.target));
+      append_windows_static_runtime(argv, options.target);
       if (manifest.build.kind == manifest::PackageKind::SharedLibrary) {
         argv.push_back("-shared");
         argv.push_back("-fPIC");
@@ -465,10 +476,12 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       const ActionId test_compile = add_compile_action(result.graph, manifest, toolchain, options,
                                                        output_root, source, package_label,
                                                        test_object);
-      const fs::Path binary = fs::Path(output_root) / "bin" / source.stem();
+      const fs::Path binary = fs::Path(output_root) / "bin" /
+                              (source.stem().string() + options.target.executable_suffix());
       std::vector<std::string> argv;
       argv.push_back(compiler_program(toolchain, false));
       append(argv, target_flags(toolchain, options.target));
+      append_windows_static_runtime(argv, options.target);
       append(argv, manifest.profile(options.profile).ld_flags());
       argv.push_back(fs::generic_string(test_object));
       for (const auto& object : objects) {
