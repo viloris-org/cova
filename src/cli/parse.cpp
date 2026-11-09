@@ -15,7 +15,7 @@
 namespace cova::cli {
 namespace {
 
-constexpr std::string_view kVersionString = "0.1.0-beta-1";
+constexpr std::string_view kVersionString = "0.1.0-beta-2";
 
 struct OptionSpec {
   std::string_view name;
