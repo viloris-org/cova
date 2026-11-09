@@ -255,8 +255,10 @@ jobs:
       - name: Install WiX
         shell: pwsh
         run: |
-          dotnet tool install --global wix --version 5.0.2
-          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $wixDir = Join-Path $env:RUNNER_TEMP "wix"
+          dotnet tool install --tool-path $wixDir wix --version 5.0.2
+          "COVA_WIX_DIR=$wixDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & (Join-Path $wixDir "wix.exe") --version
 
       - name: Build
         env:
@@ -291,6 +293,9 @@ jobs:
 
       - name: Build MSI
         run: |
+          # The MSYS2 shell does not inherit the Windows PATH, so add the
+          # directory chosen by the WiX install step explicitly.
+          export PATH="$(cygpath -u "$COVA_WIX_DIR"):$PATH"
           wix --version
           bash scripts/package/build-msi.sh
 
