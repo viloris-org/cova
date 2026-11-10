@@ -90,7 +90,9 @@ published as a `.zip`.
 
 Windows/MSVC, WASI, Android NDK, CMake adaptation, remote execution/ caching,
 C++ modules and registry publishing are not implemented. Their PRD sections are
-planning material, not current promises.
+planning material, not current promises. Projects using CMake, Meson, Make or
+Bazel migrate by rewriting their build description; [MIGRATING.md](MIGRATING.md)
+documents the supported mapping, the gaps and a verification workflow.
 
 ## Verification commands
 

@@ -341,6 +341,7 @@ COVA_TEST_NAMED(integration, init_preserves_existing_sources_and_reports_foreign
   COVA_CHECK(contains(read_text(root / "src" / "main.cpp"), "int main()"));
   COVA_CHECK(contains(read_text(root / "CMakeLists.txt"), "cmake_minimum_required"));
   COVA_CHECK(contains(result.combined(), "CMakeLists.txt"));
+  COVA_CHECK(contains(result.combined(), "MIGRATING.md"));
   COVA_CHECK(cova::fs::is_regular_file(root / "cova.toml"));
 
   auto manifest = cova::manifest::load(root / "cova.toml");

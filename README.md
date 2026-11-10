@@ -250,6 +250,24 @@ Every command honours the same set (PRD §4.2):
 | `--color <auto\|always\|never>` | Colour policy |
 | `--json` | Machine-readable output where supported |
 
+## Migrating an existing project
+
+Cova does not import CMake, Meson, Make or Bazel files, and this milestone does
+not add a compatibility layer. `cova init` detects those files, reports them and
+leaves them untouched, so an existing project can be migrated incrementally
+while the old build stays runnable.
+
+The simplest way is to hand your agent the migration guide. This works in
+Claude Code, Codex, or any agent that can read a URL and run shell commands:
+
+```text
+Migrate this project to Cova. Refer to https://raw.githubusercontent.com/viloris-org/cova/refs/heads/main/docs/MIGRATING.md for migration to Cova.
+```
+
+The guide maps the common constructs of CMake, Meson, Make and Bazel to
+`cova.toml`, states what cannot be expressed yet, and gives a verification
+checklist. It is also available as [docs/MIGRATING.md](docs/MIGRATING.md).
+
 ## Architecture at a glance
 
 ```
@@ -290,6 +308,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - [docs/TOOLCHAIN-RESOLUTION.md](docs/TOOLCHAIN-RESOLUTION.md) — the resolution chain in detail
 - [docs/REGISTRY.md](docs/REGISTRY.md) — trusted local component registry schema and install rules
 - [docs/RELEASING.md](docs/RELEASING.md) — cutting a release, package formats and signing
+- [docs/MIGRATING.md](docs/MIGRATING.md) — moving an existing CMake, Meson, Make or Bazel project to Cova
 
 ## License
 
