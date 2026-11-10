@@ -374,6 +374,9 @@ int cmd_init(CommandContext& ctx) {
     }
     ctx.ui->info("migrating from " + foreign_builds.front() +
                  ": point `[build] sources` at the existing sources, then run `cova build`");
+    ctx.ui->info("migration guide: "
+                 "https://raw.githubusercontent.com/viloris-org/cova/"
+                 "refs/heads/main/docs/MIGRATING.md");
   }
   if (!has_src) {
     ctx.ui->warn("no `src/` directory found; create one and add sources before building");
