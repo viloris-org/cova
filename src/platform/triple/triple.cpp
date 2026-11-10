@@ -713,6 +713,7 @@ const std::vector<Triple>& known_targets() {
         // Phase-two platforms (PRD §20.2).
         "aarch64-unknown-linux-gnu",
         "x86_64-pc-windows-gnu",
+        "aarch64-pc-windows-gnu",
         "wasm32-unknown-wasi",
         "x86_64-apple-darwin",
         "aarch64-apple-darwin",

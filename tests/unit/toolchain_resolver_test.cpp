@@ -167,6 +167,11 @@ COVA_TEST_NAMED(toolchain, recognises_cross_and_versioned_driver_names) {
   COVA_CHECK(mingw32->arch == cova::platform::Arch::X86);
   COVA_CHECK(mingw32->os == cova::platform::Os::Windows);
   COVA_CHECK(mingw32->env == cova::platform::Env::Gnu);
+
+  // Windows on Arm uses the same MinGW spelling with the aarch64 prefix.
+  auto woa = cova::toolchain::target_from_executable("aarch64-w64-mingw32-g++");
+  COVA_CHECK(woa.has_value());
+  COVA_CHECK_EQ(woa->to_string(), std::string("aarch64-pc-windows-gnu"));
 }
 
 COVA_TEST_NAMED(toolchain, discovery_recognises_prefixed_cross_driver) {
@@ -378,11 +383,12 @@ COVA_TEST_NAMED(toolchain, descriptor_fingerprint_covers_compiler_subprograms) {
     COVA_CHECK_MSG(!component->sha256.empty(), std::string(role));
     COVA_CHECK_MSG(!component->path.empty(), std::string(role));
   }
-  const bool gcc_or_clang = descriptor.family.find("gcc") != std::string::npos ||
-                            descriptor.family.find("clang") != std::string::npos;
-  if (gcc_or_clang) {
+  // Clang's frontend runs in-process, so a Clang descriptor legitimately has
+  // no separate cc1/cc1plus/collect2 binaries to hash; the driver binary is
+  // already part of the fingerprint. GCC always has those subprograms.
+  if (descriptor.family.find("gcc") != std::string::npos) {
     COVA_CHECK_MSG(found_subprogram,
-                   "the GCC/Clang descriptor recorded no compiler subprogram");
+                   "the GCC descriptor recorded no compiler subprogram");
   }
 }
 

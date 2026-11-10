@@ -33,7 +33,7 @@ detect_os() {
     Linux) echo linux ;;
     Darwin) echo macos ;;
     MINGW*|MSYS*|CYGWIN*)
-      die "Windows releases are .zip archives; download one from https://github.com/$REPO/releases and extract it"
+      die "Windows releases are .msi installers; download one from https://github.com/$REPO/releases and run it"
       ;;
     *) die "unsupported operating system: $(uname -s)" ;;
   esac

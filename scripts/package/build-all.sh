@@ -5,7 +5,7 @@
 #   Linux    -> .tar.gz always; .deb with dpkg-deb; .rpm with rpmbuild;
 #               pacman package with bsdtar+zstd
 #   macOS    -> universal .tar.gz, .pkg and .dmg
-#   Windows  -> .zip (MSYS2 / MinGW shell)
+#   Windows  -> .msi (MSYS2 / MinGW shell with WiX on PATH)
 #
 # A missing tool is reported and skipped rather than failed, so the same script
 # runs unchanged on a contributor's machine and in CI.
@@ -41,10 +41,10 @@ if [[ "$os_name" == "Darwin" ]]; then
     skipped+=("macOS installers (pkgbuild/hdiutil missing)")
   fi
 elif [[ "$os_name" == MINGW* || "$os_name" == MSYS* || "$os_name" == CYGWIN* ]]; then
-  if have zip; then
-    run_step "Windows zip" "build-windows.sh"
+  if have wix; then
+    run_step "Windows MSI" "build-msi.sh"
   else
-    skipped+=("Windows zip (zip missing)")
+    skipped+=("Windows MSI (wix missing; install the WiX .NET global tool)")
   fi
 else
   run_step "tarball" "build-tarball.sh"
@@ -73,7 +73,7 @@ fi
   # `set -u`, so the file list is newline-delimited and read back line by line.
   list="$(mktemp)"
   trap 'rm -f "$list"' EXIT
-  for pattern in '*.deb' '*.rpm' '*.pkg.tar.zst' '*.tar.gz' '*.dmg' '*.zip'; do
+  for pattern in '*.deb' '*.rpm' '*.pkg.tar.zst' '*.tar.gz' '*.dmg' '*.msi'; do
     for f in $pattern; do
       if [ -e "$f" ]; then basename "$f" >> "$list"; fi
     done

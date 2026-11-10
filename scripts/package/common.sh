@@ -33,6 +33,25 @@ manifest_version() {
   sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' "$ROOT/cova.toml" | head -1
 }
 
+# MSI ProductVersion is numeric, with up to four dot-separated fields. A semver
+# pre-release suffix has no MSI representation, so only the numeric part is
+# kept; MajorUpgrade in windows/cova.wxs allows same-version upgrades, which is
+# what makes successive betas of the same patch version replace each other.
+msi_version() {
+  local full="$1" numeric
+  numeric="${full%%-*}"
+  numeric="${numeric%%+*}"
+  local major minor patch
+  IFS='.' read -r major minor patch <<< "$numeric"
+  major="${major:-0}"
+  minor="${minor:-0}"
+  patch="${patch:-0}"
+  for part in "$major" "$minor" "$patch"; do
+    [[ "$part" =~ ^[0-9]+$ ]] || die "cannot map version '$full' to an MSI ProductVersion"
+  done
+  printf '%s.%s.%s' "$major" "$minor" "$patch"
+}
+
 # Resolve the defaults once: version from the manifest, binary from the
 # bootstrap build tree unless the caller overrides either.
 resolve_defaults() {

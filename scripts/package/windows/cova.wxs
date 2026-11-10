@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cova — Windows installer.
+
+  Built by scripts/package/build-msi.sh, which supplies the version numbers and
+  absolute source paths. The package is per-machine: it installs under
+  Program Files and appends that directory to the system PATH, so the MSI needs
+  the same elevation the Linux installer gets from /usr/local.
+
+  UpgradeCode is stable for the lifetime of the product. ProductCode is left to
+  WiX so every build produces a new product identity; MajorUpgrade then replaces
+  the previous install (including another CPU architecture) instead of stacking
+  copies. MSI cannot express a semver pre-release suffix, so AllowSameVersion-
+  Upgrades handles beta-to-beta upgrades that share the same numeric version.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Cova"
+           Manufacturer="The Cova Authors"
+           Version="$(var.MsiVersion)"
+           UpgradeCode="276C558F-E627-4370-A14B-2323A73B9D18"
+           Scope="perMachine"
+           Language="1033"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Cova is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Windows Installer reports VersionNT 603 (Windows 8.1) on Windows 10
+         and later for compatibility, so 1000 is not a usable floor here. -->
+    <Launch Condition="Installed OR VersionNT &gt;= 603"
+            Message="Cova requires Windows 8.1 or later." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Cova">
+        <Component Id="CovaExe" Guid="89B8B80A-0A4F-424E-997C-4C6253B558D6">
+          <File Id="CovaExe" Source="$(var.BinarySource)" KeyPath="yes" />
+          <!-- Append the install directory to the system PATH. An uninstall
+               removes the value again. -->
+          <Environment Id="CovaPath" Name="PATH" Value="[INSTALLFOLDER]"
+                       Permanent="no" Part="last" Action="set" System="yes" />
+          <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        </Component>
+
+        <Component Id="CovaLicense" Guid="CD5819D6-D728-4F00-AB7A-972A7A82AF23">
+          <File Id="CovaLicense" Source="$(var.LicenseSource)" Name="LICENSE" KeyPath="yes" />
+        </Component>
+
+        <Component Id="CovaNotice" Guid="0608870D-6DC3-42FD-AE15-27CCADE6EC5F">
+          <File Id="CovaNotice" Source="$(var.NoticeSource)" Name="NOTICE" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Cova" Level="1">
+      <ComponentRef Id="CovaExe" />
+      <ComponentRef Id="CovaLicense" />
+      <ComponentRef Id="CovaNotice" />
+    </Feature>
+
+    <Property Id="ARPHELPLINK" Value="https://github.com/viloris-org/cova" />
+    <Property Id="ARPCOMMENTS" Value="Cova $(var.FullVersion)" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+  </Package>
+</Wix>

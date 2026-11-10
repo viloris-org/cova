@@ -102,9 +102,15 @@ Result<FormatterDescriptor> resolve_formatter(const ResolveOptions& options) {
     }
   }
   for (const auto& directory : fs::path_entries()) {
-    const auto candidate = directory / options.tool;
-    if (fs::is_regular_file(candidate)) {
-      candidates.emplace_back(candidate, "system");
+    // Windows tools carry the .exe suffix. Looking only for the bare name
+    // found nothing here even though find_in_path() (and the test that guards
+    // it) did resolve clang-format.exe.
+    for (const std::string& name : {options.tool, options.tool + ".exe"}) {
+      const auto candidate = directory / name;
+      if (fs::is_regular_file(candidate)) {
+        candidates.emplace_back(candidate, "system");
+        break;
+      }
     }
   }
 

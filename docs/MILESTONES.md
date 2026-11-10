@@ -82,11 +82,11 @@ script remains the authoritative clean-room path.
 
 ## Milestone 5 — Ecosystem expansion (Windows GNU host delivered)
 
-Native Windows x86_64 builds with MinGW-w64 GCC work: `src/core/process/process.cpp`
+Native Windows x86_64 and Arm64 (WoA) builds work: `src/core/process/process.cpp`
 executes children through `CreateProcessW` with pipes, a job object for timeouts,
 UTF-8/UTF-16 command lines and an inherited environment, and
 `scripts/devbuild.py` emits Windows-safe Ninja rules. Windows binaries are
-published as a `.zip`.
+published as per-machine `.msi` installers for both architectures.
 
 Windows/MSVC, WASI, Android NDK, CMake adaptation, remote execution/ caching,
 C++ modules and registry publishing are not implemented. Their PRD sections are

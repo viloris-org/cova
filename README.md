@@ -37,16 +37,20 @@ Cross compilation is a first-class command, not a configuration project:
 cova build --target aarch64-unknown-linux-musl
 ```
 
-Windows GNU targets use the same model. With a MinGW-w64 cross toolchain
-installed, either spelling works:
+Windows GNU targets use the same model, for both x86_64 and Windows on Arm
+(WoA). With a MinGW-w64 cross toolchain installed, either spelling works:
 
 ```bash
 cova build --target x86_64-pc-windows-gnu
 cova build --target x86_64-w64-mingw32   # MinGW's own triple
+
+cova build --target aarch64-pc-windows-gnu
+cova build --target aarch64-w64-mingw32  # WoA, MinGW's own triple
 ```
 
-Cova discovers prefixed drivers such as `x86_64-w64-mingw32-g++`, links a PE
-executable and verifies its architecture after linking.
+Cova discovers prefixed drivers such as `x86_64-w64-mingw32-g++` and
+`aarch64-w64-mingw32-g++`, links a PE executable and verifies its architecture
+after linking.
 
 ## Status
 
@@ -80,7 +84,7 @@ What works today:
 | Compilation database | Every `build` and `check` emits `compile_commands.json` with the exact compile arguments; a workspace gets one file covering its members |
 | Workspace | Discovery, ordering, shared settings and multi-package builds |
 | Self-hosting | A root `cova.toml` lets a built Cova build, test and run itself (Stage 1) |
-| Host platforms | Linux and macOS x86_64/aarch64, and Windows x86_64 with MinGW-w64 GCC (MSVC is not supported yet) |
+| Host platforms | Linux and macOS x86_64/aarch64, and Windows x86_64/aarch64 with a MinGW-w64-compatible toolchain, GCC or Clang (MSVC is not supported yet) |
 
 What deliberately does **not** work yet, by design:
 
@@ -113,14 +117,18 @@ Native packages are attached to each release:
 |---|---|
 | Linux x86_64 / aarch64 | `.deb`, `.rpm`, pacman `.pkg.tar.zst`, `.tar.gz` |
 | macOS Intel + Apple Silicon | universal `.pkg`, `.dmg`, `.tar.gz` |
-| Windows x86_64 | `.zip` with `cova.exe` |
+| Windows x86_64 | `.msi` |
+| Windows Arm64 (WoA) | `.msi` |
 
 The Linux binaries are statically linked, so one package works across
-distributions. The Windows archive is built with MSYS2's UCRT64 GCC and links
-the MinGW runtime statically: unzip it and add the directory to `PATH`. It uses
-the system UCRT (`ucrtbase.dll`), which ships with Windows 10 and later. Cova
-builds Windows projects with a MinGW-w64 GCC; MSVC as a host toolchain is not
-supported yet (PRD §20.2).
+distributions. The Windows installers are built with MSYS2's UCRT64 GCC
+(x86_64) and CLANGARM64 Clang (Arm64) and link the C++ runtime statically. Run
+the `.msi` for your architecture: it installs under `Program Files\Cova` and
+appends that directory to the system `PATH`. The installer needs elevation and
+is not code-signed, so SmartScreen asks for confirmation. It uses the system
+UCRT (`ucrtbase.dll`), which ships with Windows 10 and later. Cova builds
+Windows projects with a MinGW-w64-compatible toolchain (GCC or Clang); MSVC as
+a host toolchain is not supported yet (PRD §20.2).
 
 ### Releasing
 
@@ -144,15 +152,18 @@ actually uses (`<expected>`, `<print>`, concepts, ranges, designated
 initializers) — it does not infer support from a version number (PRD §16.4).
 
 On Windows the bootstrap shell script needs MSYS2. A native build works without
-it as long as a MinGW-w64 GCC, Ninja and Python 3 are on `PATH`:
+it as long as a MinGW-w64-compatible C++ compiler (GCC or Clang), Ninja and
+Python 3 are on `PATH`:
 
 ```powershell
 python scripts/devbuild.py build
 python scripts/devbuild.py test
 ```
 
-`scripts/devbuild.py` handles Windows command lines and `.exe`/`.a` naming for
-MinGW; MSVC (`cl.exe`) is not a supported host toolchain yet.
+Windows on Arm has no native GCC in MSYS2, so use its CLANGARM64 environment
+(`clang++`) or an llvm-mingw toolchain there. `scripts/devbuild.py` handles
+Windows command lines and `.exe`/`.a` naming for MinGW; MSVC (`cl.exe`) is not a
+supported host toolchain yet.
 
 Cova can also build itself once a Stage 0 binary exists (PRD §16.2):
 
