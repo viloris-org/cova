@@ -210,11 +210,10 @@ Result<BuildResult> Executor::run() {
     }
   };
 
-  auto consider = [&](const Action& action) -> Disposition {
+  auto consider = [&](const Action& action, std::string& reason) -> Disposition {
     if (stop_early) {
       return Disposition::Fail;
     }
-    std::string reason;
     bool current = false;
     if (options_.incremental && up_to_date_check_) {
       // The predicate consults shared caches and records state, so it stays
@@ -251,13 +250,18 @@ Result<BuildResult> Executor::run() {
         scheduler.complete(*next);
         continue;
       }
-      const Disposition disposition = consider(*action);
+      std::string reason;
+      const Disposition disposition = consider(*action, reason);
       if (disposition == Disposition::Skip) {
         ActionOutcome outcome;
         outcome.id = action->id;
         outcome.succeeded = true;
         outcome.skipped = true;
-        outcome.skip_reason = "up to date";
+        // The predicate's reason distinguishes "the incremental record already
+        // proved this current" from "restored from cache". The caller uses that
+        // difference to keep an existing, still-exact record instead of
+        // re-deriving one it already has.
+        outcome.skip_reason = reason.empty() ? "up to date" : reason;
         settled(*action, outcome);
         continue;
       }
