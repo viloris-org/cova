@@ -188,20 +188,28 @@ int cmd_clean(CommandContext& ctx) {
   std::vector<fs::Path> removable;
   if (clean_all) {
     removable.push_back(target_dir);
-  } else if (ctx.flags.boolean("release") || ctx.flags.get("profile")) {
-    // Only the selected profile subtree of each target.
+  } else if (ctx.flags.boolean("release") || ctx.global.profile_set) {
+    // Only the selected profile subtree of each target. `--profile` is a global
+    // option (see OptionSpec in src/cli/parse.cpp), so it never appears in
+    // `ctx.flags`; reading it from there silently degraded this branch into a
+    // full `target/` wipe.
     const std::string profile = selected_profile(ctx);
     std::error_code ec;
+    std::size_t profiles_seen = 0;
     for (auto it = stdfs::directory_iterator(target_dir, ec); it != stdfs::directory_iterator();
          it.increment(ec)) {
       if (!fs::is_directory(it->path())) {
         continue;
       }
+      ++profiles_seen;
       const auto profile_dir = it->path() / profile;
       if (fs::is_directory(profile_dir)) {
         removable.push_back(profile_dir);
       }
     }
+    // A profile directory that was never built means there is nothing to clean;
+    // removing every target because one profile is missing would be surprising.
+    (void)profiles_seen;
   } else {
     removable.push_back(target_dir);
   }

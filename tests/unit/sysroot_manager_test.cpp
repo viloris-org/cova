@@ -21,6 +21,55 @@ cova::Result<cova::proc::ProcessResult> create_test_archive(const std::filesyste
 
 } // namespace
 
+// Regression: the zip link check shelled out to `tar -tvf`, which always fails
+// on a zip, so the check never ran. A zip carrying a symlink would have been
+// extracted with its link intact (or failed to extract) instead of rejected.
+COVA_TEST_NAMED(sysroot, rejects_zip_with_symlink) {
+  if (!cova::fs::find_in_path("unzip").has_value() ||
+      !cova::fs::find_in_path("zip").has_value()) {
+    return;  // tooling unavailable on this host
+  }
+  cova::test::TempDir temp;
+  const std::filesystem::path base = temp.path();
+  COVA_CHECK(cova::fs::create_directories(base / "stage" / "root").has_value());
+  // zip stores the link target as the entry's *content*; `zip -y` keeps it.
+  COVA_CHECK(cova::proc::run("ln", {"-sf", "/tmp/cova_zip_escape", "root/link"}, base / "stage")
+                 .has_value());
+  auto zipped = cova::proc::run("zip", {"-y", "-q", "-r", "../evil.zip", "root"},
+                                base / "stage");
+  if (!zipped || !zipped->success()) {
+    return;  // archive tool cannot store symlinks here; nothing to assert
+  }
+
+  auto extracted = cova::sysroot::extract_archive_safely(base / "evil.zip", base / "out");
+  COVA_CHECK(!extracted.has_value());
+  if (!extracted) {
+    COVA_CHECK(extracted.error().code == std::string("cova::sysroot::unsafe_archive"));
+  }
+}
+
+// A zip without symlinks must still be accepted, so the check above cannot be
+// satisfied by simply rejecting every zip.
+COVA_TEST_NAMED(sysroot, accepts_zip_without_symlinks) {
+  if (!cova::fs::find_in_path("unzip").has_value() ||
+      !cova::fs::find_in_path("zip").has_value()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const std::filesystem::path base = temp.path();
+  COVA_CHECK(cova::fs::create_directories(base / "stage" / "root" / "include").has_value());
+  COVA_CHECK(cova::fs::write_file(base / "stage" / "root" / "include" / "a.h",
+                                  "#define A 1\n")
+                 .has_value());
+  auto zipped = cova::proc::run("zip", {"-q", "-r", "../ok.zip", "root"}, base / "stage");
+  if (!zipped || !zipped->success()) {
+    return;
+  }
+  auto extracted = cova::sysroot::extract_archive_safely(base / "ok.zip", base / "out");
+  COVA_CHECK_MSG(extracted.has_value(),
+                 extracted ? "" : extracted.error().to_string());
+}
+
 COVA_TEST_NAMED(sysroot, manifest_round_trips) {
   cova::sysroot::SysrootManifest manifest;
   manifest.id = "aarch64-musl-1";

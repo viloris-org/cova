@@ -120,10 +120,10 @@ std::string selected_profile(const CommandContext& ctx) {
   if (ctx.flags.boolean("release")) {
     return "release";
   }
-  if (auto explicit_profile = ctx.flags.get("profile")) {
-    if (!explicit_profile->empty()) {
-      return *explicit_profile;
-    }
+  // `--profile` is a global option (OptionSpec in src/cli/parse.cpp), so it is
+  // never present in `ctx.flags`; reading it from there silently ignored it.
+  if (ctx.global.profile_set && !ctx.global.profile.empty()) {
+    return ctx.global.profile;
   }
   return ctx.global.profile.empty() ? "dev" : ctx.global.profile;
 }
@@ -188,6 +188,17 @@ Result<LoadedProject> load_project(CommandContext& ctx) {
   loaded.manifest = std::move(loaded_manifest->manifest);
   loaded.warnings = std::move(loaded_manifest->warnings);
   loaded.is_workspace_root = loaded.manifest.is_workspace_root();
+
+  // Validation was implemented but never called, so an invalid package name,
+  // version or edition reached the planner and produced either a compiler error
+  // or a nonsensical artifact name. Report it as a Cova diagnostic instead.
+  if (auto validated = manifest::validate(loaded.manifest); !validated) {
+    return fail<LoadedProject>(validated.error());
+  } else {
+    for (auto& warning : *validated) {
+      loaded.warnings.push_back(std::move(warning));
+    }
+  }
 
   // Attach workspace information. When the manifest itself is a workspace root,
   // load it; when it is a plain package, look upward for a workspace that
@@ -565,6 +576,25 @@ Result<build::PlanResult> plan_with_dependencies(CommandContext& ctx, const Load
   build::PlanOptions options;
   options.target = target;
   options.profile = selected_profile(ctx);
+  // An unknown profile used to be accepted silently: `Manifest::profile()`
+  // falls back to dev settings, so `--profile typo` built dev flags into a
+  // `typo/` directory. Reject it instead of inventing a configuration.
+  if (!dependencies.build_packages.empty() &&
+      !dependencies.build_packages.front().profiles.contains(options.profile)) {
+    std::string known;
+    for (const auto& [name, profile] : dependencies.build_packages.front().profiles) {
+      (void)profile;
+      if (!known.empty()) {
+        known += ", ";
+      }
+      known += name;
+    }
+    return fail<build::PlanResult>(
+        Error::make("cova::manifest::unknown_profile",
+                    "no profile named `" + options.profile + "` is declared")
+            .with("declared profiles: " + (known.empty() ? "none" : known))
+            .with("add [profile." + options.profile + "] to cova.toml, or use an existing one"));
+  }
   options.jobs = ctx.global.jobs;
   options.use_color = ctx.global.use_color(stdout_is_tty());
   options.include_tests = include_tests;

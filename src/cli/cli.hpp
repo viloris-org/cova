@@ -23,6 +23,11 @@ namespace stdfs = std::filesystem;
 struct GlobalOptions {
   std::optional<std::string> target;
   std::string profile = "dev";
+  // True once `--profile` was actually supplied. `profile` always carries a
+  // usable default, so a command that needs to distinguish "the user asked for
+  // this profile" from "nobody said anything" must test this flag rather than
+  // comparing `profile` against a default.
+  bool profile_set = false;
   std::optional<std::string> compiler;   // family@version
   std::optional<std::string> toolchain;  // descriptor id or path
   bool offline = false;
@@ -138,6 +143,13 @@ class Ui {
   virtual void status(std::string_view text) = 0;
   virtual void warn(std::string_view text) = 0;
   virtual void error(std::string_view text) = 0;
+  // Writes text verbatim to the error stream without a severity prefix. Used
+  // when relaying a child program's own output, where an `error:` prefix would
+  // misrepresent it as a Cova diagnostic.
+  virtual void raw_error(std::string_view text) {
+    std::string indented(text);
+    error(indented);
+  }
   virtual void verbose(std::string_view text) = 0;
   // True when the UI can redraw a single status line in place. Only a terminal
   // can; pipes and test harnesses fall back to one line per event.
@@ -160,6 +172,7 @@ class StreamUi final : public Ui {
   void status(std::string_view text) override;
   void warn(std::string_view text) override;
   void error(std::string_view text) override;
+  void raw_error(std::string_view text) override;
   void verbose(std::string_view text) override;
   bool progress_live() const override { return progress_live_; }
   void progress_update(std::string_view text) override;
@@ -187,6 +200,7 @@ class StringUi final : public Ui {
   void status(std::string_view text) override;
   void warn(std::string_view text) override;
   void error(std::string_view text) override;
+  void raw_error(std::string_view text) override;
   void verbose(std::string_view text) override;
   bool interactive() const override { return is_interactive; }
   bool confirm(std::string_view question, bool fallback) override;

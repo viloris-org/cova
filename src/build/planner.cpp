@@ -456,6 +456,11 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       action.inputs.push_back(FileInput{objects[index], "object"});
       action.dependencies.push_back(object_actions[index]);
     }
+    // Linked dependency artifacts are inputs too: they appear in argv, so a
+    // rebuilt library must change this action's cache key and force a relink.
+    for (const auto& artifact : options.dependency_artifacts) {
+      action.inputs.push_back(FileInput{fs::Path(artifact), "library"});
+    }
     action.outputs.push_back(FileOutput{final_output, true});
     // Archive/link inputs are the object files produced by this graph, which
     // are themselves complete inputs, so no provider scan is needed.
@@ -547,6 +552,18 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       link.working_dir = manifest.root;
       link.inputs.push_back(FileInput{test_object, "object"});
       link.inputs.push_back(FileInput{source, "source"});
+      // Every object the link line names is an input. Leaving them out of
+      // `inputs` kept them out of the cache key, so changing a library source
+      // recompiled and re-archived it but never relinked the test binary.
+      for (const auto& object : objects) {
+        if (!main_object.empty() && object == main_object) {
+          continue;
+        }
+        link.inputs.push_back(FileInput{object, "object"});
+      }
+      for (const auto& artifact : options.dependency_artifacts) {
+        link.inputs.push_back(FileInput{fs::Path(artifact), "library"});
+      }
       link.dependencies.push_back(test_compile);
       for (const auto& object_action : object_actions) {
         link.dependencies.push_back(object_action);

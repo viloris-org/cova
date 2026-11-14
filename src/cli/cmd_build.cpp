@@ -489,7 +489,10 @@ Status verify_artifacts(const PreparedBuild& prepared, CommandContext& ctx) {
 }
 
 // Executes a planned graph with incremental state and the shared artifact cache.
-int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
+// `own_json` is false when the caller emits its own JSON document (`cova test`),
+// so the build stage must not print a second, unrelated one to stdout.
+int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
+                  bool own_json = true) {
   auto config = effective_config(ctx);
   if (!config) {
     return report_error(config.error(), ctx);
@@ -796,7 +799,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
 
   if (!result->succeeded) {
     report_diagnostics(result->diagnostics, ctx);
-    if (ctx.global.json) {
+    if (ctx.global.json && own_json) {
       json::Value out = json::Value::object();
       out.set("success", false);
       out.set("failed", static_cast<std::int64_t>(result->failed));
@@ -835,7 +838,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     }
   }
 
-  if (ctx.global.json) {
+  if (ctx.global.json && own_json) {
     json::Value out = json::Value::object();
     out.set("success", true);
     out.set("executed", static_cast<std::int64_t>(result->executed));
@@ -851,7 +854,9 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run) {
     return 0;
   }
 
-  if (!ctx.global.quiet) {
+  // The human summary goes to stdout, so it must stay out of the way of a JSON
+  // document -- whether this stage prints one or the caller does.
+  if (!ctx.global.quiet && !ctx.global.json) {
     const std::string verb = result->executed == 0 ? "Finished" : "Built";
     std::string line = verb + " `" + project_label(prepared.project) + "` in " +
                        format_duration(elapsed);
@@ -1051,11 +1056,14 @@ int cmd_run(CommandContext& ctx) {
   if (auto early = prepare(ctx, prepared, /*include_tests=*/false)) {
     return *early;
   }
-  const int build_code = execute_build(ctx, prepared, /*dry_run=*/false);
+  // `cova run --dry-run` reports what would be built and then stops; building
+  // first and only checking the flag afterwards made the dry run the real thing.
+  const bool dry_run = ctx.flags.boolean("dry-run");
+  const int build_code = execute_build(ctx, prepared, dry_run);
   if (build_code != 0) {
     return build_code;
   }
-  if (ctx.flags.boolean("dry-run")) {
+  if (dry_run) {
     return 0;
   }
 
@@ -1088,8 +1096,14 @@ int cmd_run(CommandContext& ctx) {
     return report_error(result.error(), ctx);
   }
   if (!interactive) {
+    // With --json, stdout carries exactly one JSON document (the build report),
+    // so the program's own output goes to stderr instead of corrupting it.
     if (!result->stdout_text.empty()) {
-      ctx.ui->out(result->stdout_text);
+      if (ctx.global.json) {
+        ctx.ui->raw_error(result->stdout_text);
+      } else {
+        ctx.ui->out(result->stdout_text);
+      }
     }
     if (!result->stderr_text.empty()) {
       ctx.ui->error(result->stderr_text);
@@ -1113,7 +1127,7 @@ int cmd_test(CommandContext& ctx) {
     ctx.ui->info("no tests declared for `" + project_label(prepared.project) + "`");
     return 0;
   }
-  const int build_code = execute_build(ctx, prepared, /*dry_run=*/false);
+  const int build_code = execute_build(ctx, prepared, /*dry_run=*/false, /*own_json=*/false);
   if (build_code != 0) {
     return build_code;
   }
@@ -1133,8 +1147,15 @@ int cmd_test(CommandContext& ctx) {
     ++failed;
     failures.push_back(label + ": " + reason);
     ctx.ui->error("test failed: " + label);
+    // Under --json the failure detail belongs to the JSON document (it is a
+    // field of `failures`) and to stderr, never to stdout: writing it here made
+    // the machine-readable output unparseable by prefixing it to the JSON.
     if (!reason.empty()) {
-      ctx.ui->out(reason);
+      if (ctx.global.json) {
+        ctx.ui->error(reason);
+      } else {
+        ctx.ui->out(reason);
+      }
     }
   };
 
