@@ -527,6 +527,10 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
 
   const auto started = Clock::now();
   std::size_t restored = 0;
+  // Actions the local incremental record proved current in this run. Their
+  // existing records already hold the verified hashes, so rebuilding them after
+  // execution would re-hash the whole closure for no gain.
+  std::set<std::uint64_t> verified_by_state;
 
   auto try_cache_restore = [&](const build::Action& action) -> bool {
     // Sharing requires a hermetic environment and a complete input closure.
@@ -534,7 +538,15 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
         !action.input_closure_complete || !action.input_identity_complete) {
       return false;
     }
-    const std::string key = action.cache_key(env);
+    // The key must be recomputed when another action in this build could have
+    // changed this action's inputs, because the executor computed every key
+    // before anything ran (a link's identity covers object files an earlier
+    // action may only just have produced). An action with no dependencies has
+    // no such producer, so the executor's up-front key is still exact and can
+    // be reused instead of hashing the whole closure a second time.
+    const std::string key = action.dependencies.empty() && !action.computed_key.empty()
+                                ? action.computed_key
+                                : action.cache_key(env);
     if (!action.input_identity_complete) {
       return false;
     }
@@ -561,6 +573,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
       return false;
     }
     if (env.incremental_eligible && local_state.is_up_to_date(action, reason)) {
+      verified_by_state.insert(action.id.value);
       return true;
     }
     if (env.incremental_eligible && local_state.inputs_match(action)) {
@@ -595,6 +608,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
           return true;
         }
         if (env.incremental_eligible && local_state.is_up_to_date(action, reason)) {
+          verified_by_state.insert(action.id.value);
           return true;
         }
       }
@@ -683,6 +697,14 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
     if (!outcome.succeeded) {
       continue;
     }
+    // The incremental predicate already matched this action's key and verified
+    // every recorded input and output hash in this run, so the record it
+    // matched is still exact. Rebuilding it would re-hash the whole closure to
+    // reproduce a record we already have, which made a no-op build as expensive
+    // as a full rebuild.
+    if (outcome.skipped && verified_by_state.contains(outcome.id.value)) {
+      continue;
+    }
     const build::Action* action = prepared.plan.graph.find(outcome.id);
     if (action == nullptr) {
       continue;
@@ -710,13 +732,14 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
       }
     }
     build::ActionRecord record;
+    // A compile's declared closure and its parsed depfile overlap almost
+    // entirely, and the old linear scan over `record.input_hashes` made this
+    // quadratic in the number of headers.
+    std::set<std::string> recorded_inputs;
     auto add_input = [&](const fs::Path& input) {
       const std::string path = fs::generic_string(input);
-      for (const auto& [existing, digest] : record.input_hashes) {
-        (void)digest;
-        if (existing == path) {
-          return;
-        }
+      if (!recorded_inputs.insert(path).second) {
+        return;
       }
       record.input_paths.push_back(path);
       auto digest = build::FileHasher{}.hash_file(input);
@@ -745,19 +768,17 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
         // run again next time, but it must not be reused or published.
         continue;
       }
+      std::set<std::string> key_inputs;
+      for (const auto& input : key_action.inputs) {
+        key_inputs.insert(fs::generic_string(fs::canonical_for_compare(input.path)));
+      }
       for (const auto& header : parsed->dependencies) {
         if (!fs::is_regular_file(header)) {
           continue;
         }
         add_input(header);
-        bool already_an_input = false;
-        for (const auto& input : key_action.inputs) {
-          if (fs::canonical_for_compare(input.path) ==
-              fs::canonical_for_compare(header)) {
-            already_an_input = true;
-            break;
-          }
-        }
+        const bool already_an_input =
+            key_inputs.contains(fs::generic_string(fs::canonical_for_compare(header)));
         if (!already_an_input) {
           // A header the pre-execution scan did not see means the closure is
           // not proven for this execution. The output may satisfy the user,
