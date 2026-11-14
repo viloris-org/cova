@@ -248,6 +248,118 @@ void render_table(const Table& table, const std::vector<std::string>& prefix, st
 // Parser
 // ---------------------------------------------------------------------------
 
+// Validates the shapes TOML 1.0 allows for offset date-times, local
+// date-times, local dates and local times.
+//
+// Field widths are fixed by RFC 3339 (4-2-2 date, 2:2:2 time, optional
+// fractional seconds), which is what makes `1979-05-27T99:99:99` invalid rather
+// than "an unusual but acceptable value".
+bool valid_datetime_shapes(std::string_view raw) {
+  auto digits_at = [raw](std::size_t pos, std::size_t count) {
+    if (pos + count > raw.size()) {
+      return false;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+      if (!is_digit(raw[pos + i])) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto in_range = [raw](std::size_t pos, std::size_t count, int low, int high) {
+    int value = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+      value = value * 10 + (raw[pos + i] - '0');
+    }
+    return value >= low && value <= high;
+  };
+
+  std::size_t pos = 0;
+  bool saw_date = false;
+  bool saw_time = false;
+
+  // Date: YYYY-MM-DD
+  if (digits_at(0, 4) && raw.size() >= 10 && raw[4] == '-' && raw[7] == '-' && digits_at(5, 2) &&
+      digits_at(8, 2)) {
+    if (!in_range(5, 2, 1, 12) || !in_range(8, 2, 1, 31) || !in_range(0, 4, 0, 9999)) {
+      return false;
+    }
+    pos = 10;
+    saw_date = true;
+  }
+
+  // Time: HH:MM:SS[.fraction]
+  auto parse_time = [&](std::size_t start) {
+    if (raw.size() < start + 8 || !digits_at(start, 2) || raw[start + 2] != ':' ||
+        !digits_at(start + 3, 2) || raw[start + 5] != ':' || !digits_at(start + 6, 2)) {
+      return std::optional<std::size_t>{};
+    }
+    if (!in_range(start, 2, 0, 23) || !in_range(start + 3, 2, 0, 59) ||
+        !in_range(start + 6, 2, 0, 60)) {  // 60 allows a leap second
+      return std::optional<std::size_t>{};
+    }
+    std::size_t next = start + 8;
+    if (next < raw.size() && raw[next] == '.') {
+      std::size_t fraction = next + 1;
+      while (fraction < raw.size() && is_digit(raw[fraction])) {
+        ++fraction;
+      }
+      if (fraction == next + 1) {
+        return std::optional<std::size_t>{};
+      }
+      next = fraction;
+    }
+    return std::optional<std::size_t>{next};
+  };
+
+  if (saw_date && pos < raw.size()) {
+    // A space separator is only valid when a time follows.
+    if (raw[pos] == 'T' || raw[pos] == 't' || raw[pos] == ' ') {
+      auto next = parse_time(pos + 1);
+      if (!next) {
+        return false;
+      }
+      pos = *next;
+      saw_time = true;
+    }
+  } else if (!saw_date) {
+    auto next = parse_time(0);
+    if (!next) {
+      return false;
+    }
+    pos = *next;
+    saw_time = true;
+  }
+
+  if (!saw_date && !saw_time) {
+    return false;
+  }
+
+  // Optional offset: Z, or +/-HH:MM.
+  if (pos < raw.size()) {
+    if (raw[pos] == 'Z' || raw[pos] == 'z') {
+      if (pos + 1 != raw.size()) {
+        return false;
+      }
+      return true;
+    }
+    if (raw[pos] == '+' || raw[pos] == '-') {
+      if (pos + 6 != raw.size() || !digits_at(pos + 1, 2) || raw[pos + 3] != ':' ||
+          !digits_at(pos + 4, 2)) {
+        return false;
+      }
+      return in_range(pos + 1, 2, 0, 23) && in_range(pos + 4, 2, 0, 59);
+    }
+    return false;
+  }
+  return true;
+}
+
+// Maximum nesting depth for arrays and inline tables. Chosen to be far beyond
+// any real manifest or lockfile (which nest a handful of levels) while staying
+// well inside the smallest stack Cova runs on. Matches `json.cpp`'s bound.
+constexpr std::uint32_t kMaxNestingDepth = 128;
+
 class Parser {
  public:
   Parser(std::string_view text, std::string_view source) : text_(text), source_(source) {}
@@ -387,6 +499,9 @@ class Parser {
   std::vector<std::string> current_path_;
   // Fully-qualified headers already declared, to reject duplicate [table]s.
   std::map<std::string, bool, std::less<>> defined_tables_;
+  // Current value nesting depth (arrays + inline tables). Bounded by
+  // `kMaxNestingDepth` so recursion cannot overflow the stack.
+  std::uint32_t depth_ = 0;
 };
 
 void Parser::append_utf8(std::string& out, std::uint32_t code_point) {
@@ -687,13 +802,19 @@ Value Parser::parse_number_or_datetime() {
       bump();
     }
     // There must be a date or time shape; otherwise it was a number like 2024.
-    if (raw.size() >= 8 && raw.find('-') != std::string::npos) {
-      return Value::datetime(std::move(raw));
+    const bool looks_like_a_date = raw.size() >= 8 && raw.find('-') != std::string::npos;
+    const bool looks_like_a_time = raw.size() >= 8 && raw.find(':') != std::string::npos;
+    if (!looks_like_a_date && !looks_like_a_time) {
+      throw_error("malformed date-time value");
     }
-    if (raw.size() >= 8 && raw.find(':') != std::string::npos) {
-      return Value::datetime(std::move(raw));
+    // The character scan above accepts any run of digits and separators, which
+    // let `1979-05-27T99:99:99` and `1979-05-27T07:32:00ZZ` through. TOML 1.0
+    // requires RFC 3339 with fixed field widths; a manifest with a typo'd date
+    // must be rejected here, not silently stored.
+    if (!valid_datetime_shapes(raw)) {
+      throw_error("malformed date-time value `" + raw + "`");
     }
-    throw_error("malformed date-time value");
+    return Value::datetime(std::move(raw));
   }
 
   const bool negative = consume('-');
@@ -918,6 +1039,25 @@ Value Parser::parse_inline_table() {
 }
 
 Value Parser::parse_value() {
+  // Guard against unbounded recursion through nested arrays and inline tables.
+  //
+  // `parse_value` -> `parse_array` -> `parse_value` is mutual recursion whose
+  // depth is controlled entirely by the input. Without a limit a hostile or
+  // merely corrupt document (`a = [[[[...]]]]`) overflows the stack and kills
+  // the process instead of reporting a parse error (PRD §19.3 requires every
+  // parse error to carry a location). `json.cpp` has enforced the same bound
+  // since it was written; TOML did not.
+  //
+  // The RAII guard is essential: `throw_error` throws, and the depth must be
+  // unwound on that path too or a later sibling value would inherit the depth.
+  struct DepthGuard {
+    std::uint32_t& depth;
+    ~DepthGuard() { --depth; }
+  } depth_guard{depth_};
+  if (++depth_ > kMaxNestingDepth) {
+    throw_error("nesting is too deep (limit " + std::to_string(kMaxNestingDepth) + ")");
+  }
+
   const SourceLocation start = location();
   Value value;
   switch (peek()) {

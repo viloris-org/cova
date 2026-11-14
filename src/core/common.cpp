@@ -272,12 +272,27 @@ bool is_package_name(std::string_view s) {
   if (s.empty()) {
     return false;
   }
-  if (is_digit(s[0])) {
+  auto lower_alpha = [](char c) { return c >= 'a' && c <= 'z'; };
+  // The first character must be a letter or '_'. A leading '-' would make the
+  // name (and the artifact derived from it) look like a command-line option,
+  // and names such as "-bad" or "--" also produced unusable directories.
+  if (!lower_alpha(s[0]) && s[0] != '_') {
     return false;
   }
   for (char c : s) {
-    const bool lower_alpha = c >= 'a' && c <= 'z';
-    if (!(lower_alpha || is_digit(c) || c == '-' || c == '_')) {
+    if (!(lower_alpha(c) || is_digit(c) || c == '-' || c == '_')) {
+      return false;
+    }
+  }
+  // No trailing separator, and no doubled separators: they make awkward
+  // artifact names and are almost always a typo.
+  if (s.back() == '-' || s.back() == '_') {
+    return false;
+  }
+  for (std::size_t i = 0; i + 1 < s.size(); ++i) {
+    const char a = s[i];
+    const char b = s[i + 1];
+    if ((a == '-' || a == '_') && a == b) {
       return false;
     }
   }
@@ -289,8 +304,33 @@ std::string quote(std::string_view s) {
   out.reserve(s.size() + 2);
   out.push_back('"');
   for (char c : s) {
-    if (c == '"' || c == '\\') {
-      out.push_back('\\');
+    switch (c) {
+      case '"':
+      case '\\':
+        out.push_back('\\');
+        out.push_back(c);
+        continue;
+      case '\n':
+        out += "\\n";
+        continue;
+      case '\r':
+        out += "\\r";
+        continue;
+      case '\t':
+        out += "\\t";
+        continue;
+      default:
+        break;
+    }
+    // Control characters would break a single-line diagnostic (or, worse, emit
+    // terminal escape sequences from an untrusted manifest value).
+    const auto byte = static_cast<unsigned char>(c);
+    if (byte < 0x20 || byte == 0x7F) {
+      static constexpr char kHex[] = "0123456789abcdef";
+      out += "\\x";
+      out.push_back(kHex[(byte >> 4) & 0xF]);
+      out.push_back(kHex[byte & 0xF]);
+      continue;
     }
     out.push_back(c);
   }

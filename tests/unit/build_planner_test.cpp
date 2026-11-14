@@ -1046,4 +1046,56 @@ COVA_TEST_NAMED(build, state_inputs_match_is_independent_of_output_presence) {
   COVA_CHECK(state.is_up_to_date(action, reason));
 }
 
+// ---------------------------------------------------------------------------
+// Dependency-file parsing
+//
+// Compilers on Windows emit raw backslash paths. Treating every backslash as an
+// escape mangled each dependency, so the closure looked incomplete and the
+// incremental cache was never used.
+// ---------------------------------------------------------------------------
+
+COVA_TEST_NAMED(build, depfile_parses_windows_backslash_paths) {
+  auto depfile = COVA_REQUIRE_OK(cova::build::Depfile::parse(
+      "C:\\build\\obj\\main.o: C:\\src\\main.cpp C:\\src\\inc\\a.hpp\n",
+      cova::fs::Path("C:/project")));
+  COVA_CHECK_EQ(depfile.dependencies.size(), std::size_t{2});
+  // The dependency keeps its original form; only the base is prepended.
+  const std::string first = cova::fs::generic_string(depfile.dependencies.front());
+  COVA_CHECK_MSG(first.find("main.cpp") != std::string::npos,
+                 "the source dependency must survive escaping");
+  COVA_CHECK_MSG(first.find("project") != std::string::npos, "the base must be applied");
+}
+
+COVA_TEST_NAMED(build, depfile_parses_escaped_spaces_and_colons) {
+  auto spaced = COVA_REQUIRE_OK(
+      cova::build::Depfile::parse("o.o: /src/a\\ b/header.hpp\n", cova::fs::Path("")));
+  COVA_CHECK_EQ(spaced.dependencies.size(), std::size_t{1});
+  COVA_CHECK_MSG(cova::fs::generic_string(spaced.dependencies.front()).find("a b") !=
+                     std::string::npos,
+                 "an escaped space belongs to the path");
+
+  auto colon = COVA_REQUIRE_OK(
+      cova::build::Depfile::parse("o.o: /src/a\\:b.hpp\n", cova::fs::Path("")));
+  COVA_CHECK_EQ(colon.dependencies.size(), std::size_t{1});
+  COVA_CHECK_MSG(cova::fs::generic_string(colon.dependencies.front()).find("a:b") !=
+                     std::string::npos,
+                 "an escaped colon belongs to the path");
+}
+
+COVA_TEST_NAMED(build, depfile_handles_crlf_and_continuations) {
+  // Windows compilers write CRLF; a stray \r must not become part of a path.
+  auto crlf = COVA_REQUIRE_OK(cova::build::Depfile::parse(
+      "o.o: a.cpp \\\r\n  b.hpp\r\n", cova::fs::Path("/p")));
+  COVA_CHECK_EQ(crlf.dependencies.size(), std::size_t{2});
+  for (const auto& dependency : crlf.dependencies) {
+    COVA_CHECK_MSG(cova::fs::generic_string(dependency).find('\r') == std::string::npos,
+                   "carriage returns must be stripped");
+  }
+}
+
+COVA_TEST_NAMED(build, depfile_rejects_a_file_without_a_target_line) {
+  auto error = COVA_REQUIRE_ERR(cova::build::Depfile::parse("just text\n", cova::fs::Path("/p")));
+  COVA_CHECK_EQ(error.code, std::string("cova::build::depfile"));
+}
+
 COVA_TEST_MAIN()

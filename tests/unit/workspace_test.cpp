@@ -1,5 +1,7 @@
 // Cova — workspace discovery and ordering tests (PRD §14).
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "core/filesystem/filesystem.hpp"
 #include "testing/test.hpp"
@@ -79,6 +81,77 @@ sources = ["src/**/*.cpp"]
                  .has_value());
   auto error = COVA_REQUIRE_ERR(cova::workspace::load(root));
   COVA_CHECK(error.code.find("workspace") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Exclusion matching
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Creates a workspace with one package per entry in `members` (name == dir),
+// plus the given exclude list, and returns the discovered member names.
+std::vector<std::string> discover(const std::filesystem::path& root,
+                                 const std::vector<std::string>& member_globs,
+                                 const std::vector<std::string>& excludes,
+                                 const std::vector<std::string>& directories) {
+  for (const auto& directory : directories) {
+    const auto package_dir = root / directory;
+    COVA_CHECK(cova::fs::create_directories(package_dir).has_value());
+    COVA_CHECK(cova::fs::write_file(package_dir / "cova.toml",
+                                    "[package]\nname = \"" +
+                                        std::filesystem::path(directory).filename().string() +
+                                        "\"\nversion = \"0.1.0\"\n")
+                   .has_value());
+  }
+  std::string manifest = "[workspace]\nmembers = [";
+  for (std::size_t index = 0; index < member_globs.size(); ++index) {
+    manifest += (index == 0 ? "\"" : ", \"") + member_globs[index] + "\"";
+  }
+  manifest += "]\nexclude = [";
+  for (std::size_t index = 0; index < excludes.size(); ++index) {
+    manifest += (index == 0 ? "\"" : ", \"") + excludes[index] + "\"";
+  }
+  manifest += "]\n";
+  COVA_CHECK(cova::fs::write_file(root / "cova.toml", manifest).has_value());
+
+  auto workspace = cova::workspace::load(root);
+  COVA_CHECK_MSG(workspace.has_value(), "workspace failed to load");
+  std::vector<std::string> names;
+  for (const auto& member : workspace->members) {
+    names.push_back(member.name);
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+}  // namespace
+
+COVA_TEST_NAMED(workspace, exclude_matches_whole_path_components_only) {
+  cova::test::TempDir temp;
+  // Excluding "vendor" must not also remove "vendor-lib": a substring match
+  // used to delete it from the workspace without any diagnostic.
+  const auto names = discover(temp.path(), {"vendor", "vendor-lib", "alpha"}, {"vendor"},
+                              {"vendor", "vendor-lib", "alpha"});
+  COVA_CHECK_EQ(names.size(), std::size_t{2});
+  COVA_CHECK(std::find(names.begin(), names.end(), "vendor-lib") != names.end());
+  COVA_CHECK(std::find(names.begin(), names.end(), "alpha") != names.end());
+  COVA_CHECK(std::find(names.begin(), names.end(), "vendor") == names.end());
+}
+
+COVA_TEST_NAMED(workspace, exclude_does_not_behave_like_a_substring_filter) {
+  cova::test::TempDir temp;
+  // A short exclusion used to drop every member whose path merely contained it.
+  const auto names = discover(temp.path(), {"alpha", "beta"}, {"beta"}, {"alpha", "beta"});
+  COVA_CHECK_EQ(names.size(), std::size_t{1});
+  COVA_CHECK_EQ(names.front(), std::string("alpha"));
+}
+
+COVA_TEST_NAMED(workspace, exclude_supports_glob_components) {
+  cova::test::TempDir temp;
+  const auto names = discover(temp.path(), {"*"}, {"build-*"}, {"build-tools", "app"});
+  COVA_CHECK_EQ(names.size(), std::size_t{1});
+  COVA_CHECK_EQ(names.front(), std::string("app"));
 }
 
 COVA_TEST_MAIN()

@@ -520,7 +520,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
   options.fail_fast = !ctx.flags.boolean("keep-going");
   options.verbose = ctx.global.verbose;
   options.quiet = ctx.global.quiet;
-  options.use_color = ctx.global.use_color(stdout_is_tty());
+  options.use_color = ctx.global.build_diagnostic_color();
 
   build::CacheSettings cache = build::default_cache_settings();
   cache.enabled = cache.enabled && !ctx.global.offline_mode();
@@ -1002,7 +1002,7 @@ int cmd_check(CommandContext& ctx) {
   options.max_parallel = config->resolved_jobs();
   options.quiet = ctx.global.quiet;
   options.verbose = ctx.global.verbose;
-  options.use_color = ctx.global.use_color(stdout_is_tty());
+  options.use_color = ctx.global.build_diagnostic_color();
 
   ProgressReporter::Options progress;
   progress.header = "Checking `" + project_label(prepared.project) + "` with " +

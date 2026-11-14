@@ -44,6 +44,14 @@ struct GlobalOptions {
   std::string version_flag;  // "--version" content, unused when empty
 
   bool use_color(bool tty) const;
+  // Colour for *compiler* diagnostics, which is part of the compile command
+  // line and therefore of the build cache key.
+  //
+  // "auto" must not consult the terminal here: doing so made CI and local
+  // builds of the same tree disagree on every cache key and produced different
+  // `compile_commands.json` files. Only an explicit `--color always` enables
+  // it, so the value is a property of the invocation, not of the environment.
+  bool build_diagnostic_color() const { return color == "always"; }
   bool install_allowed() const { return !no_install && !offline; }
   bool locked_mode() const { return locked || frozen; }
   bool offline_mode() const { return offline || frozen; }

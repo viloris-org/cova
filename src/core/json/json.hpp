@@ -7,6 +7,8 @@
 #include <concepts>
 #include <cstdint>
 #include <map>
+#include <limits>
+#include <type_traits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -34,9 +36,13 @@ class Value {
   // `unsigned long` or `unsigned long long` on this platform. Keeping separate
   // int/int64_t/size_t overloads made `uint64_t` ambiguous on macOS, where it
   // is a distinct type from `size_t`.
+  //
+  // Unsigned values above INT64_MAX are clamped rather than wrapped: a silent
+  // wrap turned a byte count such as 18446744073709551615 into `-1`, which then
+  // looked like a sentinel to every consumer.
   template <typename T>
     requires(std::integral<T> && !std::same_as<std::remove_cv_t<T>, bool>)
-  Value(T v) : storage_(static_cast<std::int64_t>(v)) {}
+  Value(T v) : storage_(to_storage(v)) {}
   Value(double v);
   Value(const char* v);
   Value(std::string v);
@@ -77,6 +83,16 @@ class Value {
   bool operator==(const Value&) const;
 
  private:
+  template <typename T>
+  static std::int64_t to_storage(T v) {
+    if constexpr (std::is_unsigned_v<T>) {
+      if (v > static_cast<T>(std::numeric_limits<std::int64_t>::max())) {
+        return std::numeric_limits<std::int64_t>::max();
+      }
+    }
+    return static_cast<std::int64_t>(v);
+  }
+
   Storage storage_;
 };
 

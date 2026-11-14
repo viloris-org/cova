@@ -458,6 +458,36 @@ Status write_file_atomic(const Path& p, std::string_view data) {
                                .with("to: " + path_text(p))
                                .with("reason: " + ec.message()));
   }
+#ifndef _WIN32
+  // The rename is only durable once the *directory* entry is flushed. Without
+  // this a crash right after writing a lockfile can leave the old one in place
+  // while the manifest already references the new resolution.
+  //
+  // Failure to open/fsync the directory is not fatal: the data and the rename
+  // are already durable on most filesystems, and refusing to write a lockfile
+  // because a platform rejects directory fsync would be worse. It is reported
+  // so a genuinely broken filesystem is not silent.
+#ifdef O_DIRECTORY
+  const int dir_flags = O_RDONLY | O_DIRECTORY;
+#else
+  // Some platforms (older BSD, macOS SDKs without POSIX 2008 extensions) do not
+  // define O_DIRECTORY; opening the directory read-only is still enough for
+  // fsync on those systems.
+  const int dir_flags = O_RDONLY;
+#endif
+  const int dir_fd = ::open(parent.c_str(), dir_flags);
+  if (dir_fd >= 0) {
+    if (::fsync(dir_fd) != 0) {
+      const int saved = errno;
+      ::close(dir_fd);
+      return std::unexpected(Error::make("cova::fs::write_failed",
+                                         "atomic rename was not made durable")
+                                 .with("path: " + path_text(p))
+                                 .with("errno: " + std::string(std::strerror(saved))));
+    }
+    ::close(dir_fd);
+  }
+#endif
   return ok();
 }
 

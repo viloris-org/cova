@@ -118,7 +118,25 @@ int compare_versions(const Version& a, const Version& b) {
   return compare_prerelease(a.pre, b.pre);
 }
 
-std::string format_bound(const VersionBound& bound) {
+}  // namespace
+
+// The public relational operators delegate to the SemVer-aware comparison.
+// Keeping one implementation means the resolver's "newest compiler" sort and
+// requirement matching can never disagree about ordering.
+std::strong_ordering Version::operator<=>(const Version& other) const {
+  const int order = compare_versions(*this, other);
+  if (order < 0) {
+    return std::strong_ordering::less;
+  }
+  if (order > 0) {
+    return std::strong_ordering::greater;
+  }
+  return std::strong_ordering::equal;
+}
+
+bool Version::operator==(const Version& other) const { return compare_versions(*this, other) == 0; }
+
+namespace {std::string format_bound(const VersionBound& bound) {
   std::string_view op;
   switch (bound.op) {
     case VersionBound::Op::Eq:
@@ -412,6 +430,18 @@ Version partial_to_version(const PartialVersion& p) {
   return version;
 }
 
+// First version after the series described by a partial requirement:
+// `1` -> 2.0.0, `1.2` -> 1.3.0, `1.2.3` -> 1.2.4.
+Version next_series(const PartialVersion& p) {
+  if (p.count <= 1) {
+    return Version(p.parts[0] + 1, 0, 0);
+  }
+  if (p.count == 2) {
+    return Version(p.parts[0], p.parts[1] + 1, 0);
+  }
+  return Version(p.parts[0], p.parts[1], p.parts[2] + 1);
+}
+
 }  // namespace
 
 Result<VersionRequirement> VersionRequirement::parse(std::string_view text) {
@@ -476,26 +506,45 @@ Result<VersionRequirement> VersionRequirement::parse(std::string_view text) {
                               "the != operator is not supported in version requirements")
                       .with("clause: " + clause));
     } else if (op_text == ">") {
-      add_bound(VersionBound::Op::Gt, partial_to_version(partial));
+      // `>1.2` means "newer than the whole 1.2 series", i.e. >= 1.3.0. Taking
+      // `>1.2.0` would have accepted 1.2.1, contradicting the series reading
+      // used by the bare form (`1.2` == `>=1.2, <1.3`).
+      if (partial.count < 3) {
+        add_bound(VersionBound::Op::Ge, next_series(partial));
+      } else {
+        add_bound(VersionBound::Op::Gt, partial_to_version(partial));
+      }
     } else if (op_text == ">=") {
       add_bound(VersionBound::Op::Ge, partial_to_version(partial));
     } else if (op_text == "<") {
       add_bound(VersionBound::Op::Lt, partial_to_version(partial));
     } else if (op_text == "<=") {
-      add_bound(VersionBound::Op::Le, partial_to_version(partial));
+      // `<=1.2` includes the whole 1.2 series: `<=1.2.0` rejected 1.2.5.
+      if (partial.count < 3) {
+        add_bound(VersionBound::Op::Lt, next_series(partial));
+      } else {
+        add_bound(VersionBound::Op::Le, partial_to_version(partial));
+      }
     } else if (op_text == "^") {
+      // Cargo semantics: `^` allows changes that do not modify the left-most
+      // non-zero component, so the upper bound depends on how many leading
+      // components are zero — not on how many were written.
+      //
+      // The previous test (`base.major > 0 || partial.count > 1`) sent every
+      // written-out version to `<major+1,0,0>`, making `^0.0.3` accept `0.9.0`
+      // and `^0.1.2` accept `0.9.0`. The `else` branch that implemented the
+      // 0.x rule was therefore unreachable.
       const Version base = partial_to_version(partial);
       add_bound(VersionBound::Op::Ge, base);
-      if (base.major > 0 || partial.count > 1) {
-        add_bound(VersionBound::Op::Lt,
-                  Version(base.major + 1, 0, 0));
+      if (base.major > 0 || partial.count == 1) {
+        // ^1.2.3 -> <2.0.0 ; ^0 -> <1.0.0
+        add_bound(VersionBound::Op::Lt, Version(base.major + 1, 0, 0));
+      } else if (base.minor > 0 || partial.count == 2) {
+        // ^0.2.3 -> <0.3.0 ; ^0.2 -> <0.3.0
+        add_bound(VersionBound::Op::Lt, Version(0, base.minor + 1, 0));
       } else {
-        // ^0.x.y pins the minor series, matching Cargo's rules for 0.x.
-        if (partial.count >= 2) {
-          add_bound(VersionBound::Op::Lt, Version(0, base.minor + 1, 0));
-        } else {
-          add_bound(VersionBound::Op::Lt, Version(1, 0, 0));
-        }
+        // ^0.0.3 -> <0.0.4 ; ^0.0 -> <0.1.0 comes from the minor branch above
+        add_bound(VersionBound::Op::Lt, Version(0, 0, base.patch + 1));
       }
     } else if (op_text == "~") {
       const Version base = partial_to_version(partial);

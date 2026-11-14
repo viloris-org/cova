@@ -84,6 +84,26 @@ Result<std::vector<std::string>> read_array(const Table& table, std::string_view
   return out;
 }
 
+// Like `read_array`, but distinguishes "the key is absent" (nullopt) from "the
+// key is present and explicitly empty" (an empty vector).
+//
+// The distinction matters wherever the field has a built-in default: a manifest
+// that writes `sources = []` is disabling something, and silently substituting
+// the default would invert the user's intent.
+Result<std::optional<std::vector<std::string>>> read_array_optional(const Table& table,
+                                                                   std::string_view key,
+                                                                   std::string_view context) {
+  if (!lookup(table, key)) {
+    return std::optional<std::vector<std::string>>{};
+  }
+  auto values = read_array(table, key, context);
+  if (!values) {
+    return fail<std::optional<std::vector<std::string>>>(values.error());
+  }
+  return std::optional<std::vector<std::string>>{std::move(*values)};
+}
+
+
 std::optional<platform::Crt> crt_from_manifest(std::string_view text) {
   const std::string value = str::to_lower(str::trim_view(text));
   if (value == "glibc" || value == "gnu") {
@@ -129,19 +149,35 @@ Result<Profile> parse_profile(const Table& table, const Profile& defaults,
   Profile profile = defaults;
   if (auto value = lookup(table, "optimization")) {
     if (value && (*value)->is_integer()) {
-      profile.optimization = static_cast<int>((*value)->as_integer());
+      const std::int64_t level = (*value)->as_integer();
+      if (level < 0 || level > 3) {
+        return fail<Profile>(Error::make(
+            "cova::manifest::profile",
+            "optimization level " + std::to_string(level) + " is out of range in " +
+                std::string(context))
+                                 .with("accepted levels are 0, 1, 2 and 3")
+                                 .with("use \"s\" or \"size\" to optimise for size"));
+      }
+      profile.optimization = static_cast<int>(level);
+      profile.optimize_for_size = false;
     } else if (value && (*value)->is_string()) {
       const std::string text = (*value)->as_string();
       if (text == "none" || text == "0") {
         profile.optimization = 0;
+        profile.optimize_for_size = false;
       } else if (text == "1" || text == "less") {
         profile.optimization = 1;
-      } else if (text == "2" || text == "2") {
+        profile.optimize_for_size = false;
+      } else if (text == "2") {
         profile.optimization = 2;
-      } else if (text == "3" || text == "3") {
+        profile.optimize_for_size = false;
+      } else if (text == "3") {
         profile.optimization = 3;
+        profile.optimize_for_size = false;
       } else if (text == "s" || text == "size") {
+        // `-Os` rather than an `-O` level: this is what the author asked for.
         profile.optimization = 2;
+        profile.optimize_for_size = true;
       } else {
         return fail<Profile>(Error::make(
             "cova::manifest::profile", "invalid optimization `" + text + "` in " +
@@ -265,13 +301,15 @@ Result<FormatSection> parse_format(const Table& table, std::string_view context)
 
 Result<TestSection> parse_test(const Table& table, std::string_view context) {
   TestSection section;
-  section.sources = {"tests/**/*.cpp"};
-  auto sources = read_array(table, "sources", context);
+  // The default lives on the struct, so "absent" inherits it while an explicit
+  // `sources = []` genuinely disables test discovery. Substituting the default
+  // for an empty array made the key impossible to switch off.
+  auto sources = read_array_optional(table, "sources", context);
   if (!sources) {
     return fail<TestSection>(sources.error());
   }
-  if (!sources->empty()) {
-    section.sources = std::move(*sources);
+  if (sources->has_value()) {
+    section.sources = std::move(**sources);
   }
   auto exclude = read_array(table, "exclude", context);
   if (!exclude) {
@@ -482,16 +520,38 @@ std::optional<PackageKind> kind_from_string(std::string_view text) {
 
 int PackageSection::cpp_standard() const {
   std::string value = str::to_lower(str::trim_view(edition));
+  // "gnu++" is five characters and "c++" is three; using 3 for both turned
+  // "gnu++17" into "++17", which `stoi` rejects, and the old catch-all then
+  // reported the newest standard (26) instead of the requested one.
   if (value.rfind("gnu++", 0) == 0) {
+    value = value.substr(5);
+  } else if (value.rfind("c++", 0) == 0) {
     value = value.substr(3);
   }
-  if (value.rfind("c++", 0) == 0) {
-    value = value.substr(3);
+  // Require plain digits: `stoi` happily parses "17abc" as 17.
+  if (value.empty() ||
+      !std::all_of(value.begin(), value.end(),
+                   [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; })) {
+    return 0;
   }
+  int standard = 0;
   try {
-    return std::stoi(value);
+    standard = std::stoi(value);
   } catch (...) {
-    return 26;
+    return 0;
+  }
+  // Only the standards Cova actually supports. Returning an arbitrary number
+  // would let `c++99` through as if it were a real flag.
+  switch (standard) {
+    case 11:
+    case 14:
+    case 17:
+    case 20:
+    case 23:
+    case 26:
+      return standard;
+    default:
+      return 0;
   }
 }
 
@@ -518,13 +578,18 @@ std::string DependencySpec::to_string() const {
 }
 
 std::string Profile::to_string() const {
-  return name + " (opt " + std::to_string(optimization) + (debug ? ", debug" : "") +
+  const std::string level = optimize_for_size ? std::string("s") : std::to_string(optimization);
+  return name + " (opt " + level + (debug ? ", debug" : "") +
          (lto ? ", lto" : "") + ")";
 }
 
 std::vector<std::string> Profile::cxx_flags() const {
   std::vector<std::string> flags;
-  flags.push_back("-O" + std::to_string(optimization));
+  if (optimize_for_size) {
+    flags.push_back("-Os");
+  } else {
+    flags.push_back("-O" + std::to_string(optimization));
+  }
   if (debug) {
     flags.push_back("-g");
   }
@@ -1120,14 +1185,19 @@ std::string to_toml(const Manifest& manifest) {
     Table profiles;
     for (const auto& [name, profile] : manifest.profiles) {
       Table table;
-      table.emplace("optimization", Value(static_cast<std::int64_t>(profile.optimization)));
+      // Preserve `optimization = "s"` as such instead of flattening it to the
+      // numeric level 2, which would re-parse as `-O2`.
+      table.emplace("optimization", profile.optimize_for_size
+                                        ? Value(std::string("s"))
+                                        : Value(static_cast<std::int64_t>(profile.optimization)));
+      // `debug`, `lto` and `assertions` are always written, even when they
+      // match the built-in default for this profile name. Parsing starts from
+      // `default_profiles()`, so an omitted key re-applies the *default*, not
+      // the value that was in the file: `lto = false` in `[profile.release]`
+      // silently became `lto = true` on the next write.
       table.emplace("debug", Value(profile.debug));
-      if (profile.lto) {
-        table.emplace("lto", Value(true));
-      }
-      if (!profile.assertions) {
-        table.emplace("assertions", Value(false));
-      }
+      table.emplace("lto", Value(profile.lto));
+      table.emplace("assertions", Value(profile.assertions));
       if (profile.sanitize) {
         if (profile.sanitizer.empty()) {
           table.emplace("sanitize", Value(true));
@@ -1171,7 +1241,16 @@ std::string to_toml(const Manifest& manifest) {
 
   {
     Table test;
-    write_string_array(test, "sources", manifest.test.sources);
+    // `sources` is written even when empty: an empty array is how a manifest
+    // disables test discovery, and omitting the key would re-apply the default
+    // on the next parse (breaking round-trip stability and silently
+    // re-enabling tests the user turned off).
+    toml::Array sources;
+    sources.reserve(manifest.test.sources.size());
+    for (const auto& entry : manifest.test.sources) {
+      sources.emplace_back(entry);
+    }
+    test.emplace("sources", Value(std::move(sources)));
     write_string_array(test, "exclude", manifest.test.exclude);
     if (!manifest.test.runner.empty()) {
       test.emplace("runner", Value(manifest.test.runner));
@@ -1197,12 +1276,20 @@ std::string to_toml(const Manifest& manifest) {
       if (!manifest.workspace->toolchain->version.empty()) {
         toolchain_section.emplace("version", Value(manifest.workspace->toolchain->version));
       }
+      // Mirror the top-level [toolchain] writer. Omitting `auto-install` and
+      // `preferred` here silently dropped a workspace-level toolchain pin on
+      // every manifest rewrite, falling back to system discovery.
+      toolchain_section.emplace("auto-install", Value(manifest.workspace->toolchain->auto_install));
+      if (!manifest.workspace->toolchain->preferred.empty()) {
+        toolchain_section.emplace("preferred", Value(manifest.workspace->toolchain->preferred));
+      }
       workspace.emplace("toolchain", table_value(std::move(toolchain_section)));
     }
     if (manifest.workspace->format) {
       Table format;
       format.emplace("tool", Value(manifest.workspace->format->tool));
       format.emplace("style", Value(manifest.workspace->format->style));
+      format.emplace("fallback-style", Value(manifest.workspace->format->fallback_style));
       write_string_array(format, "include", manifest.workspace->format->include);
       write_string_array(format, "exclude", manifest.workspace->format->exclude);
       workspace.emplace("format", table_value(std::move(format)));

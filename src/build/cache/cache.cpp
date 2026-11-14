@@ -273,27 +273,59 @@ void BuildState::record(ActionRecord record) {
 // Depfiles
 // ---------------------------------------------------------------------------
 Result<Depfile> Depfile::parse(std::string_view text, const Path& base) {
+  // GNU make / GCC / Clang dependency-file syntax:
+  //
+  //   target: dep dep   //     dep
+  //
+  // with `\ ` and `\#` escaping whitespace/special characters inside a path,
+  // `\:` escaping a colon, and a `C:\dir` drive prefix that is *not* the
+  // target separator. Windows compilers emit raw backslashes, so a parser that
+  // treats `\` as "always escape the next byte" mangles every dependency
+  // (`C:\src\a.cpp` became `C:src a.cpp`).
   Depfile depfile;
+
+  // Join continuation lines. A trailing backslash continues the logical line;
+  // CRLF endings are stripped so `\r` never becomes part of a path.
   std::string joined;
-  for (const auto& line : str::split(text, '\n')) {
-    if (!line.empty() && line.back() == '\\') {
-      joined.append(line.substr(0, line.size() - 1));
+  for (const auto& raw_line : str::split(text, '\n')) {
+    std::string line = raw_line;
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    // A continuation is a *single* backslash at end of line, not an escaped one.
+    std::size_t trailing = 0;
+    while (trailing < line.size() && line[line.size() - 1 - trailing] == '\\') {
+      ++trailing;
+    }
+    if (trailing % 2 == 1) {
+      line.pop_back();
+      joined += line;
       joined.push_back(' ');
     } else {
-      joined.append(line);
-      joined.push_back(' ');
+      joined += line;
+      joined.push_back('\n');
     }
   }
-  // Find the target/dependency separator. A Windows drive prefix (`C:`)
-  // must not be mistaken for it, otherwise every dependency path is shifted.
+
+  // Find the target/dependency separator, skipping Windows drive prefixes.
+  // A drive prefix is a single letter followed by ':' and then a separator, and
+  // it can only occur at the very start of a path token (beginning of the file
+  // or right after whitespace).
   std::size_t colon = std::string::npos;
   for (std::size_t index = 0; index < joined.size(); ++index) {
     if (joined[index] != ':') {
       continue;
     }
-    if (index == 1 && std::isalpha(static_cast<unsigned char>(joined[0])) &&
+    // The drive letter sits at `index - 1`, so the token starts one byte before
+    // that: either `index == 1`, or `index - 2` is whitespace.
+    const bool at_token_start =
+        index >= 1 && (index == 1 ||
+                       std::isspace(static_cast<unsigned char>(joined[index - 2])) != 0);
+    const bool looks_like_drive =
+        at_token_start && std::isalpha(static_cast<unsigned char>(joined[index - 1])) &&
         index + 1 < joined.size() &&
-        (joined[index + 1] == '/' || joined[index + 1] == '\\')) {
+        (joined[index + 1] == '/' || joined[index + 1] == '\\');
+    if (looks_like_drive) {
       continue;
     }
     colon = index;
@@ -302,26 +334,43 @@ Result<Depfile> Depfile::parse(std::string_view text, const Path& base) {
   if (colon == std::string::npos) {
     return fail<Depfile>(Error::make("cova::build::depfile", "dependency file has no target line"));
   }
+
   const std::string dependencies = joined.substr(colon + 1);
   std::string current;
+  bool have_token = false;
+  auto flush = [&]() {
+    if (have_token && !current.empty()) {
+      depfile.dependencies.push_back(base / current);
+    }
+    current.clear();
+    have_token = false;
+  };
+
   for (std::size_t index = 0; index < dependencies.size(); ++index) {
     const char character = dependencies[index];
     if (character == '\\' && index + 1 < dependencies.size()) {
-      current.push_back(dependencies[++index]);
+      const char next = dependencies[index + 1];
+      // `\ ` and `\#` and `\\` are escapes; a backslash before anything else
+      // (notably before a drive-letter path) is literal, because Windows paths
+      // contain far more backslashes than escapes.
+      if (next == ' ' || next == '\t' || next == '#' || next == '\\' || next == ':') {
+        current.push_back(next);
+        have_token = true;
+        ++index;
+        continue;
+      }
+      current.push_back(character);
+      have_token = true;
       continue;
     }
-    if (std::isspace(static_cast<unsigned char>(character))) {
-      if (!current.empty()) {
-        depfile.dependencies.push_back(base / current);
-        current.clear();
-      }
+    if (std::isspace(static_cast<unsigned char>(character)) != 0) {
+      flush();
       continue;
     }
     current.push_back(character);
+    have_token = true;
   }
-  if (!current.empty()) {
-    depfile.dependencies.push_back(base / current);
-  }
+  flush();
   return depfile;
 }
 

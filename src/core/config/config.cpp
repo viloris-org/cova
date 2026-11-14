@@ -100,7 +100,17 @@ Result<std::uint64_t> read_size(const toml::Table& table, std::string_view key,
                                          "cannot parse size for '" + std::string(key) + "'")
                                  .with("value: " + it->second.as_string()));
     }
-    return static_cast<std::uint64_t>(amount) * multiplier;
+    // Reject a size that does not fit in 64 bits instead of wrapping. A wrapped
+    // limit such as "9223372036854775807gb" -> 18446744072709551616 disables
+    // cache eviction in a way the user never asked for.
+    const auto scaled =
+        static_cast<std::uint64_t>(amount) * multiplier;
+    if (multiplier != 0 && scaled / multiplier != static_cast<std::uint64_t>(amount)) {
+      return std::unexpected(Error::make("cova::config::value",
+                                         "size for '" + std::string(key) + "' is too large")
+                                 .with("value: " + it->second.as_string()));
+    }
+    return scaled;
   }
   return std::unexpected(type_error("cova::config::value", std::string(key), "an integer", it->second));
 }

@@ -19,7 +19,15 @@ struct PlanOptions {
   platform::Triple target;
   std::string profile = "dev";
   int jobs = 0;
-  bool use_color = true;
+  // Colourised compiler diagnostics, forced on or off.
+  //
+  // This value ends up in the compile command line, and the command line is
+  // part of the action identity. Deriving it from "is stdout a terminal?" made
+  // the same source tree produce different cache keys in CI and on a developer
+  // machine (and a different `compile_commands.json`), so every switch of
+  // environment forced a full rebuild. The planner therefore always pins it to
+  // a value that is a property of the *request*, never of the terminal.
+  bool use_color = false;
   bool include_tests = false;
   bool explain = false;
   bool workspace = false;

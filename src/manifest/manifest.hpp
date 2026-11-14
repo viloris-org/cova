@@ -40,7 +40,10 @@ struct PackageSection {
   std::optional<platform::Crt> crt;
   std::optional<platform::LibCpp> libcpp;
 
-  // C++ standard as an integer: 26 for "c++26", 23 for "c++23".
+  // C++ standard as an integer: 26 for "c++26", 23 for "c++23", and the same
+  // for the GNU spellings (`gnu++23`). Returns 0 when the edition is not a
+  // recognised C++ standard, so a caller can reject it instead of silently
+  // compiling as the newest standard.
   int cpp_standard() const;
 };
 
@@ -92,7 +95,12 @@ struct DependencySpec {
 // [profile.dev] / [profile.release]
 struct Profile {
   std::string name = "dev";
-  int optimization = 0;        // -O level
+  int optimization = 0;        // -O level, always 0..3
+  // True when the profile asked for size optimisation (`optimization = "s"` /
+  // `"size"`). It is a separate flag because `-Os` is not an optimisation
+  // *level*: mapping "size" onto `-O2` silently produced a speed-optimised
+  // binary when the manifest asked for the smallest one.
+  bool optimize_for_size = false;
   bool debug = true;           // debug info
   bool lto = false;
   bool sanitize = false;
@@ -136,7 +144,10 @@ struct TargetOverride {
 
 // [test]
 struct TestSection {
-  std::vector<std::string> sources;      // globs; defaults to tests/**/*.cpp
+  // Glob patterns for test sources. The default is enabled so a manifest with
+  // no `[test]` section still finds `tests/**`; writing `sources = []` disables
+  // discovery explicitly (the parser distinguishes the two cases).
+  std::vector<std::string> sources = {"tests/**/*.cpp"};
   std::vector<std::string> exclude;
   std::string runner;                    // "", "native", "qemu", "wine", "remote"
   std::string runner_command;
