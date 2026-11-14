@@ -161,6 +161,60 @@ COVA_TEST_NAMED(build, cache_key_changes_with_input_contents) {
   COVA_CHECK(first != action.cache_key(environment));
 }
 
+// Regression: `cova test` links every non-main object plus the dependency
+// artifacts, so all of them must be inputs. Leaving them out kept them out of
+// the cache key and the test binary was never relinked after a library change.
+COVA_TEST_NAMED(build, test_link_inputs_cover_every_object) {
+  cova::test::TempDir temp;
+  const auto root = std::filesystem::path(temp.path()) / "pkg";
+  COVA_CHECK(cova::fs::create_directories(root / "src").has_value());
+  COVA_CHECK(cova::fs::create_directories(root / "tests").has_value());
+  COVA_CHECK(cova::fs::write_file(root / "src" / "main.cpp",
+                                  "int main() { return 0; }\n")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(root / "src" / "lib.cpp",
+                                  "int lib() { return 1; }\n")
+                 .has_value());
+  COVA_CHECK(cova::fs::write_file(root / "tests" / "smoke.cpp",
+                                  "int lib(); int main() { return lib(); }\n")
+                 .has_value());
+
+  auto manifest = cova::manifest::default_manifest("pkg", cova::manifest::PackageKind::Executable);
+  manifest.path = root / "cova.toml";
+  manifest.root = root;
+  manifest.build.sources = {"src/**/*.cpp"};
+  manifest.test.sources = {"tests/**/*.cpp"};
+
+  cova::build::PlanOptions options;
+  options.target = cova::platform::host_triple();
+  options.profile = "dev";
+  options.include_tests = true;
+  auto plan = COVA_REQUIRE_OK(cova::build::plan_package(
+      manifest, dummy_toolchain("/usr/bin/ar"), options,
+      std::filesystem::path(temp.path()) / "target"));
+
+  const cova::build::Action* test_link = nullptr;
+  for (const auto& action : plan.graph.actions()) {
+    if (action.kind == cova::build::ActionKind::Link &&
+        action.label.rfind("link test", 0) == 0) {
+      test_link = &action;
+    }
+  }
+  COVA_CHECK(test_link != nullptr);
+  if (test_link == nullptr) {
+    return;
+  }
+  // The link line names lib.o (main.o is excluded for tests); that object must
+  // be an input, otherwise editing lib.cpp never changes the test link's key.
+  bool has_lib_object = false;
+  for (const auto& input : test_link->inputs) {
+    if (input.role == "object" && input.path.filename() == "lib.o") {
+      has_lib_object = true;
+    }
+  }
+  COVA_CHECK(has_lib_object);
+}
+
 COVA_TEST_NAMED(build, state_round_trips_and_detects_changes) {
   cova::test::TempDir temp;
   const auto input = std::filesystem::path(temp.path()) / "input.cpp";

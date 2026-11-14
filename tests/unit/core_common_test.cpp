@@ -171,6 +171,36 @@ COVA_TEST_NAMED(common, human_bytes) {
   COVA_CHECK_EQ(cova::human_bytes(2ull * 1024 * 1024 * 1024), std::string("2.0 GiB"));
 }
 
+// Regression: a manifest may declare an arbitrarily long numeric pre-release
+// identifier. Comparing them used std::stoll, which throws on overflow and
+// terminated the process; ordering must instead follow SemVer's numeric rule
+// without converting to an integer.
+COVA_TEST_NAMED(common, version_compare_survives_huge_prerelease_numbers) {
+  // The overflow is in the *pre-release* identifier: major/minor/patch are
+  // bounded by parse_number, but SemVer puts no length limit on these.
+  const std::string huge = "99999999999999999999999";
+  auto requirement = COVA_REQUIRE_OK(cova::VersionRequirement::parse("=1.0.0-" + huge));
+  auto candidate = COVA_REQUIRE_OK(cova::Version::parse("1.0.0-" + huge));
+  // The panic this guards against is an abort, so reaching the check at all is
+  // most of the assertion.
+  COVA_CHECK(requirement.matches(candidate));
+
+  auto less = COVA_REQUIRE_OK(cova::VersionRequirement::parse("<1.0.0-" + huge));
+  auto slightly_less = COVA_REQUIRE_OK(cova::Version::parse("1.0.0-99999999999999999999998"));
+  COVA_CHECK(less.matches(slightly_less));
+  auto one = COVA_REQUIRE_OK(cova::Version::parse("1.0.0-1"));
+  COVA_CHECK(less.matches(one));
+
+  // Leading zeros compare numerically, not lexically.
+  auto with_zeros = COVA_REQUIRE_OK(cova::Version::parse("1.0.0-007"));
+  auto plain = COVA_REQUIRE_OK(cova::Version::parse("1.0.0-7"));
+  auto eq_plain = COVA_REQUIRE_OK(cova::VersionRequirement::parse("=1.0.0-7"));
+  COVA_CHECK(eq_plain.matches(with_zeros));
+  auto lt_eight = COVA_REQUIRE_OK(cova::VersionRequirement::parse("<1.0.0-8"));
+  COVA_CHECK(lt_eight.matches(with_zeros));
+  (void)plain;
+}
+
 COVA_TEST_NAMED(common, version_extract_ignores_triple_components) {
   auto version =
       COVA_REQUIRE_OK(cova::Version::extract("x86_64-pc-linux-gnu-g++ (GCC) 16.2.1 20260810"));

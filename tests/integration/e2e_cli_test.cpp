@@ -15,6 +15,7 @@
 
 #include "cli/cli.hpp"
 #include "cli/common.hpp"
+#include "core/config/config.hpp"
 #include "core/filesystem/filesystem.hpp"
 #include "core/hashing/hash.hpp"
 #include "core/json/json.hpp"
@@ -638,6 +639,164 @@ COVA_TEST_NAMED(integration, clean_removes_artifacts_but_keeps_sources) {
   COVA_CHECK(cova::fs::is_regular_file(root / "cova.toml"));
   // Shared data directories are untouched by a default clean (PRD §12.1).
   COVA_CHECK(cova::fs::is_directory(temp.sub("covahome")));
+}
+
+// Regression: `--profile` is a *global* option, so it never lands in
+// `ctx.flags`. Reading it from there made `clean --profile dev` fall through to
+// the "remove target/" branch and wipe every profile.
+COVA_TEST_NAMED(integration, clean_with_profile_keeps_other_profiles) {
+  COVA_SKIP_UNLESS_CXX_DRIVER();
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "profiles"}).ok());
+  }
+  const stdfs::path root = stdfs::path(temp.path()) / "profiles";
+  ScopedCwd cwd(root);
+
+  COVA_CHECK_MSG(run_cli({"build"}).ok(), "dev build failed");
+  COVA_CHECK_MSG(run_cli({"build", "--release"}).ok(), "release build failed");
+
+  // Find the per-target directory so the assertion does not depend on how the
+  // triple is spelled on this host.
+  stdfs::path target_root;
+  std::error_code ec;
+  for (auto it = stdfs::directory_iterator(root / "target", ec);
+       it != stdfs::directory_iterator(); it.increment(ec)) {
+    if (cova::fs::is_directory(it->path())) {
+      target_root = it->path();
+      break;
+    }
+  }
+  COVA_CHECK(cova::fs::is_directory(target_root / "dev"));
+  COVA_CHECK(cova::fs::is_directory(target_root / "release"));
+
+  auto cleaned = run_cli({"clean", "--profile", "dev"});
+  COVA_CHECK_MSG(cleaned.ok(), cleaned.combined());
+
+  // Only the selected profile went away.
+  COVA_CHECK(!cova::fs::is_directory(target_root / "dev"));
+  COVA_CHECK(cova::fs::is_directory(target_root / "release"));
+  // The whole target tree is not sacrificed.
+  COVA_CHECK(cova::fs::is_directory(root / "target"));
+}
+
+// Regression: `cova add` re-serialised the whole manifest, so any comment or
+// key the model did not know was silently deleted.
+COVA_TEST_NAMED(integration, add_and_remove_preserve_manifest_text) {
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "keepme"}).ok());
+  }
+  const stdfs::path root = stdfs::path(temp.path()) / "keepme";
+  const stdfs::path dep = stdfs::path(temp.path()) / "dep";
+  COVA_CHECK(cova::fs::create_directories(dep).has_value());
+  COVA_CHECK(cova::fs::write_file(dep / "cova.toml",
+                                  "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n"
+                                  "edition = \"c++26\"\n\n[build]\ntype = \"static-library\"\n"
+                                  "sources = [\"src/**/*.cpp\"]\n")
+                 .has_value());
+  COVA_CHECK(cova::fs::create_directories(dep / "src").has_value());
+  COVA_CHECK(cova::fs::write_file(dep / "src" / "dep.cpp", "int dep() { return 0; }\n")
+                 .has_value());
+
+  const std::string original =
+      "# hand-written comment\n"
+      "[package]\n"
+      "name = \"keepme\"\n"
+      "version = \"0.1.0\"\n"
+      "edition = \"c++26\"\n"
+      "\n"
+      "[build]\n"
+      "type = \"executable\"\n"
+      "sources = [\"src/**/*.cpp\"]\n"
+      "custom-key = \"preserve me\"\n"
+      "\n"
+      "[toolchain]\n"
+      "policy = \"system-first\"\n"
+      "auto-install = false\n";
+  COVA_CHECK(cova::fs::write_file(root / "cova.toml", original).has_value());
+
+  ScopedCwd cwd(root);
+  auto added = run_cli({"add", "dep", "--path", "../dep"});
+  COVA_CHECK_MSG(added.ok(), added.combined());
+
+  auto after_add = COVA_REQUIRE_OK(cova::fs::read_file(root / "cova.toml"));
+  COVA_CHECK(after_add.find("# hand-written comment") != std::string::npos);
+  COVA_CHECK(after_add.find("custom-key") != std::string::npos);
+  COVA_CHECK(after_add.find("dep = {") != std::string::npos);
+
+  auto removed = run_cli({"remove", "dep"});
+  COVA_CHECK_MSG(removed.ok(), removed.combined());
+  auto after_remove = COVA_REQUIRE_OK(cova::fs::read_file(root / "cova.toml"));
+  COVA_CHECK(after_remove.find("# hand-written comment") != std::string::npos);
+  COVA_CHECK(after_remove.find("custom-key") != std::string::npos);
+  COVA_CHECK(after_remove.find("dep = {") == std::string::npos);
+  // An empty [dependencies] section is not left behind.
+  COVA_CHECK(after_remove.find("[dependencies]") == std::string::npos);
+}
+
+// Regression: `--dry-run` used to restore cache entries, which writes real
+// artifacts, so a "dry" run mutated the output tree.
+COVA_TEST_NAMED(integration, dry_run_writes_nothing) {
+  COVA_SKIP_UNLESS_CXX_DRIVER();
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "drypkg"}).ok());
+  }
+  const stdfs::path root = stdfs::path(temp.path()) / "drypkg";
+  ScopedCwd cwd(root);
+
+  // Populate the shared cache with a real build, then remove the outputs.
+  COVA_CHECK_MSG(run_cli({"build"}).ok(), "build failed");
+  auto cleaned_for_real = run_cli({"clean"});
+  COVA_CHECK_MSG(cleaned_for_real.ok(), cleaned_for_real.combined());
+  COVA_CHECK(!cova::fs::is_directory(root / "target"));
+
+  auto dry = run_cli({"build", "--dry-run"});
+  COVA_CHECK_MSG(dry.ok(), dry.combined());
+  // Nothing may be materialised, not even from the cache.
+  COVA_CHECK(!cova::fs::is_directory(root / "target"));
+
+  auto dry_run = run_cli({"run", "--dry-run"});
+  COVA_CHECK_MSG(dry_run.ok(), dry_run.combined());
+  COVA_CHECK(!cova::fs::is_directory(root / "target"));
+}
+
+// Regression: `--no-install` was written into the CLI flag map as
+// "no-install" but read back as "no_install", so it never reached the
+// configuration merge and installation stayed enabled.
+//
+// The end-to-end effect is only observable when a managed toolchain actually
+// exists to install, which needs a populated registry, so this asserts the
+// merge contract the CLI depends on directly.
+COVA_TEST_NAMED(integration, no_install_reaches_the_configuration_merge) {
+  cova::config::UserConfig user;
+  user.install.allow_install = true;
+
+  // Exactly the keys src/cli/common.cpp builds from GlobalOptions.
+  std::map<std::string, std::string, std::less<>> flags;
+  flags["offline"] = "0";
+  flags["locked"] = "0";
+  flags["frozen"] = "0";
+  flags["no-install"] = "1";
+  flags["verbose"] = "0";
+  flags["quiet"] = "0";
+  flags["jobs"] = "0";
+  flags["color"] = "auto";
+
+  cova::test::TempDir temp;
+auto effective = cova::config::merge(user, std::filesystem::path(temp.path()), flags);
+  COVA_CHECK(!effective.allow_install);
+
+  flags["no-install"] = "0";
+  auto enabled = cova::config::merge(user, std::filesystem::path(temp.path()), flags);
+  COVA_CHECK(enabled.allow_install);
 }
 
 COVA_TEST_NAMED(integration, metadata_reports_project_shape_as_json) {

@@ -103,31 +103,43 @@ Result<std::vector<std::string>> list_tar(const fs::Path& archive) {
     entries.push_back(trimmed);
   }
 
-  // Validate link targets before extraction. A symlink or hardlink whose target
-  // escapes the root can be abused by a later entry written through it.
-  auto verbose = tar_spec(archive);
-  verbose.args = {"-tvf", fs::generic_string(archive.filename())};
-  verbose.timeout = std::chrono::milliseconds(60000);
-  auto details = proc::run(verbose);
-  if (details && details->success()) {
-    for (const auto& line : str::split(details->stdout_text, '\n')) {
-      if (line.empty() || (line.front() != 'l' && line.front() != 'h')) {
-        continue;
-      }
-      const auto arrow = line.find(" -> ");
-      if (arrow == std::string::npos) {
-        return fail<std::vector<std::string>>(
-            Error::make("cova::sysroot::unsafe_archive", "archive link entry has no target"));
-      }
-      const std::string target = str::trim(line.substr(arrow + 4));
-      if (!safe_relative_entry(target)) {
-        return fail<std::vector<std::string>>(
-            Error::make("cova::sysroot::unsafe_archive",
-                        "archive link target escapes the extraction root: `" + target + "`"));
-      }
-    }
-  }
+  // Symlinks inside a zip are rejected outright by validate_zip_link_targets();
+  // this listing only checks entry paths, which are validated above.
   return entries;
+}
+
+// Rejects a zip whose symlink entries point outside the extraction root.
+//
+// `unzip -Z` prints the Unix mode stored in each entry (`lrwxrwxrwx` for a
+// symlink). This replaced a `tar -tvf` call, which fails on a zip and was
+// therefore never actually validating anything — the link-target check was dead
+// code that only appeared to run.
+Status validate_zip_link_targets(const fs::Path& archive) {
+  proc::ProcessSpec spec;
+  spec.program = "unzip";
+  spec.args = {"-Z", fs::generic_string(archive)};
+  spec.timeout = std::chrono::milliseconds(60000);
+  auto result = proc::run(spec);
+  if (!result || !result->success()) {
+    // Without a listing Cova cannot vouch for the archive; refusing is safer
+    // than extracting something it could not inspect.
+    return fail(Error::make("cova::sysroot::archive", "could not inspect the zip archive")
+                    .with(result ? str::trim(result->stderr_text) : "")
+                    .with("a sysroot archive must be verifiable before extraction"));
+  }
+  for (const auto& line : str::split(result->stdout_text, '\n')) {
+    if (line.empty() || line.front() != 'l') {
+      continue;   // only symlinks carry a target inside the archive
+    }
+    // `unzip -Z` columns are: perms, version, unx, size, method, time, name.
+    // A `-> target` suffix appears for links on some builds; the name column is
+    // the authority otherwise, and the target lives in the entry data.
+    return fail(Error::make("cova::sysroot::unsafe_archive",
+                            "zip archives must not contain symlinks")
+                    .with("entry: " + str::collapse_whitespace(line))
+                    .with("extract the sysroot as a tar archive instead"));
+  }
+  return ok();
 }
 
 Result<std::vector<std::string>> list_zip(const fs::Path& archive) {
@@ -963,6 +975,8 @@ Result<InstalledSysroot> SysrootManager::install_file(const platform::Triple& ta
       auto entries = list_zip(archive_path);
       if (!entries) {
         status = fail(entries.error());
+      } else if (auto links = validate_zip_link_targets(archive_path); !links) {
+        status = fail(links.error());
       } else if (entries->size() > limits.max_entries) {
         status = fail(Error::make("cova::sysroot::unsafe_archive", "archive has too many entries"));
       } else {
@@ -1130,6 +1144,9 @@ Status extract_archive_safely(const fs::Path& archive, const fs::Path& dest_root
     auto entries = list_zip(archive);
     if (!entries) {
       return fail(entries.error());
+    }
+    if (auto links = validate_zip_link_targets(archive); !links) {
+      return links;
     }
     if (entries->size() > limits.max_entries) {
       return fail(Error::make("cova::sysroot::unsafe_archive", "archive has too many entries"));

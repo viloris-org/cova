@@ -423,12 +423,27 @@ EffectiveConfig merge(const UserConfig& user, const stdfs::path& data_dir,
   effective.data_dir = data_dir.empty() ? user.path.parent_path() : data_dir;
   effective.allow_install = user.install.allow_install;
 
+  // CLI flags are spelled with hyphens (`--no-install`) while user-config keys
+  // use underscores (`allow_install`). Treat `-` and `_` as the same separator
+  // so a caller cannot silently miss a flag by picking the other spelling —
+  // that mismatch previously made `--no-install` a no-op.
   auto flag = [&cli_flags](std::string_view key) -> std::optional<std::string> {
+    auto normalize = [](std::string_view text) {
+      std::string out(text);
+      std::replace(out.begin(), out.end(), '-', '_');
+      return out;
+    };
+    const std::string wanted = normalize(key);
     const auto it = cli_flags.find(key);
-    if (it == cli_flags.end()) {
-      return std::nullopt;
+    if (it != cli_flags.end()) {
+      return it->second;
     }
-    return it->second;
+    for (const auto& [name, value] : cli_flags) {
+      if (normalize(name) == wanted) {
+        return value;
+      }
+    }
+    return std::nullopt;
   };
   auto flag_bool = [&flag](std::string_view key, bool fallback) {
     const std::optional<std::string> text = flag(key);

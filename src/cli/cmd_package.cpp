@@ -18,6 +18,193 @@
 namespace cova::cli {
 namespace {
 
+namespace {
+
+// --- surgical cova.toml editing -------------------------------------------
+//
+// `cova add` / `cova remove` used to rewrite the manifest from the parsed model.
+// That dropped comments, reordered every table and deleted unknown keys, so a
+// one-line dependency edit could destroy hand-written configuration. These
+// helpers edit only the `[dependencies]` table and leave the rest byte for byte.
+
+struct TableSpan {
+  bool found = false;
+  std::size_t header_line = 0;  // index of the "[dependencies]" line
+  std::size_t body_begin = 0;   // first line after the header
+  std::size_t body_end = 0;     // one past the last line of the body
+};
+
+// Finds the line range of the `[dependencies]` table. Only the plain table form
+// is handled; dotted keys and `[dependencies.x]` sub-tables are left alone.
+TableSpan find_dependencies_table(const std::vector<std::string>& lines) {
+  TableSpan span;
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    const std::string trimmed = str::trim(lines[i]);
+    if (trimmed != "[dependencies]") {
+      continue;
+    }
+    span.found = true;
+    span.header_line = i;
+    std::size_t j = i + 1;
+    for (; j < lines.size(); ++j) {
+      const std::string next = str::trim(lines[j]);
+      if (!next.empty() && next.front() == '[') {
+        break;
+      }
+    }
+    span.body_begin = i + 1;
+    span.body_end = j;
+    return span;
+  }
+  return span;
+}
+
+// True when the line declares `name` as a top-level dependency key.
+bool line_declares(const std::string& line, std::string_view name) {
+  const std::string trimmed = str::trim(line);
+  if (trimmed.empty() || trimmed.front() == '#') {
+    return false;
+  }
+  const std::size_t equals = trimmed.find('=');
+  if (equals == std::string::npos) {
+    return false;
+  }
+  std::string key = str::trim(trimmed.substr(0, equals));
+  if (key.size() >= 2 && (key.front() == '"' || key.front() == '\'')) {
+    key = key.substr(1, key.size() - 2);
+  }
+  return key == name;
+}
+
+// Escapes a value for a basic TOML string literal.
+std::string escape_toml_string(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (char c : text) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out.push_back(c);
+    }
+  }
+  return out;
+}
+
+// A path dependency is stored relative to the manifest, which keeps the file
+// portable and avoids leaking an absolute home directory into a repository.
+std::string relative_dependency_path(const stdfs::path& dependency,
+                                    const stdfs::path& manifest_root) {
+  std::error_code ec;
+  const auto relative = stdfs::relative(dependency, manifest_root, ec);
+  if (ec || relative.empty()) {
+    return fs::generic_string(dependency);
+  }
+  return fs::generic_string(relative);
+}
+
+std::vector<std::string> split_lines(const std::string& text) {
+  std::vector<std::string> lines;
+  std::size_t begin = 0;
+  while (begin <= text.size()) {
+    const std::size_t newline = text.find('\n', begin);
+    if (newline == std::string::npos) {
+      if (begin < text.size()) {
+        lines.push_back(text.substr(begin));
+      }
+      break;
+    }
+    lines.push_back(text.substr(begin, newline - begin));
+    begin = newline + 1;
+  }
+  return lines;
+}
+
+std::string join_lines(const std::vector<std::string>& lines) {
+  std::string out;
+  for (const auto& line : lines) {
+    out += line;
+    out += '\n';
+  }
+  return out;
+}
+
+// Appends a dependency declaration, creating the table when it is missing.
+Status append_dependency_line(std::vector<std::string>& lines, const std::string& name,
+                              const std::string& value) {
+  const std::string declaration = name + " = " + value;
+  TableSpan span = find_dependencies_table(lines);
+  if (!span.found) {
+    if (!lines.empty() && !lines.back().empty()) {
+      lines.emplace_back();
+    }
+    lines.push_back("[dependencies]");
+    lines.push_back(declaration);
+    return ok();
+  }
+  // Insert after the last non-blank line of the body so trailing comments on the
+  // table stay at the end.
+  std::size_t insert_at = span.body_begin;
+  for (std::size_t i = span.body_begin; i < span.body_end; ++i) {
+    if (!str::trim(lines[i]).empty()) {
+      insert_at = i + 1;
+    }
+  }
+  lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insert_at), declaration);
+  return ok();
+}
+
+// True when the `[dependencies]` table no longer declares anything.
+bool table_is_empty(const std::vector<std::string>& lines, const TableSpan& span) {
+  for (std::size_t i = span.body_begin; i < span.body_end; ++i) {
+    const std::string trimmed = str::trim(lines[i]);
+    if (!trimmed.empty() && trimmed.front() != '#') {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Removes the declaration of `name`; leaves everything else untouched.
+//
+// When that empties the table, the header and its now-blank body go too, so the
+// file does not accumulate an empty `[dependencies]` section on every remove.
+bool remove_dependency_line(std::vector<std::string>& lines, std::string_view name) {
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    if (!line_declares(lines[i], name)) {
+      continue;
+    }
+    lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+    const TableSpan span = find_dependencies_table(lines);
+    if (span.found && table_is_empty(lines, span)) {
+      lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(span.body_begin),
+                  lines.begin() + static_cast<std::ptrdiff_t>(span.body_end));
+      lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(span.header_line));
+      // Drop the blank separator that preceded the removed table.
+      if (span.header_line > 0 && str::trim(lines[span.header_line - 1]).empty()) {
+        lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(span.header_line - 1));
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 int report_milestone_gap(CommandContext& ctx, std::string_view command,
                         std::string_view what) {
   DiagnosticEngine engine;
@@ -97,9 +284,32 @@ int cmd_add(CommandContext& ctx) {
   spec.path = fs::absolute_normalized(ctx.cwd / *ctx.flags.get("path"));
   spec.requirement_text = version;
   spec.dev = ctx.flags.boolean("dev");
+  // Capture the path before `spec` is moved into the model.
+  const stdfs::path dependency_path = *spec.path;
   manifest.dependencies.push_back(std::move(spec));
 
-  auto status = fs::write_file_atomic(project->layout.manifest, manifest::to_toml(manifest));
+  // Edit the existing text instead of re-serialising the model, so comments,
+  // key order and unknown keys survive.
+  auto existing = fs::read_file(project->layout.manifest);
+  if (!existing) {
+    return report_error(existing.error(), ctx);
+  }
+  std::vector<std::string> lines = split_lines(*existing);
+  std::string value = "{ path = \"" +
+                      escape_toml_string(relative_dependency_path(dependency_path,
+                                                                  project->layout.root)) +
+                      "\"";
+  if (!version.empty()) {
+    value += ", version = \"" + escape_toml_string(version) + "\"";
+  }
+  if (spec.dev) {
+    value += ", dev = true";
+  }
+  value += " }";
+  if (Status appended = append_dependency_line(lines, name, value); !appended) {
+    return report_error(appended.error(), ctx);
+  }
+  auto status = fs::write_file_atomic(project->layout.manifest, join_lines(lines));
   if (!status) {
     return report_error(status.error(), ctx);
   }
@@ -129,7 +339,16 @@ int cmd_remove(CommandContext& ctx) {
     return report_error(
         Error::make("cova::remove::unknown", "`" + name + "` is not a declared dependency"), ctx);
   }
-  auto status = fs::write_file_atomic(project->layout.manifest, manifest::to_toml(manifest));
+  auto existing = fs::read_file(project->layout.manifest);
+  if (!existing) {
+    return report_error(existing.error(), ctx);
+  }
+  std::vector<std::string> lines = split_lines(*existing);
+  if (!remove_dependency_line(lines, name)) {
+    return report_error(
+        Error::make("cova::remove::unknown", "`" + name + "` is not a declared dependency"), ctx);
+  }
+  auto status = fs::write_file_atomic(project->layout.manifest, join_lines(lines));
   if (!status) {
     return report_error(status.error(), ctx);
   }

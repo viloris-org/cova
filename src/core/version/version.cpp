@@ -41,6 +41,29 @@ bool parse_number(std::string_view text, std::size_t& pos, int& out) {
   return true;
 }
 
+// Compares two numeric SemVer identifiers ("1", "007", "99999999999999999999").
+//
+// SemVer places no length limit on a numeric pre-release identifier, and Cova
+// must not abort on a version a user wrote in a manifest, so this never
+// converts to an integer: leading zeros are dropped, then the longer
+// significant part is the larger number, and equal lengths compare
+// lexicographically. Both inputs are non-empty and all-digit by construction.
+int compare_numeric_identifier(std::string_view lhs, std::string_view rhs) {
+  const std::size_t lhs_begin = lhs.find_first_not_of('0');
+  const std::size_t rhs_begin = rhs.find_first_not_of('0');
+  const std::string_view l = lhs_begin == std::string_view::npos ? std::string_view{}
+                                                                 : lhs.substr(lhs_begin);
+  const std::string_view r = rhs_begin == std::string_view::npos ? std::string_view{}
+                                                                 : rhs.substr(rhs_begin);
+  if (l.size() != r.size()) {
+    return l.size() < r.size() ? -1 : 1;
+  }
+  if (l != r) {
+    return l < r ? -1 : 1;
+  }
+  return 0;
+}
+
 // SemVer pre-release comparison: a release outranks any pre-release; otherwise
 // dot-separated identifiers compare numerically when both are numeric and
 // lexically when either is alphanumeric.
@@ -63,10 +86,9 @@ int compare_prerelease(std::string_view a, std::string_view b) {
     const bool rhs_num = !rhs[i].empty() &&
                          std::all_of(rhs[i].begin(), rhs[i].end(), [](char c) { return is_digit(c); });
     if (lhs_num && rhs_num) {
-      const long long lv = std::stoll(lhs[i]);
-      const long long rv = std::stoll(rhs[i]);
-      if (lv != rv) {
-        return lv < rv ? -1 : 1;
+      const int order = compare_numeric_identifier(lhs[i], rhs[i]);
+      if (order != 0) {
+        return order;
       }
       continue;
     }

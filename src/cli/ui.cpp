@@ -92,6 +92,8 @@ void StreamUi::error(std::string_view text) {
   write_line(err_, wrap(kAnsiRed, "error: ", color_, kAnsiReset), text);
 }
 
+void StreamUi::raw_error(std::string_view text) { write_line(err_, {}, text); }
+
 void StreamUi::verbose(std::string_view text) {
   if (!verbose_) {
     return;
@@ -149,6 +151,13 @@ void StringUi::warn(std::string_view text) {
 
 void StringUi::error(std::string_view text) {
   stderr_text.append("error: ").append(text);
+  if (text.empty() || text.back() != '\n') {
+    stderr_text.push_back('\n');
+  }
+}
+
+void StringUi::raw_error(std::string_view text) {
+  stderr_text.append(text);
   if (text.empty() || text.back() != '\n') {
     stderr_text.push_back('\n');
   }

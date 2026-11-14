@@ -358,6 +358,7 @@ std::string apply_global(GlobalOptions& g, std::string_view name, const std::str
     g.target = value;
   } else if (name == "profile") {
     g.profile = value.empty() ? "dev" : value;
+    g.profile_set = true;
   } else if (name == "compiler") {
     g.compiler = value;
   } else if (name == "toolchain") {
