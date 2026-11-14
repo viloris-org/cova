@@ -123,4 +123,113 @@ build-script = true
   COVA_CHECK(error.message.find("build-script") != std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// Round-trip fidelity
+//
+// `to_toml` is used by `cova new` and by any command that rewrites the
+// manifest. Omitting a key that has a built-in default silently re-applied the
+// default on the next parse, so a value the user wrote could change without
+// them touching the file.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Parses `text`, serialises it, re-parses the result and returns the manifest.
+cova::manifest::Manifest round_trip(std::string_view text, const std::filesystem::path& root) {
+  auto first = cova::manifest::parse(text, "cova.toml", root);
+  COVA_CHECK_MSG(first.has_value(), "input manifest failed to parse");
+  const std::string rendered = cova::manifest::to_toml(first->manifest);
+  auto second = cova::manifest::parse(rendered, "cova.toml", root);
+  COVA_CHECK_MSG(second.has_value(), "rendered manifest failed to parse");
+  return second->manifest;
+}
+
+constexpr const char* kPackageHeader =
+    "[package]\nname = \"rt\"\nversion = \"0.1.0\"\nedition = \"c++26\"\n";
+
+}  // namespace
+
+COVA_TEST_NAMED(manifest, round_trip_preserves_explicit_profile_flags) {
+  cova::test::TempDir temp;
+  const auto manifest = round_trip(std::string(kPackageHeader) +
+                                       "[profile.release]\nlto = false\nassertions = true\n",
+                                   temp.path());
+  const auto& release = manifest.profiles.at("release");
+  COVA_CHECK_MSG(!release.lto, "release lto=false must survive a rewrite");
+  COVA_CHECK_MSG(release.assertions, "release assertions=true must survive a rewrite");
+}
+
+COVA_TEST_NAMED(manifest, round_trip_preserves_workspace_toolchain_pin) {
+  cova::test::TempDir temp;
+  const auto manifest = round_trip(
+      "[workspace]\nmembers = [\"a\"]\n"
+      "[workspace.toolchain]\npolicy = \"managed-first\"\nauto-install = false\n"
+      "preferred = \"/opt/llvm/bin/clang++\"\n",
+      temp.path());
+  COVA_CHECK(manifest.workspace.has_value());
+  COVA_CHECK(manifest.workspace->toolchain.has_value());
+  COVA_CHECK(!manifest.workspace->toolchain->auto_install);
+  COVA_CHECK_EQ(manifest.workspace->toolchain->preferred, std::string("/opt/llvm/bin/clang++"));
+}
+
+COVA_TEST_NAMED(manifest, round_trip_preserves_workspace_format_settings) {
+  cova::test::TempDir temp;
+  const auto manifest =
+      round_trip("[workspace]\nmembers = [\"a\"]\n"
+                 "[workspace.format]\nfallback-style = \"Google\"\n",
+                 temp.path());
+  COVA_CHECK(manifest.workspace->format.has_value());
+  COVA_CHECK_EQ(manifest.workspace->format->fallback_style, std::string("Google"));
+}
+
+COVA_TEST_NAMED(manifest, explicit_empty_test_sources_disable_discovery) {
+  cova::test::TempDir temp;
+  // `sources = []` is how a manifest turns test discovery off. Treating an
+  // empty array as "unset" inverted the author's intent.
+  const auto disabled =
+      round_trip(std::string(kPackageHeader) + "[test]\nsources = []\n", temp.path());
+  COVA_CHECK_MSG(disabled.test.sources.empty(), "an explicit empty array must stay empty");
+
+  // Omitting the section still applies the documented default.
+  const auto omitted = round_trip(std::string(kPackageHeader), temp.path());
+  COVA_CHECK_EQ(omitted.test.sources.size(), std::size_t{1});
+}
+
+COVA_TEST_NAMED(manifest, optimization_is_range_checked_and_size_is_preserved) {
+  cova::test::TempDir temp;
+  auto too_large = cova::manifest::parse(std::string(kPackageHeader) +
+                                             "[profile.dev]\noptimization = 99\n",
+                                         "cova.toml", temp.path());
+  COVA_CHECK_MSG(!too_large.has_value(), "optimization = 99 must be rejected");
+
+  const auto sized =
+      round_trip(std::string(kPackageHeader) + "[profile.release]\noptimization = \"s\"\n",
+                 temp.path());
+  const auto& release = sized.profiles.at("release");
+  COVA_CHECK_MSG(release.optimize_for_size, "optimization = \"s\" must keep the size flag");
+  bool has_os = false;
+  for (const auto& flag : release.cxx_flags()) {
+    if (flag == "-Os") {
+      has_os = true;
+    }
+  }
+  COVA_CHECK_MSG(has_os, "a size profile must emit -Os, not -O2");
+}
+
+COVA_TEST_NAMED(manifest, gnu_editions_report_their_real_standard) {
+  cova::test::TempDir temp;
+  auto manifest = cova::manifest::default_manifest("gnu", cova::manifest::PackageKind::Executable);
+  // "gnu++17" was parsed as "++17", the exception was swallowed and the result
+  // silently became the newest standard.
+  manifest.package.edition = "gnu++17";
+  COVA_CHECK_EQ(manifest.package.cpp_standard(), 17);
+  manifest.package.edition = "gnu++20";
+  COVA_CHECK_EQ(manifest.package.cpp_standard(), 20);
+  manifest.package.edition = "c++23";
+  COVA_CHECK_EQ(manifest.package.cpp_standard(), 23);
+  // An unrecognised edition reports 0 so callers can reject it.
+  manifest.package.edition = "c++99";
+  COVA_CHECK_EQ(manifest.package.cpp_standard(), 0);
+}
+
 COVA_TEST_MAIN()

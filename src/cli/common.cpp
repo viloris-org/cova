@@ -181,7 +181,12 @@ Result<LoadedProject> load_project(CommandContext& ctx) {
   }
   ctx.project_root = root;
 
-  auto loaded_manifest = manifest::load(manifest_path);
+  // Enable strict key checking for the manifest the user actually builds: a
+  // typo such as `[dependecies]` used to be dropped without a word, and the
+  // resulting build simply did not link the dependency.
+  manifest::ManifestLoadOptions load_options;
+  load_options.strict = true;
+  auto loaded_manifest = manifest::load(manifest_path, load_options);
   if (!loaded_manifest) {
     return fail<LoadedProject>(loaded_manifest.error());
   }
@@ -336,13 +341,19 @@ void render_diagnostic(const Diagnostic& diagnostic, CommandContext& ctx, int de
       break;
     case Severity::Help:
     case Severity::Note:
-      ctx.ui->out(indent + diagnostic.message);
+      // Notes and help are part of a diagnostic, never program output. Routing
+      // them to stdout corrupts `--json` documents and pollutes piped stdout
+      // with prose (the compiler's stderr arrives here as a detail line).
+      ctx.ui->raw_error(indent + diagnostic.message);
       break;
   }
   if (!diagnostic.detail.empty()) {
     for (const auto& line : str::split(diagnostic.detail, '\n')) {
       if (!line.empty()) {
-        ctx.ui->out(indent + "  " + line);
+        // Detail carries captured subprocess output (compiler diagnostics,
+        // linker errors). It belongs on stderr: stdout is reserved for the
+        // command's own results, and `--json` must stay parseable.
+        ctx.ui->raw_error(indent + "  " + line);
       }
     }
   }
@@ -596,7 +607,7 @@ Result<build::PlanResult> plan_with_dependencies(CommandContext& ctx, const Load
             .with("add [profile." + options.profile + "] to cova.toml, or use an existing one"));
   }
   options.jobs = ctx.global.jobs;
-  options.use_color = ctx.global.use_color(stdout_is_tty());
+  options.use_color = ctx.global.build_diagnostic_color();
   options.include_tests = include_tests;
   options.explain = ctx.global.verbose;
   options.workspace = ctx.flags.boolean("workspace") || project.is_workspace_root;

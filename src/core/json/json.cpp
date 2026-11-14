@@ -53,6 +53,11 @@ std::int64_t Value::as_int(std::int64_t fallback) const {
     return *value;
   }
   if (const double* value = std::get_if<double>(&storage_); value != nullptr) {
+    // Converting a double outside int64_t's range is undefined behaviour; a
+    // JSON document carrying `1e308` used to yield INT64_MIN.
+    if (!(*value >= -9223372036854775808.0 && *value < 9223372036854775808.0)) {
+      return fallback;
+    }
     return static_cast<std::int64_t>(*value);
   }
   if (const bool* value = std::get_if<bool>(&storage_); value != nullptr) {
@@ -416,6 +421,12 @@ class Parser {
   }
 
   static void append_utf8(std::string& out, std::uint32_t code_point) {
+    // A lone UTF-16 surrogate is not a Unicode scalar value: encoding it
+    // produces CESU-8/WTF-8 bytes that are invalid UTF-8, and strict JSON
+    // consumers reject the document. Substitute U+FFFD like RFC 8259 readers do.
+    if ((code_point >= 0xD800 && code_point <= 0xDFFF) || code_point > 0x10FFFF) {
+      code_point = 0xFFFD;
+    }
     if (code_point < 0x80) {
       out.push_back(static_cast<char>(code_point));
     } else if (code_point < 0x800) {

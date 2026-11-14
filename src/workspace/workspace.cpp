@@ -19,12 +19,61 @@ bool has_glob_magic(std::string_view pattern) {
          pattern.find('[') != std::string_view::npos;
 }
 
+// Matches one path component against a glob fragment supporting `*` and `?`.
+bool matches_component(std::string_view pattern, std::string_view name) {
+  std::size_t p = 0;
+  std::size_t n = 0;
+  std::size_t star_p = std::string_view::npos;
+  std::size_t star_n = 0;
+  while (n < name.size()) {
+    if (p < pattern.size() && pattern[p] != '*' &&
+        (pattern[p] == '?' || pattern[p] == name[n])) {
+      ++p;
+      ++n;
+    } else if (p < pattern.size() && pattern[p] == '*') {
+      star_p = p++;
+      star_n = n;
+    } else if (star_p != std::string_view::npos) {
+      p = star_p + 1;
+      n = ++star_n;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.size() && pattern[p] == '*') {
+    ++p;
+  }
+  return p == pattern.size();
+}
+
+// True when `relative` is the excluded path or lives underneath it.
+//
+// Matching is per path component. A raw substring test was used before and
+// made `exclude = ["vendor"]` also drop `vendor-lib` — and `exclude = ["a"]`
+// drop every member whose path merely contained the letter "a". Both silently
+// removed packages from the workspace.
+bool excludes_path(const std::string& relative, const std::string& pattern) {
+  const std::vector<std::string> rel_parts = str::split(relative, "/");
+  const std::vector<std::string> pat_parts = str::split(pattern, "/");
+  if (pat_parts.empty() || rel_parts.size() < pat_parts.size()) {
+    return false;
+  }
+  // The excluded path must match a leading run of components.
+  for (std::size_t index = 0; index < pat_parts.size(); ++index) {
+    if (pat_parts[index] == "**") {
+      // `**` excludes everything below the current position.
+      return true;
+    }
+    if (!matches_component(pat_parts[index], rel_parts[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool matches_any(const std::string& relative, const std::vector<std::string>& patterns) {
   for (const auto& pattern : patterns) {
-    // A simple prefix/substring match is enough for the workspace exclusions
-    // Cova documents; full glob matching is used for includes.
-    if (relative == pattern || str::starts_with(relative, pattern + "/") ||
-        relative.find(pattern) != std::string::npos) {
+    if (excludes_path(relative, pattern)) {
       return true;
     }
   }

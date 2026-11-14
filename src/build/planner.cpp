@@ -277,11 +277,20 @@ bool add_depfile_inputs(Action& action, const fs::Path& depfile, const fs::Path&
 }
 
 // Adds a compile action for one source and returns the object output path.
+//
+// `object_owners` maps each already-claimed object path to the source that
+// claimed it. Two sources can map to the same object path whenever they differ
+// only by extension (`src/util.c` and `src/util.cpp` both want `src/util.o`).
+// Silently letting the second overwrite the first corrupts the build: the link
+// step then either fails with a missing symbol or, worse, succeeds against the
+// wrong translation unit. Cova rejects the plan instead.
 ActionId add_compile_action(BuildGraph& graph, const manifest::Manifest& manifest,
                             const toolchain::ResolvedToolchain& toolchain,
                             const PlanOptions& options, const fs::Path& output_root,
                             const fs::Path& source, const std::string& package_label,
-                            fs::Path& object_out) {
+                            fs::Path& object_out,
+                            std::map<std::string, fs::Path>& object_owners,
+                            Result<PlanResult>& error_out) {
   const bool c_source = is_c_source(source);
   const std::string relative = relative_text(source, manifest.root);
   std::string object_name = relative;
@@ -294,7 +303,32 @@ ActionId add_compile_action(BuildGraph& graph, const manifest::Manifest& manifes
   if (!options.object_namespace.empty()) {
     object_directory /= options.object_namespace;
   }
-  object_out = object_directory / object_name;
+  // `relative_text` can contain `..` when a manifest names a source outside the
+  // package root. Normalising keeps the object inside the output tree instead
+  // of letting it escape through the target directory.
+  object_out = fs::normalize(object_directory / object_name);
+  if (!fs::is_within(object_out, output_root)) {
+    error_out = fail<PlanResult>(
+        Error::make("cova::build::object_outside_output",
+                    "a source outside the package would place its object outside the "
+                    "target directory")
+            .with("source: " + fs::generic_string(source))
+            .with("object: " + fs::generic_string(object_out))
+            .with("output root: " + fs::generic_string(output_root))
+            .with("list only sources inside the package in [build] sources"));
+    return ActionId{};
+  }
+  const std::string object_key = fs::generic_string(object_out);
+  if (auto [it, inserted] = object_owners.emplace(object_key, source); !inserted) {
+    error_out = fail<PlanResult>(
+        Error::make("cova::build::object_collision",
+                    "two sources compile to the same object file")
+            .with("first: " + fs::generic_string(it->second))
+            .with("second: " + fs::generic_string(source))
+            .with("object: " + object_key)
+            .with("rename one of the sources so their basenames differ"));
+    return ActionId{};
+  }
   const fs::Path depfile = fs::Path(object_out.string() + ".d");
 
   const auto* override = target_override_for(manifest, options.target);
@@ -380,10 +414,18 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
   std::vector<ActionId> object_actions;
   std::vector<fs::Path> objects;
   std::map<std::string, ActionId> source_actions;
+  // Shared by the package and test loops so a test source can never claim an
+  // object path the package already uses.
+  std::map<std::string, fs::Path> object_owners;
+  Result<PlanResult> plan_error = PlanResult{};
   for (const auto& source : sources) {
     fs::Path object;
     const ActionId id = add_compile_action(result.graph, manifest, toolchain, options,
-                                           output_root, source, package_label, object);
+                                           output_root, source, package_label, object,
+                                           object_owners, plan_error);
+    if (!plan_error) {
+      return fail<PlanResult>(std::move(plan_error.error()));
+    }
     object_actions.push_back(id);
     objects.push_back(std::move(object));
     source_actions[fs::generic_string(source)] = id;
@@ -513,7 +555,10 @@ Result<PlanResult> plan_package(const manifest::Manifest& manifest,
       fs::Path test_object;
       const ActionId test_compile = add_compile_action(result.graph, manifest, toolchain, options,
                                                        output_root, source, package_label,
-                                                       test_object);
+                                                       test_object, object_owners, plan_error);
+      if (!plan_error) {
+        return fail<PlanResult>(std::move(plan_error.error()));
+      }
       const fs::Path binary = fs::Path(output_root) / "bin" /
                               (source.stem().string() + options.target.executable_suffix());
       std::vector<std::string> argv;

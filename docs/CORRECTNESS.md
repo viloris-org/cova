@@ -295,3 +295,26 @@ cache correctness.
   independent Windows/macOS CI runs for the environment matrix.
 * User-facing `[build.env]` configuration; today the policy is the audited
   default plus `--inherit-env`, with the API available for a future config layer.
+
+## 10. Hardening pass (review follow-up)
+
+A correctness review of this tree found several defects that the existing tests
+did not cover. Each is now fixed and has a regression test; the invariants below
+are what a future change must not break.
+
+| Area | Invariant |
+|---|---|
+| TOML parsing | Value nesting is bounded (128 levels), so a hostile or corrupt manifest reports `cova::toml::parse` with a line/column instead of crashing the process. JSON has the same bound. |
+| Date-time values | A date-time is validated against the RFC 3339 shapes TOML 1.0 allows. Out-of-range fields and trailing junk are rejected rather than stored verbatim. |
+| Diagnostics stream | `stdout` carries only command results. Diagnostic messages and their detail lines (which include captured compiler output) go to `stderr`, so `--json` output is always a single parseable document. |
+| Version ordering | `Version` ordering implements SemVer §11.4 precedence (`std::strong_ordering` is defined in terms of the same comparison requirement matching uses). Resolver "newest compiler" sorts depend on it. |
+| Requirement expansion | `^0.y.z` pins the left-most non-zero component, `~` pins the minor series, and a partial operand to `<=`/`>` covers the whole implied series (`<=1.2` includes 1.2.5). |
+| Action identity | Compiler diagnostic colour is derived from the invocation (`--color always`), never from terminal detection, so the same tree produces the same keys and the same `compile_commands.json` in CI and locally. |
+| Build graph | Two sources may not claim the same object path, and an object may not be written outside the target directory. Both are plan-time errors naming the two sources. |
+| Manifest round-trip | Every field a user can write survives `to_toml` + re-parse: profile `debug`/`lto`/`assertions`, `optimization = "s"` (`-Os`), workspace `[toolchain]` `auto-install`/`preferred`, workspace `[format]` `fallback-style`, and an explicit `[test] sources = []`. |
+| Dependency lock | Requested `features` are part of a package's resolution identity and are recorded in `cova.lock`, so `--locked` rejects a feature-set change. |
+| Workspace exclusion | `[workspace] exclude` matches whole path components with glob support; `exclude = ["vendor"]` never removes `vendor-lib`. |
+| Depfile syntax | Dependency files are parsed with make's escaping rules: `\ `, `\:`, `\#`, literal backslashes in Windows paths, CRLF line endings and continuation lines. |
+| Durability | `write_file_atomic` fsyncs the containing directory after the rename, so a crash cannot leave a rewritten lockfile or manifest non-durable. |
+| Numeric edges | JSON clamps integers above `INT64_MAX` instead of wrapping, `as_int` returns its fallback outside the `int64_t` range, config sizes reject overflow, and `optimization` is range-checked to 0..3. |
+| Name validation | A package name must start with a letter or `_` and must not end or double a separator, so a name can never look like a command-line option. |

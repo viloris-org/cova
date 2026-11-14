@@ -1,6 +1,8 @@
 // Cova — parallel action executor (PRD §9.4, §19.2).
 #include "build/executor/executor.hpp"
 
+#include <optional>
+
 #include <algorithm>
 #include <chrono>
 #include <future>
@@ -10,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "build/scheduler/scheduler.hpp"
 #include "core/filesystem/filesystem.hpp"
 #include "core/process/process.hpp"
 
@@ -175,96 +178,133 @@ Result<BuildResult> Executor::run() {
     action->cache_key(environment_);
   }
 
-  std::map<std::uint64_t, int> depth;
-  for (const auto* action : ordered) {
-    int level = 0;
-    for (const auto& dependency : action->dependencies) {
-      auto it = depth.find(dependency.value);
-      if (it != depth.end()) {
-        level = std::max(level, it->second + 1);
-      }
-    }
-    depth[action->id.value] = level;
-  }
-  std::map<int, std::vector<const Action*>> levels;
-  for (const auto* action : ordered) {
-    levels[depth[action->id.value]].push_back(action);
-  }
-
-  std::map<std::uint64_t, bool> completed;
-  bool stop_early = false;
+  // Dispatch straight from the dependency scheduler instead of walking the
+  // graph in "depth levels". The level approach had a barrier: every action in
+  // a level had to finish before any action of the next level started, so one
+  // slow compile blocked ready work behind it. The scheduler releases each
+  // dependent as soon as *its* dependencies are done.
+  Scheduler scheduler(graph_);
+  std::mutex scheduler_mutex;
   std::mutex check_mutex;
+  bool stop_early = false;
   const int workers = parallelism(options_.max_parallel);
 
-  for (const auto& [level, actions] : levels) {
-    (void)level;
+  enum class Disposition { Skip, Fail, Run };
+  struct Running {
+    const Action* action = nullptr;
+    std::future<ActionOutcome> future;
+  };
+
+  auto settled = [&](const Action& action, const ActionOutcome& outcome) {
+    {
+      std::lock_guard<std::mutex> lock(scheduler_mutex);
+      if (outcome.succeeded) {
+        scheduler.complete(action.id);
+      } else {
+        scheduler.fail(action.id);
+      }
+    }
+    note_outcome(action, outcome, result);
+    if (!outcome.succeeded && options_.fail_fast) {
+      stop_early = true;
+    }
+  };
+
+  auto consider = [&](const Action& action) -> Disposition {
+    if (stop_early) {
+      return Disposition::Fail;
+    }
+    std::string reason;
+    bool current = false;
+    if (options_.incremental && up_to_date_check_) {
+      // The predicate consults shared caches and records state, so it stays
+      // serialised. It runs on the executor thread only.
+      std::lock_guard<std::mutex> lock(check_mutex);
+      current = up_to_date_check_(action, reason);
+    }
+    if (current) {
+      return Disposition::Skip;
+    }
+    return Disposition::Run;
+  };
+
+  std::vector<Running> in_flight;
+  for (;;) {
     if (stop_early) {
       break;
     }
-    std::vector<const Action*> runnable;
-    for (const auto* action : actions) {
-      bool dependency_failed = false;
-      for (const auto& dependency : action->dependencies) {
-        auto it = completed.find(dependency.value);
-        if (it == completed.end() || !it->second) {
-          dependency_failed = true;
-          break;
-        }
+    // Launch as many ready actions as the worker budget allows.
+    while (!stop_early &&
+           static_cast<int>(in_flight.size()) < workers &&
+           scheduler.ready_count() > 0) {
+      std::optional<ActionId> next;
+      {
+        std::lock_guard<std::mutex> lock(scheduler_mutex);
+        next = scheduler.next();
       }
-      if (dependency_failed) {
-        ActionOutcome outcome;
-        outcome.id = action->id;
-        outcome.failure_message = "a dependency failed";
-        note_outcome(*action, outcome, result);
-        completed[action->id.value] = false;
-        stop_early = stop_early || options_.fail_fast;
+      if (!next) {
+        break;
+      }
+      const Action* action = graph_.find(*next);
+      if (action == nullptr) {
+        std::lock_guard<std::mutex> lock(scheduler_mutex);
+        scheduler.complete(*next);
         continue;
       }
-      std::string reason;
-      bool current = false;
-      if (options_.incremental && up_to_date_check_) {
-        std::lock_guard<std::mutex> lock(check_mutex);
-        current = up_to_date_check_(*action, reason);
-      }
-      if (current) {
+      const Disposition disposition = consider(*action);
+      if (disposition == Disposition::Skip) {
         ActionOutcome outcome;
         outcome.id = action->id;
         outcome.succeeded = true;
         outcome.skipped = true;
-        outcome.skip_reason = reason;
-        note_outcome(*action, outcome, result);
-        completed[action->id.value] = true;
+        outcome.skip_reason = "up to date";
+        settled(*action, outcome);
         continue;
       }
-      runnable.push_back(action);
+      if (disposition == Disposition::Fail) {
+        ActionOutcome outcome;
+        outcome.id = action->id;
+        outcome.failure_message = "a dependency failed";
+        settled(*action, outcome);
+        continue;
+      }
+      in_flight.push_back(Running{action, std::async(std::launch::async, [this, action] {
+                                    return run_action(*action);
+                                  })});
     }
 
-    for (std::size_t offset = 0; offset < runnable.size() && !stop_early;
-         offset += static_cast<std::size_t>(workers)) {
-      std::vector<std::future<ActionOutcome>> futures;
-      const std::size_t end =
-          std::min(runnable.size(), offset + static_cast<std::size_t>(workers));
-      for (std::size_t index = offset; index < end; ++index) {
-        const Action* action = runnable[index];
-        futures.push_back(std::async(std::launch::async, [this, action] {
-          return run_action(*action);
-        }));
+    if (in_flight.empty()) {
+      break;
+    }
+
+    // Wait for the first action that finishes. Polling keeps the executor
+    // single-threaded while still allowing completions in any order; the small
+    // sleep is invisible next to a compile.
+    bool progressed = false;
+    for (std::size_t index = 0; index < in_flight.size();) {
+      auto& entry = in_flight[index];
+      if (entry.future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        ++index;
+        continue;
       }
-      for (std::size_t index = 0; index < futures.size(); ++index) {
-        ActionOutcome outcome = futures[index].get();
-        const Action* action = runnable[offset + index];
-        note_outcome(*action, outcome, result);
-        completed[action->id.value] = outcome.succeeded;
-        if (!outcome.succeeded && options_.fail_fast) {
-          stop_early = true;
-        }
-      }
+      ActionOutcome outcome = entry.future.get();
+      settled(*entry.action, outcome);
+      in_flight.erase(in_flight.begin() + static_cast<std::ptrdiff_t>(index));
+      progressed = true;
+      break;
+    }
+    if (!progressed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
 
-  if (!result.succeeded) {
-    return result;
+  // Drain anything still running so no future is abandoned mid-flight, and so
+  // fail-fast does not hide a diagnostic the user needs from a started action.
+  for (auto& entry : in_flight) {
+    ActionOutcome outcome = entry.future.get();
+    note_outcome(*entry.action, outcome, result);
   }
+
   return result;
 }
 

@@ -41,8 +41,16 @@ class Version {
   std::string to_string() const;
   std::string to_string_short() const;  // "23.1" style, drops trailing zeros
 
-  auto operator<=>(const Version&) const = default;
-  bool operator==(const Version&) const = default;
+  // Ordering follows SemVer §11.4 precedence, including the pre-release rules
+  // (a release outranks any of its pre-releases; dot-separated identifiers
+  // compare numerically when both are numeric and lexically otherwise).
+  //
+  // This must NOT be defaulted. A defaulted `<=>` compares the members in
+  // declaration order, which makes `pre` an ordinary `std::string` and yields
+  // `1.0.0 < 1.0.0-alpha` and `1.0.0-9 > 1.0.0-10` — both wrong, and both used
+  // by the toolchain resolver to pick the "newest" compiler.
+  std::strong_ordering operator<=>(const Version& other) const;
+  bool operator==(const Version& other) const;
 };
 
 struct VersionBound {

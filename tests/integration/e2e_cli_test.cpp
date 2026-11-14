@@ -1314,4 +1314,101 @@ COVA_TEST_NAMED(integration, sysroot_gc_reclaims_unreferenced_store_entries) {
   COVA_CHECK(contains(verify.combined(), "no sysroots to verify"));
 }
 
+// Two sources that differ only by extension map to the same object path
+// (`src/util.c` and `src/util.cpp` both want `src/util.o`). Letting the second
+// overwrite the first produced a build that either failed to link or linked the
+// wrong translation unit, depending on scheduling.
+COVA_TEST_NAMED(integration, object_path_collision_is_reported) {
+  if (!has_cxx_driver()) {
+    return;  // needs a real compiler to reach the planner
+  }
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "collide"}).ok());
+  }
+  const stdfs::path root = stdfs::path(temp.path()) / "collide";
+  write_text(root / "src" / "util.c", "int from_c(void) { return 1; }\n");
+  write_text(root / "src" / "util.cpp", "int from_cpp() { return 2; }\n");
+  std::string manifest = read_text(root / "cova.toml");
+  const std::string anchor = "sources = [\"src/**/*.cpp\"]";
+  const auto position = manifest.find(anchor);
+  COVA_CHECK(position != std::string::npos);
+  manifest.replace(position, anchor.size(),
+                   "sources = [\"src/**/*.c\", \"src/**/*.cpp\"]");
+  write_text(root / "cova.toml", manifest);
+
+  ScopedCwd cwd(root);
+  auto built = run_cli({"build"});
+  COVA_CHECK(!built.ok());
+  COVA_CHECK(contains(built.combined(), "same object file"));
+  COVA_CHECK(contains(built.combined(), "util.c"));
+  COVA_CHECK(contains(built.combined(), "util.cpp"));
+}
+
+// A source outside the package must not place its object outside `target/`.
+COVA_TEST_NAMED(integration, source_outside_package_cannot_escape_the_target_dir) {
+  if (!has_cxx_driver()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  const stdfs::path root = stdfs::path(temp.path()) / "inside";
+  COVA_CHECK(cova::fs::create_directories(root / "src").has_value());
+  write_text(root / "cova.toml", R"(
+[package]
+name = "inside"
+version = "0.1.0"
+edition = "c++26"
+
+[build]
+type = "executable"
+sources = ["../outside.cpp"]
+)");
+  write_text(stdfs::path(temp.path()) / "outside.cpp", "int main() { return 0; }\n");
+
+  ScopedCwd cwd(root);
+  auto built = run_cli({"build"});
+  // A single `../` still lands inside the normalised object tree, so the build
+  // succeeds — but nothing may be written outside `target/`. Deeper escapes are
+  // rejected outright (covered by the planner unit tests).
+  if (built.ok()) {
+    const stdfs::path target_dir = root / "target";
+    COVA_CHECK_MSG(cova::fs::is_directory(target_dir), "the build must use target/");
+    COVA_CHECK_MSG(!cova::fs::is_regular_file(stdfs::path(temp.path()) / "outside.o"),
+                   "an object must never escape into the package's parent");
+  } else {
+    COVA_CHECK(contains(built.combined(), "outside the target directory") ||
+               contains(built.combined(), "outside the package"));
+  }
+}
+
+COVA_TEST_NAMED(integration, json_build_failure_keeps_stdout_parseable) {
+  if (!has_cxx_driver()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
+  {
+    ScopedCwd cwd(temp.path());
+    COVA_CHECK(run_cli({"new", "jsonfail"}).ok());
+  }
+  const stdfs::path root = stdfs::path(temp.path()) / "jsonfail";
+  write_text(root / "src" / "main.cpp", "int main() { this is not c++ }\n");
+
+  ScopedCwd cwd(root);
+  auto built = run_cli({"build", "--json"});
+  COVA_CHECK(!built.ok());
+  // stdout must be exactly one JSON document: the compiler diagnostics belong
+  // on stderr, otherwise `--json` consumers cannot parse the result.
+  auto parsed = cova::json::Value::parse(built.out);
+  COVA_CHECK_MSG(parsed.has_value(), "stdout must stay a single JSON document");
+  if (parsed) {
+    COVA_CHECK_EQ(parsed->as_bool(false), false);
+  }
+  // The diagnostics must still be visible somewhere.
+  COVA_CHECK(contains(built.err, "error"));
+}
+
 COVA_TEST_MAIN()

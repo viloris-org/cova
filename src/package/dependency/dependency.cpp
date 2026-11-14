@@ -70,6 +70,19 @@ std::string resolution_input(const manifest::Manifest& manifest, const path& bas
         out += ',';
       }
     }
+    // Requested features change what the dependency compiles, so they are part
+    // of its resolution identity. Leaving them out made `--locked` accept a
+    // lockfile resolved for a different feature set and build the wrong
+    // configuration while reporting success.
+    if (!dependency.features.empty()) {
+      std::vector<std::string> features = dependency.features;
+      std::sort(features.begin(), features.end());
+      out += "|features=";
+      for (const auto& feature : features) {
+        out += feature;
+        out += ',';
+      }
+    }
     out += '\n';
   }
   return out;
@@ -359,6 +372,12 @@ std::vector<std::string> compare_locks(const lockfile::DependencyLock& expected,
     if (recorded.dev != package.dev) {
       differ("development flag changed");
     }
+    // Requested features are part of the resolution identity; comparing them
+    // here (and hashing them in `resolution_input`) is what makes `--locked`
+    // reject a feature-set change instead of silently building the old one.
+    if (recorded.features != package.features) {
+      differ("requested features changed");
+    }
   }
   for (const auto& [name, recorded] : actual_by_name) {
     (void)recorded;
@@ -405,6 +424,20 @@ lockfile::DependencyLock to_lock(const DependencyGraph& graph, const stdfs::path
     entry.path = relative_text(fs::absolute_normalized(package->manifest.root),
                                fs::absolute_normalized(lock_root));
     entry.dependencies = package->all_dependencies;
+    // Record the features the lockfile was resolved with so a later feature
+    // change is detectable instead of being silently ignored under --locked.
+    //
+    // Build the union of the features requested by every dependent edge, sorted
+    // for determinism.
+    std::set<std::string> requested;
+    for (const auto& dependent : graph.packages) {
+      for (const auto& dependency : dependent.manifest.dependencies) {
+        if (dependency.name == entry.name) {
+          requested.insert(dependency.features.begin(), dependency.features.end());
+        }
+      }
+    }
+    entry.features.assign(requested.begin(), requested.end());
     // A path dependency is live source, not fetched content: there is no
     // verified content hash to record. Only the resolved identity is locked.
     lock.packages.push_back(std::move(entry));
