@@ -67,10 +67,31 @@ missing, stale or would change, and never rewrites it; `--frozen` implies
 coverage: `path_dependency_outside_a_workspace_builds_and_links`,
 `lockfile_is_written_and_enforced`.
 
-Remote dependency management (registry and git sources), `cova update` and
-vendoring of remote dependencies remain unimplemented and fail explicitly because
-there is no trusted registry or verified source fetcher (PRD §18.1, OD-003). A
-regular build skips remote development dependencies, which it does not need.
+Git dependencies are fetched through `src/package/source/git`: a bare mirror and
+a per-commit checkout live under `$COVA_HOME/git`, the commit's tree is hashed
+from git's own objects (sorted path, mode and blob id) so the hash does not
+depend on the checkout's line endings, and `cova.lock` records URL, declared
+revision, pinned commit and that hash. Resolution prefers the locked commit, so a
+moved branch cannot change an existing lockfile and a cold `--locked` build
+reproduces the locked commit; only `cova update` re-reads remote refs. A
+dependency with no pin reads the remote once instead of trusting a shared cache
+entry, and a `git` value without a URL scheme is resolved relative to the
+manifest. `--offline` and `--frozen` resolve from the cache or fail with
+`cova::package::source_not_cached`. Tests:
+`resolves_git_dependency_and_pins_its_commit`,
+`keeps_a_pinned_commit_when_the_branch_moves`,
+`pins_the_locked_commit_over_a_moved_branch`,
+`first_resolution_reads_the_remote_instead_of_a_cached_head`,
+`reuses_the_cached_checkout_without_network_access`,
+`resolves_a_relative_git_url_against_the_manifest`,
+`rejects_two_git_sources_for_the_same_package`,
+`git_source_hash_ignores_checkout_line_endings`,
+`resolves_a_default_branch_that_is_not_main_or_master`.
+
+Registry dependencies (`cova add <name>` with no source), `cova package`,
+`cova publish` and vendoring of fetched sources remain unimplemented and fail
+explicitly because there is no trusted registry (PRD §18.1, OD-003). A regular
+build skips remote development dependencies, which it does not need.
 
 ## Milestone 4 — Workspace and self-hosting (workspace delivered)
 

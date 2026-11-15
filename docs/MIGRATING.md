@@ -107,7 +107,7 @@ left column, the migration is incomplete unless the workaround is acceptable.
 | Per-file or per-language flags (`set_source_files_properties`, `$<COMPILE_LANGUAGE:CXX>`) | Not supported | Apply flags to the whole package, or move the files into another package |
 | Platform-specific source sets | `[targets.<triple>]` has no `sources` | Guard with the preprocessor, or put platform code in a package enabled by a target-conditioned dependency |
 | `install()`, `export()`, CPack, `meson install`, `make install` | `cova install/package/publish` are not implemented | Consume artifacts from `target/<triple>/<profile>/` |
-| Remote/git/registry dependencies (`FetchContent`, `ExternalProject`, vcpkg, Conan) | Only local `path` dependencies are resolved | Vendor the sources and declare a path dependency, or use a system-installed library |
+| Remote/git/registry dependencies (`FetchContent`, `ExternalProject`, vcpkg, Conan) | `{ git = "...", rev = "..." }` dependencies are fetched, pinned and built; registry dependencies are not implemented | For a git dependency, declare `{ git = "https://...", rev = "v1.2.3" }`; for Conan or a system library, vendor the sources and use a path dependency |
 | CMake package config, `pkg-config` integration | Not implemented | Run `pkg-config` manually and transcribe `-I`, `-D`, `-l` and `-L` |
 | Precompiled headers | Not supported | Remove the PCH or keep it out of the Cova build |
 | C++ Modules (`.ixx`, `.cppm`) | Not supported | Do not migrate the module build yet |
@@ -283,7 +283,14 @@ For each dependency:
   nothing to build, and dependents still get the include path.
 - **System library** → `link-libraries`, plus `private-includes` or
   `link-options = ["-L<dir>"]` when it is not in the default search path.
-- **Remote dependency** → vendor it. There is no fetcher in this milestone.
+- **Remote dependency** → declare it with `cova add <name> --git <url> --rev <tag>`
+  when the dependency is a Cova package in a git repository. Cova fetches it into
+  `$COVA_HOME/git`, checks out a pinned commit and records that commit plus a
+  tree hash in `cova.lock`; a build never re-resolves a moved branch (only
+  `cova update` refreshes refs). A `git` value without a URL scheme is a local
+  repository resolved relative to the manifest (for example
+  `{ git = "../lib", rev = "v1" }`). A dependency that is not a Cova package has
+  to be vendored and declared with `{ path = "..." }`.
 
 ### Step 6 — tests
 
@@ -486,7 +493,7 @@ that by hand.
 | `add_subdirectory(sub)` | Workspace member or path dependency |
 | `find_package(Foo)` | `link-libraries` + include/defines transcribed by hand |
 | `pkg_check_modules(...)` | Run `pkg-config` manually; transcribe flags |
-| `FetchContent` / `ExternalProject_Add` | Vendor and use `{ path = ... }` |
+| `FetchContent` / `ExternalProject_Add` | `{ git = "...", rev = "..." }` for Cova packages; vendor anything else and use `{ path = ... }` |
 | `configure_file` | Generate before the build and commit the result |
 | `add_custom_command` / `add_custom_target` | Not supported |
 | `install(...)` / `export(...)` | Not supported |

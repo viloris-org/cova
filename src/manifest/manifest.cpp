@@ -356,7 +356,12 @@ Result<DependencySpec> parse_dependency(std::string name, const Value& value,
       return fail<DependencySpec>(git.error());
     }
     if (!git->empty()) {
-      spec.git = *git;
+      // A local git source is a path, not a URL: resolve it against the manifest
+      // so neither the cache key nor the lockfile depends on the directory Cova
+      // was started in.
+      spec.git = is_remote_git_url(*git)
+                     ? *git
+                     : fs::generic_string(fs::absolute_normalized(root / (*git)));
     }
     auto rev = read_string(table, "rev", context);
     if (!rev) {
@@ -490,6 +495,34 @@ Value table_value(Table table) { return Value(std::move(table)); }
 // ---------------------------------------------------------------------------
 // Enum helpers and small models
 // ---------------------------------------------------------------------------
+bool is_remote_git_url(std::string_view url) {
+  if (url.find("://") != std::string_view::npos) {
+    return true;
+  }
+  if (url.empty()) {
+    return false;
+  }
+  // A value that starts with an explicit filesystem prefix is a path, never a
+  // remote. This is the same rule git uses: `.`, `/`, `\` and `~` are local.
+  const char first = url.front();
+  if (first == '.' || first == '/' || first == '\\' || first == '~') {
+    return false;
+  }
+  // A Windows drive path (`C:/repos/lib`) is local, not `host:path`.
+  const bool drive = url.size() >= 2 && url[1] == ':' &&
+                     ((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z'));
+  if (drive) {
+    return false;
+  }
+  // git's scp-like syntax (`user@host:path`, `host:path`) names a remote.
+  const auto colon = url.find(':');
+  if (colon == std::string_view::npos) {
+    return false;
+  }
+  const auto slash = url.find('/');
+  return slash == std::string_view::npos || colon < slash;
+}
+
 std::string_view to_string(PackageKind kind) {
   switch (kind) {
     case PackageKind::Executable:
@@ -1152,7 +1185,16 @@ std::string to_toml(const Manifest& manifest) {
                                          : fs::generic_string(relative)));
         }
         if (dependency.git) {
-          table.emplace("git", Value(*dependency.git));
+          if (is_remote_git_url(*dependency.git)) {
+            table.emplace("git", Value(*dependency.git));
+          } else {
+            // A local source is resolved as an absolute path; write it back
+            // relative to the manifest so a rewrite stays portable.
+            std::error_code ec;
+            auto relative = stdfs::relative(*dependency.git, manifest.root, ec);
+            table.emplace("git", Value(ec ? fs::generic_string(*dependency.git)
+                                          : fs::generic_string(relative)));
+          }
         }
         if (dependency.git_rev) {
           table.emplace("rev", Value(*dependency.git_rev));

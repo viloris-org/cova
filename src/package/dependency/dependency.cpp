@@ -10,11 +10,34 @@
 
 #include "core/filesystem/filesystem.hpp"
 #include "core/hashing/hash.hpp"
+#include "core/version/version.hpp"
+#include "package/source/git.hpp"
 
 namespace cova::package {
 namespace {
 
 using stdfs::path;
+
+// Identity of a fetched source, remembered per package so the lockfile can
+// record where the sources came from. `url` is credential-free: it is what the
+// lockfile records and what a later pin is matched against.
+struct SourceInfo {
+  std::string url;
+  std::string ref;     // revision as declared (tag/branch/commit text)
+  std::string commit;  // pinned commit
+  std::string tree_hash;
+  bool downloaded = false;
+};
+
+// Human-readable identity of a fetched source, used in duplicate diagnostics.
+std::string source_text(const SourceInfo& source) { return source.url + "@" + source.commit; }
+
+// A dependency loaded from its manifest, plus its source identity when the
+// dependency was fetched rather than read from a path.
+struct LoadedPackage {
+  manifest::Manifest manifest;
+  std::optional<SourceInfo> source;
+};
 
 std::string relative_text(const path& value, const path& base) {
   std::error_code ec;
@@ -141,6 +164,15 @@ class Resolver {
     for (const auto& name : order_) {
       ResolvedPackage package;
       package.manifest = manifests_.at(name);
+      if (auto source = sources_.find(name); source != sources_.end()) {
+        package.source_url = source->second.url;
+        if (!source->second.ref.empty()) {
+          package.git_ref = source->second.ref;
+        }
+        package.git_rev = source->second.commit;
+        package.source_hash = source->second.tree_hash;
+        package.source_downloaded = source->second.downloaded;
+      }
       package.all_dependencies = all_dependencies_[name];
       package.build_dependencies = build_dependencies_[name];
       package.root = root_names_.contains(name);
@@ -174,18 +206,18 @@ class Resolver {
     return ok();
   }
 
-  // Loads the package a dependency declaration points at. Only local path
-  // dependencies and name-only references to workspace members are supported.
-  Result<manifest::Manifest> load_dependency_package(const manifest::DependencySpec& dependency) {
+  // Loads the package a dependency declaration points at: a local path, a
+  // workspace member by name, or a fetched git source.
+  Result<LoadedPackage> load_dependency_package(const manifest::DependencySpec& dependency) {
     if (dependency.path) {
       const path absolute = fs::absolute_normalized(*dependency.path);
       auto member = members_by_root_.find(fs::generic_string(absolute));
       if (member != members_by_root_.end()) {
-        return manifests_.at(member->second);
+        return LoadedPackage{manifests_.at(member->second), std::nullopt};
       }
       const path manifest_path = absolute / "cova.toml";
       if (!fs::is_regular_file(manifest_path)) {
-        return fail<manifest::Manifest>(
+        return fail<LoadedPackage>(
             Error::make("cova::package::dependency_missing",
                         "dependency `" + dependency.name + "` has no manifest")
                 .with("expected: " + fs::generic_string(manifest_path))
@@ -195,21 +227,128 @@ class Resolver {
       if (!loaded) {
         Error error = loaded.error();
         error.with("dependency: " + dependency.name + " (path " + fs::generic_string(absolute) + ")");
-        return fail<manifest::Manifest>(std::move(error));
+        return fail<LoadedPackage>(std::move(error));
       }
-      return loaded->manifest;
+      return LoadedPackage{std::move(loaded->manifest), std::nullopt};
+    }
+    if (dependency.git) {
+      return fetch_git_dependency(dependency);
     }
     auto member = members_by_name_.find(dependency.name);
     if (member != members_by_name_.end()) {
-      return manifests_.at(member->second);
+      return LoadedPackage{manifests_.at(member->second), std::nullopt};
     }
     Error error = Error::make(
         "cova::package::not_implemented",
-        "dependency `" + dependency.name + "` is not a local path dependency");
-    error.with("remote dependency management (registry and git sources) is not implemented yet");
+        "dependency `" + dependency.name + "` has no local path and no git URL");
+    error.with("registry dependencies are not implemented yet");
     error.with("declare it as `" + dependency.name +
-               " = { path = \"../path/to/package\" }`, or remove it from cova.toml");
-    return fail<manifest::Manifest>(std::move(error));
+               " = { path = \"../path/to/package\" }` or `" + dependency.name +
+               " = { git = \"https://...\", rev = \"v1.0.0\" }`");
+    return fail<LoadedPackage>(std::move(error));
+  }
+
+  // Fetches a git dependency into the shared source cache and loads the manifest
+  // from the checked out tree. The commit is resolved once and recorded, so a
+  // branch that moves later does not change an existing lockfile.
+  Result<LoadedPackage> fetch_git_dependency(const manifest::DependencySpec& dependency) {
+    const path cache = git_cache();
+    if (cache.empty()) {
+      return fail<LoadedPackage>(
+          Error::make("cova::package::source_not_cached",
+                      "cannot locate the git source cache for dependency `" + dependency.name + "`")
+              .with("hint: set COVA_HOME or HOME"));
+    }
+    // The lockfile records the credential-free URL, so a pin is matched against
+    // the same form; the token itself is only used to fetch.
+    const std::string url = git::redact_url(*dependency.git);
+    const std::string declared = dependency.git_rev.value_or("");
+    std::string rev = declared;
+    // Reuse the commit the lockfile already pinned. This is what makes a cold
+    // `--locked` build reproducible: it fetches that exact commit instead of
+    // re-reading a branch that may have moved. The pin is only trusted while the
+    // declaration itself is unchanged, so editing `rev` takes effect without
+    // `cova update`.
+    bool pinned = false;
+    if (request_.existing_lock != nullptr && !request_.refresh_git) {
+      const auto* locked = request_.existing_lock->find(dependency.name);
+      if (locked != nullptr && locked->source_url == url &&
+          locked->git_ref.value_or("") == declared && locked->git_rev.has_value() &&
+          !locked->git_rev->empty()) {
+        rev = *locked->git_rev;
+        pinned = true;
+      }
+    }
+
+    git::FetchRequest request;
+    request.url = *dependency.git;
+    request.rev = rev;
+    request.cache_root = cache;
+    request.offline = request_.offline;
+    // With no pin there is nothing to reuse, and the shared cache may hold a
+    // branch head another project fetched days ago. Re-read the remote so a
+    // first resolution locks what the branch actually points at; only
+    // `--offline`, which cannot refresh, keeps using the cache.
+    request.refresh = request_.refresh_git || (!pinned && !request_.offline);
+    auto fetched = git::fetch(request);
+    if (!fetched) {
+      Error error = fetched.error();
+      error.with("dependency: " + dependency.name);
+      return fail<LoadedPackage>(std::move(error));
+    }
+
+    const path manifest_path = fetched->checkout / "cova.toml";
+    if (!fs::is_regular_file(manifest_path)) {
+      return fail<LoadedPackage>(
+          Error::make("cova::package::dependency_missing",
+                      "git dependency `" + dependency.name + "` has no manifest")
+              .with("url: " + url)
+              .with("rev: " + fetched->commit)
+              .with("expected: " + fs::generic_string(manifest_path))
+              .with("a git dependency must be a Cova package with a cova.toml at its root"));
+    }
+    auto loaded = manifest::load(manifest_path);
+    if (!loaded) {
+      Error error = loaded.error();
+      error.with("dependency: " + dependency.name + " (git " + url + "@" + fetched->commit + ")");
+      return fail<LoadedPackage>(std::move(error));
+    }
+    // A declared `version` on a git dependency has to mean something: the
+    // repository may tag a revision that is not the version the manifest asks
+    // for, and silently building it would misreport the dependency graph.
+    if (!dependency.requirements.empty()) {
+      auto version = Version::parse(loaded->manifest.package.version);
+      if (!version) {
+        Error error = version.error();
+        error.with("dependency: " + dependency.name + " (git " + url + "@" + fetched->commit + ")");
+        return fail<LoadedPackage>(std::move(error));
+      }
+      for (const auto& requirement : dependency.requirements) {
+        if (!requirement.matches(*version)) {
+          return fail<LoadedPackage>(
+              Error::make("cova::package::version_mismatch",
+                          "git dependency `" + dependency.name + "` is version " +
+                              loaded->manifest.package.version + ", which does not satisfy `" +
+                              requirement.to_string() + "`")
+                  .with("url: " + url)
+                  .with("rev: " + fetched->commit));
+        }
+      }
+    }
+    return LoadedPackage{std::move(loaded->manifest),
+                         SourceInfo{url, declared, fetched->commit, fetched->tree_hash,
+                                    fetched->downloaded}};
+  }
+
+  path git_cache() {
+    if (!request_.git_cache.empty()) {
+      return request_.git_cache;
+    }
+    auto dirs = fs::cova_dirs();
+    if (!dirs) {
+      return {};
+    }
+    return dirs->git;
   }
 
   Status visit(const std::string& name) {
@@ -239,37 +378,68 @@ class Resolver {
       if (!child) {
         return fail(child.error());
       }
-      if (child->package.name.empty()) {
+      if (child->manifest.package.name.empty()) {
         return fail(Error::make("cova::package::missing_name",
                                 "a dependency of `" + name + "` has no `package.name`"));
       }
-      if (child->package.name != dependency.name) {
+      if (child->manifest.package.name != dependency.name) {
         return fail(Error::make("cova::package::name_mismatch",
                                 "dependency `" + dependency.name + "` points at a package named `" +
-                                    child->package.name + "`")
-                       .with("manifest: " + fs::generic_string(child->path)));
+                                    child->manifest.package.name + "`")
+                       .with("manifest: " + fs::generic_string(child->manifest.path)));
       }
-      const path child_root = fs::absolute_normalized(child->root);
-      auto existing = manifests_.find(child->package.name);
+      const path child_root = fs::absolute_normalized(child->manifest.root);
+      const std::string& child_name = child->manifest.package.name;
+      auto existing = manifests_.find(child_name);
       if (existing == manifests_.end()) {
-        manifests_.emplace(child->package.name, *child);
-        members_by_root_.emplace(fs::generic_string(child_root), child->package.name);
-      } else if (fs::generic_string(fs::absolute_normalized(existing->second.root)) !=
-                 fs::generic_string(child_root)) {
-        return fail(Error::make("cova::package::duplicate",
-                                "package `" + child->package.name +
-                                    "` is declared from two different paths")
-                       .with("first: " + fs::generic_string(existing->second.root))
-                       .with("second: " + fs::generic_string(child_root))
-                       .with("Cova cannot build two packages with the same name"));
+        manifests_.emplace(child_name, child->manifest);
+        members_by_root_.emplace(fs::generic_string(child_root), child_name);
+        if (child->source) {
+          sources_.emplace(child_name, *child->source);
+        }
+      } else {
+        auto known = sources_.find(child_name);
+        if (child->source && known != sources_.end()) {
+          // Both edges fetched this package: they must name exactly the same
+          // source and commit, or the build would link a revision nobody asked
+          // for. Compare the sources, not the checkout paths: those are
+          // cache-internal and produce a misleading diagnostic.
+          if (known->second.url != child->source->url ||
+              known->second.commit != child->source->commit) {
+            return fail(Error::make("cova::package::duplicate",
+                                    "package `" + child_name +
+                                        "` is required from two different git sources")
+                           .with("first: " + source_text(known->second))
+                           .with("second: " + source_text(*child->source))
+                           .with("Cova cannot build two versions of the same package"));
+          }
+        } else if (child->source || known != sources_.end()) {
+          // A fetched source and a local path claim the same package name.
+          const std::string fetched =
+              child->source ? source_text(*child->source) : source_text(known->second);
+          return fail(Error::make("cova::package::duplicate",
+                                  "package `" + child_name +
+                                      "` is declared both as a local path and as a git source")
+                         .with("git: " + fetched)
+                         .with("path: " + fs::generic_string(existing->second.root))
+                         .with("Cova cannot build two packages with the same name"));
+        } else if (fs::generic_string(fs::absolute_normalized(existing->second.root)) !=
+                   fs::generic_string(child_root)) {
+          return fail(Error::make("cova::package::duplicate",
+                                  "package `" + child_name +
+                                      "` is declared from two different paths")
+                         .with("first: " + fs::generic_string(existing->second.root))
+                         .with("second: " + fs::generic_string(child_root))
+                         .with("Cova cannot build two packages with the same name"));
+        }
       }
 
-      all_dependencies.push_back(child->package.name);
+      all_dependencies.push_back(child->manifest.package.name);
       const bool build_edge = !dependency.dev || request_.include_dev;
       if (build_edge && is_active_for(manifest, dependency.name, request_.target)) {
-        build_dependencies.push_back(child->package.name);
+        build_dependencies.push_back(child->manifest.package.name);
       }
-      auto status = visit(child->package.name);
+      auto status = visit(child->manifest.package.name);
       if (!status) {
         return status;
       }
@@ -315,6 +485,7 @@ class Resolver {
 
   const ResolveRequest& request_;
   std::map<std::string, manifest::Manifest, std::less<>> manifests_;
+  std::map<std::string, SourceInfo, std::less<>> sources_;
   std::map<std::string, std::string, std::less<>> members_by_root_;
   std::map<std::string, std::string, std::less<>> members_by_name_;
   std::map<std::string, int, std::less<>> state_;
@@ -363,11 +534,18 @@ std::vector<std::string> compare_locks(const lockfile::DependencyLock& expected,
         recorded.registry != package.registry) {
       differ("source changed");
     }
+    // The declared revision is compared separately from the pinned commit: a
+    // `rev` edit must be reported as a source change instead of being hidden by
+    // the old pin.
+    if (recorded.git_ref != package.git_ref) {
+      differ("declared revision changed");
+    }
     if (recorded.dependencies != package.dependencies) {
       differ("dependency list changed");
     }
     if (recorded.source_hash != package.source_hash) {
-      differ("manifest content changed");
+      // For a git package this is the commit's tree, not the manifest alone.
+      differ("source content changed");
     }
     if (recorded.dev != package.dev) {
       differ("development flag changed");
@@ -421,8 +599,17 @@ lockfile::DependencyLock to_lock(const DependencyGraph& graph, const stdfs::path
     lockfile::LockedPackage entry;
     entry.name = package->manifest.package.name;
     entry.version = package->manifest.package.version;
-    entry.path = relative_text(fs::absolute_normalized(package->manifest.root),
-                               fs::absolute_normalized(lock_root));
+    if (package->source_url) {
+      // Fetched content is identified by URL, pinned commit and tree hash;
+      // recording the cache path instead would tie the lockfile to one machine.
+      entry.source_url = package->source_url;
+      entry.git_ref = package->git_ref;
+      entry.git_rev = package->git_rev;
+      entry.source_hash = package->source_hash;
+    } else {
+      entry.path = relative_text(fs::absolute_normalized(package->manifest.root),
+                                 fs::absolute_normalized(lock_root));
+    }
     entry.dependencies = package->all_dependencies;
     // Record the features the lockfile was resolved with so a later feature
     // change is detectable instead of being silently ignored under --locked.

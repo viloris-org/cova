@@ -23,6 +23,19 @@ namespace stdfs = std::filesystem;
 // One package in the resolved local graph.
 struct ResolvedPackage {
   manifest::Manifest manifest;
+  // Set when the package came from a fetched source rather than a local path.
+  // `git_rev` is the pinned commit, not the tag or branch the manifest names:
+  // pinning here is what keeps a moved branch out of an existing lockfile.
+  std::optional<std::string> source_url;
+  // Revision as written in the manifest (`tag = "v1"`), kept so a later edit of
+  // that revision is visible to the lock, and the pinned commit is separate.
+  std::optional<std::string> git_ref;
+  std::optional<std::string> git_rev;
+  std::string source_hash;
+  // True when resolving this package fetched new objects from the remote, so a
+  // command can report what actually touched the network instead of counting
+  // cache hits as fetches.
+  bool source_downloaded = false;
   // Local dependencies built for the requested target, dependency-first.
   // Names refer to other ResolvedPackage entries.
   std::vector<std::string> build_dependencies;
@@ -61,6 +74,20 @@ struct ResolveRequest {
   // linked when a test build asks for them. A remote development dependency is
   // skipped for a regular build because it is not needed there.
   bool include_dev = true;
+  // Refuse to touch the network. A git dependency that is not cached is an
+  // error rather than a silent fetch.
+  bool offline = false;
+  // Re-read remote refs even when the cache can answer. Only `cova update`
+  // sets this; ordinary builds must be reproducible without the network.
+  bool refresh_git = false;
+  // Cache root holding bare repositories and checkouts. Empty means
+  // `$COVA_HOME/git`.
+  stdfs::path git_cache;
+  // Existing `cova.lock`, when present. Git dependencies are resolved to the
+  // revision it already pins, so a branch that moved upstream cannot silently
+  // change a locked build (and a cold `--locked` build resolves offline).
+  // `refresh_git` disables this, which is what makes `cova update` work.
+  const lockfile::DependencyLock* existing_lock = nullptr;
 };
 
 // Resolves roots and their transitive local path dependencies.

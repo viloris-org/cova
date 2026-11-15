@@ -33,6 +33,33 @@ COVA_TEST_NAMED(package, dependency_lock_round_trips) {
   COVA_CHECK_EQ(loaded.packages.size(), std::size_t{1});
 }
 
+COVA_TEST_NAMED(package, git_lock_entry_round_trips) {
+  cova::lockfile::LockedPackage package;
+  package.name = "math";
+  package.version = "0.1.0";
+  package.source_url = "https://example.invalid/math.git";
+  package.git_ref = "v1.2.3";
+  package.git_rev = "0123456789abcdef0123456789abcdef01234567";
+  package.source_hash = std::string(64, 'a');
+  package.dependencies = {"base"};
+
+  auto parsed = COVA_REQUIRE_OK(cova::lockfile::DependencyLock::from_toml(
+      [&] {
+        cova::lockfile::DependencyLock lock;
+        lock.packages.push_back(package);
+        return lock.to_toml();
+      }()));
+  const auto* entry = parsed.find("math");
+  COVA_CHECK(entry != nullptr);
+  COVA_CHECK_EQ(*entry->source_url, *package.source_url);
+  COVA_CHECK_EQ(*entry->git_ref, *package.git_ref);
+  COVA_CHECK_EQ(*entry->git_rev, *package.git_rev);
+  COVA_CHECK_EQ(entry->source_hash, package.source_hash);
+  // A fetched package is identified by its source, never by a machine-local
+  // cache path.
+  COVA_CHECK(!entry->path.has_value());
+}
+
 COVA_TEST_NAMED(package, toolchain_lock_round_trips) {
   cova::lockfile::ToolchainLock lock;
   lock.generated_by = "cova 0.1.0";

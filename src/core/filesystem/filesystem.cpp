@@ -1021,6 +1021,7 @@ Result<CovaDirs> cova_dirs() {
   dirs.downloads = dirs.root / "downloads";
   dirs.registry = dirs.root / "registry";
   dirs.cache = dirs.root / "cache";
+  dirs.git = dirs.root / "git";
   dirs.config_file = dirs.root / "config.toml";
   return dirs;
 }
@@ -1028,7 +1029,7 @@ Result<CovaDirs> cova_dirs() {
 Status ensure_layout(const CovaDirs& dirs) {
   for (const Path* path :
        {&dirs.root, &dirs.toolchains, &dirs.sysroots, &dirs.store, &dirs.downloads,
-        &dirs.registry, &dirs.cache}) {
+        &dirs.registry, &dirs.cache, &dirs.git}) {
     if (Status created = mkdirs(*path); !created) {
       return created;
     }

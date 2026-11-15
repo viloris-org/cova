@@ -92,6 +92,13 @@ struct DependencySpec {
   std::string to_string() const;
 };
 
+// True when a `git =` value names a remote repository (`https://`, `ssh://`,
+// `git://`, `file://`, or git's scp-like `user@host:path`); false for a local
+// path such as `../lib`. Local git sources are resolved against the manifest
+// directory, exactly like `path`, so the declaration stays portable and does not
+// depend on the directory Cova happened to be started in.
+bool is_remote_git_url(std::string_view url);
+
 // [profile.dev] / [profile.release]
 struct Profile {
   std::string name = "dev";

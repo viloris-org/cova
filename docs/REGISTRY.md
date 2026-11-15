@@ -118,8 +118,9 @@ its target runtime and does not require a separately installed Cova sysroot.
 - No public registry, signing infrastructure, mirror rotation or retry policy.
 - No network transport. The registry is a local directory by design in this
   milestone.
-- Packages (`cova add`, `fetch`, `update`) do not use this registry yet; they
-  are Milestone 3.
+- The component registry is only for toolchains and sysroots. Git dependencies
+  use the source cache in `$COVA_HOME/git` (`src/package/source/git`), and
+  registry *package* dependencies are not implemented yet.
 
 These are explicit limitations, not silent fallbacks. The goal is that every
 component Cova claims to have installed has been verified end to end.

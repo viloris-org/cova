@@ -232,4 +232,45 @@ COVA_TEST_NAMED(manifest, gnu_editions_report_their_real_standard) {
   COVA_CHECK_EQ(manifest.package.cpp_standard(), 0);
 }
 
+COVA_TEST_NAMED(manifest, classifies_git_sources_as_remote_or_local) {
+  using cova::manifest::is_remote_git_url;
+  // Remotes keep their URL; a local repository is a path resolved against the
+  // manifest, so classification decides whether `../lib` is portable.
+  COVA_CHECK(is_remote_git_url("https://github.com/org/lib.git"));
+  COVA_CHECK(is_remote_git_url("ssh://git@example.com/lib.git"));
+  COVA_CHECK(is_remote_git_url("git@example.com:org/lib.git"));
+  COVA_CHECK(is_remote_git_url("example.com:org/lib.git"));
+  COVA_CHECK(is_remote_git_url("file:///srv/git/lib.git"));
+  COVA_CHECK(!is_remote_git_url("../lib"));
+  COVA_CHECK(!is_remote_git_url("./vendor/lib"));
+  COVA_CHECK(!is_remote_git_url("vendor/lib"));
+  COVA_CHECK(!is_remote_git_url("/srv/git/lib"));
+  COVA_CHECK(!is_remote_git_url("C:/repos/lib"));
+  COVA_CHECK(!is_remote_git_url("\\server\\share\\lib"));
+  COVA_CHECK(!is_remote_git_url(""));
+}
+
+COVA_TEST_NAMED(manifest, local_git_source_is_resolved_against_the_manifest) {
+  cova::test::TempDir temp;
+  const std::filesystem::path root = std::filesystem::path(temp.path()) / "app";
+  COVA_CHECK(cova::fs::create_directories(root).has_value());
+  auto loaded = cova::manifest::parse(std::string(kPackageHeader) +
+                                          "[dependencies]\n"
+                                          "math = { git = \"../lib\", rev = \"v1\" }\n",
+                                      "cova.toml", root);
+  COVA_CHECK_MSG(loaded.has_value(), loaded ? "" : loaded.error().to_string());
+  COVA_CHECK_EQ(loaded->manifest.dependencies.size(), std::size_t{1});
+  const auto& dependency = loaded->manifest.dependencies.front();
+  COVA_CHECK(dependency.git.has_value());
+  // The declaration is stored as an absolute path, so two projects that both
+  // write `../lib` can never share a cache entry that means different things.
+  COVA_CHECK(*dependency.git != "../lib");
+  COVA_CHECK_EQ(*dependency.git,
+                cova::fs::generic_string(cova::fs::absolute_normalized(root / "../lib")));
+  // Serialising the model must not freeze the machine-specific absolute path
+  // into the manifest: a rewrite keeps the portable declaration.
+  const std::string rewritten = cova::manifest::to_toml(loaded->manifest);
+  COVA_CHECK_MSG(rewritten.find("git = \"../lib\"") != std::string::npos, rewritten);
+}
+
 COVA_TEST_MAIN()

@@ -4,9 +4,11 @@
 #include <string_view>
 
 #include "core/filesystem/filesystem.hpp"
+#include "core/process/process.hpp"
 #include "manifest/manifest.hpp"
 #include "package/dependency/dependency.hpp"
 #include "package/lockfile/lockfile.hpp"
+#include "package/source/git.hpp"
 #include "platform/triple/triple.hpp"
 #include "testing/test.hpp"
 
@@ -35,6 +37,58 @@ cova::manifest::Manifest load_manifest(const stdfs::path& root) {
   auto loaded = cova::manifest::load_from_root(root);
   COVA_CHECK_MSG(loaded.has_value(), loaded ? "" : loaded.error().to_string());
   return loaded->manifest;
+}
+
+bool have_git() { return cova::fs::find_in_path("git").has_value(); }
+
+// Runs git in `cwd`; a non-zero exit is a test failure, not an expected state.
+void git_run(const stdfs::path& cwd, const std::vector<std::string>& args) {
+  auto git = cova::fs::find_in_path("git");
+  COVA_CHECK(git.has_value());
+  auto result = cova::proc::run(*git, args, cwd);
+  COVA_CHECK_MSG(result.has_value(), result ? "" : result.error().to_string());
+  COVA_CHECK_MSG(result->success(), "git failed: " + result->stderr_trimmed());
+}
+
+// Runs git in `cwd` and returns its trimmed stdout.
+std::string git_output(const stdfs::path& cwd, const std::vector<std::string>& args) {
+  auto git = cova::fs::find_in_path("git");
+  COVA_CHECK(git.has_value());
+  auto result = cova::proc::capture(*git, args, cwd);
+  COVA_CHECK_MSG(result.has_value(), result ? "" : result.error().to_string());
+  return cova::str::trim(*result);
+}
+
+// Creates a committed library repository at `root`. The branch is pinned to
+// `master` on purpose: `git init` otherwise follows the developer's
+// `init.defaultBranch`, and tests that name a branch would fail on a machine
+// configured for `main`.
+void init_library_repo(const stdfs::path& root, std::string_view name) {
+  write_project(root, name, "static-library");
+  git_run(root, {"init", "--quiet"});
+  git_run(root, {"symbolic-ref", "HEAD", "refs/heads/master"});
+  git_run(root, {"-c", "user.email=test@cova.invalid", "-c", "user.name=Cova Test", "add",
+                 "-A"});
+  git_run(root, {"-c", "user.email=test@cova.invalid", "-c", "user.name=Cova Test", "commit",
+                 "--quiet", "-m", "initial"});
+}
+
+void commit_all(const stdfs::path& root, std::string_view message) {
+  git_run(root, {"-c", "user.email=test@cova.invalid", "-c", "user.name=Cova Test", "add",
+                 "-A"});
+  git_run(root, {"-c", "user.email=test@cova.invalid", "-c", "user.name=Cova Test", "commit",
+                 "--quiet", "-m", std::string(message)});
+}
+
+// `rev` may be empty: that is the "use the repository default branch" form.
+std::string git_dependency(std::string_view name, const stdfs::path& url,
+                           std::string_view rev = {}) {
+  std::string text = "[dependencies]\n" + std::string(name) + " = { git = \"" +
+                     cova::fs::generic_string(url) + "\"";
+  if (!rev.empty()) {
+    text += ", rev = \"" + std::string(rev) + "\"";
+  }
+  return text + " }\n";
 }
 
 cova::package::ResolveRequest request_for(std::vector<cova::manifest::Manifest> roots,
@@ -100,7 +154,7 @@ COVA_TEST_NAMED(package, rejects_dependency_cycles) {
   COVA_CHECK_MSG(error.message.find("a -> b -> a") != std::string::npos, error.message);
 }
 
-COVA_TEST_NAMED(package, rejects_remote_dependency_declarations) {
+COVA_TEST_NAMED(package, rejects_registry_dependency_declarations) {
   cova::test::TempDir temp;
   const auto app_root = stdfs::path(temp.path()) / "app";
   write_project(app_root, "app", "executable", "[dependencies]\nfmt = \"11\"\n");
@@ -109,11 +163,12 @@ COVA_TEST_NAMED(package, rejects_remote_dependency_declarations) {
       COVA_REQUIRE_ERR(cova::package::resolve(request_for({load_manifest(app_root)}, app_root)));
   COVA_CHECK_EQ(error.code, std::string("cova::package::not_implemented"));
   COVA_CHECK_MSG(error.message.find("fmt") != std::string::npos, error.message);
-  bool mentions_remote = false;
+  bool mentions_registry = false;
   for (const auto& line : error.context) {
-    mentions_remote = mentions_remote || line.find("remote dependency management") != std::string::npos;
+    mentions_registry =
+        mentions_registry || line.find("registry dependencies are not implemented") != std::string::npos;
   }
-  COVA_CHECK(mentions_remote);
+  COVA_CHECK(mentions_registry);
 }
 
 COVA_TEST_NAMED(package, target_filters_change_the_build_edges_not_the_lock) {
@@ -299,6 +354,393 @@ COVA_TEST_NAMED(package, lockfile_is_written_enforced_and_never_rewritten_in_loc
   auto created = COVA_REQUIRE_OK(cova::package::enforce_lock(changed, missing, false));
   COVA_CHECK(created.wrote);
   COVA_CHECK(cova::fs::is_regular_file(missing));
+}
+
+COVA_TEST_NAMED(package, resolves_git_dependency_and_pins_its_commit) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  const auto cache = base / "git-cache";
+  init_library_repo(lib_root, "math");
+  git_run(lib_root, {"tag", "v1"});
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "v1"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = cache;
+  auto graph = COVA_REQUIRE_OK(cova::package::resolve(request));
+
+  const auto* math = graph.find("math");
+  COVA_CHECK(math != nullptr);
+  COVA_CHECK(math->source_url.has_value());
+  COVA_CHECK_EQ(*math->source_url, cova::fs::generic_string(lib_root));
+  // The lockfile records a commit, never a tag: a moved tag cannot silently
+  // change an existing lock.
+  COVA_CHECK(math->git_rev.has_value());
+  COVA_CHECK_EQ(math->git_rev->size(), std::size_t{40});
+  COVA_CHECK_EQ(math->source_hash.size(), std::size_t{64});
+  // Built from the cache checkout, not from the repository next to it.
+  COVA_CHECK(cova::fs::is_within(math->manifest.root, cache));
+  COVA_CHECK(cova::fs::is_regular_file(math->manifest.root / "cova.toml"));
+
+  const auto* app = graph.find("app");
+  COVA_CHECK(app != nullptr);
+  COVA_CHECK(app->build_dependencies == std::vector<std::string>{"math"});
+
+  // The lockfile identifies the source by URL, commit and tree hash, and must
+  // not record a machine-specific cache path.
+  auto lock = cova::package::to_lock(graph, app_root);
+  const auto* entry = lock.find("math");
+  COVA_CHECK(entry != nullptr);
+  COVA_CHECK(entry->source_url.has_value());
+  COVA_CHECK(!entry->path.has_value());
+  COVA_CHECK_EQ(*entry->git_rev, *math->git_rev);
+  COVA_CHECK_EQ(entry->source_hash, math->source_hash);
+}
+
+COVA_TEST_NAMED(package, keeps_a_pinned_commit_when_the_branch_moves) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  const auto cache = base / "git-cache";
+  init_library_repo(lib_root, "math");
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "master"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = cache;
+  auto first = COVA_REQUIRE_OK(cova::package::resolve(request));
+  const std::string pinned = *first.find("math")->git_rev;
+  // A real second build has the lockfile the first one wrote; feed it in, or the
+  // resolution is a *first* resolution and is expected to read the remote.
+  const auto lock = cova::package::to_lock(first, app_root);
+
+  // A new commit on the branch must not change the resolution of a plain build.
+  COVA_CHECK(cova::fs::write_file(lib_root / "src" / "source.cpp",
+                                  "int value() { return 1; }\n")
+                 .has_value());
+  commit_all(lib_root, "second");
+
+  request.existing_lock = &lock;
+  auto stale = COVA_REQUIRE_OK(cova::package::resolve(request));
+  COVA_CHECK_EQ(*stale.find("math")->git_rev, pinned);
+
+  // `cova update` is the only command that re-reads remote refs.
+  auto refresh = request;
+  refresh.refresh_git = true;
+  auto advanced = COVA_REQUIRE_OK(cova::package::resolve(refresh));
+  COVA_CHECK_NE(*advanced.find("math")->git_rev, pinned);
+}
+
+COVA_TEST_NAMED(package, reuses_the_cached_checkout_without_network_access) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  const auto cache = base / "git-cache";
+  init_library_repo(lib_root, "math");
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "master"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = cache;
+  auto first = COVA_REQUIRE_OK(cova::package::resolve(request));
+
+  // Move the repository away: an offline resolve must still answer from the
+  // cache, which proves the checkout is self-contained.
+  std::error_code ec;
+  stdfs::rename(lib_root, base / "lib-moved", ec);
+  COVA_CHECK(!ec);
+
+  auto offline = request;
+  offline.offline = true;
+  auto cached = COVA_REQUIRE_OK(cova::package::resolve(offline));
+  COVA_CHECK_EQ(*cached.find("math")->git_rev, *first.find("math")->git_rev);
+  COVA_CHECK_EQ(cached.find("math")->source_hash, first.find("math")->source_hash);
+}
+
+COVA_TEST_NAMED(package, rejects_uncached_git_dependency_in_offline_mode) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  init_library_repo(lib_root, "math");
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "master"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = base / "empty-cache";
+  request.offline = true;
+  auto error = COVA_REQUIRE_ERR(cova::package::resolve(request));
+  COVA_CHECK_EQ(error.code, std::string("cova::package::source_not_cached"));
+}
+
+COVA_TEST_NAMED(package, rejects_git_revisions_that_do_not_exist) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  init_library_repo(lib_root, "math");
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "no-such-tag"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = base / "git-cache";
+  auto error = COVA_REQUIRE_ERR(cova::package::resolve(request));
+  COVA_CHECK_EQ(error.code, std::string("cova::package::source_rev_unknown"));
+}
+
+COVA_TEST_NAMED(package, rejects_git_dependency_whose_package_name_differs) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  init_library_repo(lib_root, "math");
+  write_project(app_root, "app", "executable", git_dependency("util", lib_root, "master"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = base / "git-cache";
+  auto error = COVA_REQUIRE_ERR(cova::package::resolve(request));
+  COVA_CHECK_EQ(error.code, std::string("cova::package::name_mismatch"));
+}
+
+COVA_TEST_NAMED(package, pins_the_locked_commit_over_a_moved_branch) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  const auto cache = base / "git-cache";
+  init_library_repo(lib_root, "math");
+  git_run(lib_root, {"tag", "v1"});
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "master"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = cache;
+  auto first = COVA_REQUIRE_OK(cova::package::resolve(request));
+  const std::string pinned = *first.find("math")->git_rev;
+  const auto lock = cova::package::to_lock(first, app_root);
+
+  COVA_CHECK(cova::fs::write_file(lib_root / "src" / "source.cpp",
+                                  "int value() { return 2; }\n")
+                 .has_value());
+  commit_all(lib_root, "moved");
+  git_run(lib_root, {"tag", "v2"});
+
+  // A cold cache plus a lockfile must build the locked commit, not today's
+  // branch head: this is what makes `--locked` reproducible on CI.
+  auto replay = request_for({load_manifest(app_root)}, app_root);
+  replay.git_cache = base / "cold-cache";
+  replay.existing_lock = &lock;
+  auto second = COVA_REQUIRE_OK(cova::package::resolve(replay));
+  COVA_CHECK_EQ(*second.find("math")->git_rev, pinned);
+  COVA_CHECK_EQ(second.find("math")->source_hash, first.find("math")->source_hash);
+
+  // Editing the declared revision defeats the pin; the lock must report it and
+  // `--locked` must refuse to build.
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "v2"));
+  auto edited = request_for({load_manifest(app_root)}, app_root);
+  edited.git_cache = cache;
+  edited.existing_lock = &lock;
+  auto third = COVA_REQUIRE_OK(cova::package::resolve(edited));
+  COVA_CHECK_NE(*third.find("math")->git_rev, pinned);
+  auto outcome = cova::package::enforce_lock(third, app_root / "cova.lock", /*locked=*/true);
+  COVA_CHECK(!outcome.has_value());
+}
+
+COVA_TEST_NAMED(package, first_resolution_reads_the_remote_instead_of_a_cached_head) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  const auto cache = base / "git-cache";
+  init_library_repo(lib_root, "math");
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "master"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = cache;
+  auto first = COVA_REQUIRE_OK(cova::package::resolve(request));
+  const std::string pinned = *first.find("math")->git_rev;
+
+  COVA_CHECK(cova::fs::write_file(lib_root / "src" / "source.cpp",
+                                  "int value() { return 2; }\n")
+                 .has_value());
+  commit_all(lib_root, "second");
+
+  // A second project shares the cache but has no lockfile yet. It has no pin to
+  // reuse, so it must read the branch instead of inheriting the first project's
+  // cached head and silently locking a stale commit.
+  const auto other_root = base / "other";
+  write_project(other_root, "other", "executable", git_dependency("math", lib_root, "master"));
+  auto other = request_for({load_manifest(other_root)}, other_root);
+  other.git_cache = cache;
+  auto second = COVA_REQUIRE_OK(cova::package::resolve(other));
+  COVA_CHECK_NE(*second.find("math")->git_rev, pinned);
+}
+
+COVA_TEST_NAMED(package, resolves_a_relative_git_url_against_the_manifest) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  init_library_repo(lib_root, "math");
+  git_run(lib_root, {"tag", "v1"});
+  // `../lib` is relative to the manifest, not to the process working directory.
+  write_project(app_root, "app", "executable", git_dependency("math", "../lib", "v1"));
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = base / "git-cache";
+  auto graph = COVA_REQUIRE_OK(cova::package::resolve(request));
+
+  const auto* math = graph.find("math");
+  COVA_CHECK(math != nullptr);
+  COVA_CHECK(math->source_url.has_value());
+  // The resolved source is absolute, so the cache key and the lockfile do not
+  // depend on where Cova was started, and two projects cannot share a cache
+  // entry that means different repositories.
+  COVA_CHECK_EQ(*math->source_url,
+                cova::fs::generic_string(cova::fs::absolute_normalized(lib_root)));
+  COVA_CHECK(cova::fs::is_regular_file(math->manifest.root / "cova.toml"));
+}
+
+COVA_TEST_NAMED(package, rejects_two_git_sources_for_the_same_package) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  const auto extra_root = base / "extra";
+  init_library_repo(lib_root, "math");
+  git_run(lib_root, {"tag", "v1"});
+  COVA_CHECK(cova::fs::write_file(lib_root / "src" / "source.cpp",
+                                  "int value() { return 1; }\n")
+                 .has_value());
+  commit_all(lib_root, "second");
+  git_run(lib_root, {"tag", "v2"});
+
+  // `app` asks for v1 and its path dependency asks for v2: one package name
+  // resolved to two commits, which cannot be built.
+  write_project(extra_root, "extra", "static-library", git_dependency("math", lib_root, "v2"));
+  const std::string dependencies =
+      git_dependency("math", lib_root, "v1") + "extra = { path = \"../extra\" }\n";
+  write_project(app_root, "app", "executable", dependencies);
+
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = base / "git-cache";
+  auto error = COVA_REQUIRE_ERR(cova::package::resolve(request));
+  COVA_CHECK_EQ(error.code, std::string("cova::package::duplicate"));
+  COVA_CHECK_MSG(error.message.find("two different git sources") != std::string::npos,
+                 error.message);
+  // The diagnostic names the sources, never the cache-internal checkout paths.
+  bool leaks_cache = false;
+  for (const auto& line : error.context) {
+    leaks_cache = leaks_cache || line.find("checkouts") != std::string::npos;
+  }
+  COVA_CHECK(!leaks_cache);
+}
+
+COVA_TEST_NAMED(package, git_source_hash_ignores_checkout_line_endings) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  init_library_repo(lib_root, "math");
+  git_run(lib_root, {"tag", "v1"});
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root, "v1"));
+
+  const auto crlf_false = base / "gitconfig-false";
+  const auto crlf_true = base / "gitconfig-true";
+  COVA_CHECK(cova::fs::write_file(crlf_false, "[core]\n\tautocrlf = false\n").has_value());
+  COVA_CHECK(cova::fs::write_file(crlf_true, "[core]\n\tautocrlf = true\n").has_value());
+
+  auto hash_with = [&](const stdfs::path& config, const stdfs::path& cache) {
+    COVA_CHECK(
+        cova::fs::set_env("GIT_CONFIG_GLOBAL", cova::fs::generic_string(config)).has_value());
+    auto request = request_for({load_manifest(app_root)}, app_root);
+    request.git_cache = cache;
+    auto graph = COVA_REQUIRE_OK(cova::package::resolve(request));
+    return graph.find("math")->source_hash;
+  };
+  const std::string hash_lf = hash_with(crlf_false, base / "cache-lf");
+  const std::string hash_crlf = hash_with(crlf_true, base / "cache-crlf");
+  // Leave the process with a valid config even when the developer had none.
+  const auto previous = cova::fs::get_env("GIT_CONFIG_GLOBAL");
+  const std::string restore =
+      previous.value_or(cova::fs::generic_string(crlf_false));
+  COVA_CHECK(cova::fs::set_env("GIT_CONFIG_GLOBAL", restore).has_value());
+
+  // The hash is taken from the commit's tree, not from the checkout, so a
+  // checkout with CRLF line endings (Git for Windows' default) cannot make a
+  // lockfile written on another platform look stale.
+  COVA_CHECK_EQ(hash_lf, hash_crlf);
+}
+
+COVA_TEST_NAMED(package, resolves_a_default_branch_that_is_not_main_or_master) {
+  if (!have_git()) {
+    return;
+  }
+  cova::test::TempDir temp;
+  const stdfs::path base(temp.path());
+  const auto lib_root = base / "lib";
+  const auto app_root = base / "app";
+  init_library_repo(lib_root, "math");
+  // The repository has two branches and its default is `trunk`; a `rev`-less
+  // dependency must follow the remote HEAD, not guess main or master.
+  git_run(lib_root, {"branch", "trunk"});
+  git_run(lib_root, {"checkout", "--quiet", "trunk"});
+  COVA_CHECK(cova::fs::write_file(lib_root / "src" / "source.cpp",
+                                  "int value() { return 9; }\n")
+                 .has_value());
+  commit_all(lib_root, "trunk work");
+  const std::string trunk_commit = git_output(lib_root, {"rev-parse", "HEAD"});
+
+  write_project(app_root, "app", "executable", git_dependency("math", lib_root));
+  auto request = request_for({load_manifest(app_root)}, app_root);
+  request.git_cache = base / "git-cache";
+  auto graph = COVA_REQUIRE_OK(cova::package::resolve(request));
+  COVA_CHECK_EQ(*graph.find("math")->git_rev, trunk_commit);
+}
+
+COVA_TEST_NAMED(package, redacts_credentials_from_recorded_urls) {
+  using cova::package::git::redact_url;
+  COVA_CHECK_EQ(redact_url("https://user:token@example.com/x.git"),
+                std::string("https://***@example.com/x.git"));
+  COVA_CHECK_EQ(redact_url("https://ghp_secret@example.com/x.git"),
+                std::string("https://***@example.com/x.git"));
+  // The conventional SSH account carries no secret and stays readable.
+  COVA_CHECK_EQ(redact_url("ssh://git@example.com/x.git"),
+                std::string("ssh://git@example.com/x.git"));
+  COVA_CHECK_EQ(redact_url("https://example.com/x.git"),
+                std::string("https://example.com/x.git"));
+  COVA_CHECK_EQ(redact_url("../lib"), std::string("../lib"));
 }
 
 COVA_TEST_MAIN()

@@ -119,6 +119,7 @@ struct CovaDirs {
   Path downloads;   // root/downloads
   Path registry;    // root/registry
   Path cache;       // root/cache
+  Path git;         // root/git (bare repositories and checkouts)
   Path config_file; // root/config.toml
 };
 

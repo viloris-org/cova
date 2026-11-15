@@ -31,6 +31,7 @@ struct LockedPackage {
   std::string version;
   // Exactly one source form is recorded per entry.
   std::optional<std::string> source_url;   // git or registry URL
+  std::optional<std::string> git_ref;      // revision as declared (tag/branch)
   std::optional<std::string> git_rev;      // pinned commit
   std::optional<std::string> registry;
   std::optional<std::string> path;         // workspace/path dependency

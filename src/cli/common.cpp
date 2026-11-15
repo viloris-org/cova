@@ -511,7 +511,7 @@ std::vector<std::string> selected_roots(CommandContext& ctx, const LoadedProject
 
 Result<DependencyState> resolve_dependencies(CommandContext& ctx, const LoadedProject& project,
                                              const platform::Triple& target, bool apply_lock,
-                                             bool include_dev) {
+                                             bool include_dev, bool refresh_git) {
   auto members = load_member_manifests(project);
   if (!members) {
     return fail<DependencyState>(members.error());
@@ -520,6 +520,8 @@ Result<DependencyState> resolve_dependencies(CommandContext& ctx, const LoadedPr
   package::ResolveRequest request;
   request.target = target;
   request.include_dev = include_dev;
+  request.offline = ctx.global.offline_mode();
+  request.refresh_git = refresh_git;
   request.workspace_members = *members;
   request.lock_root = project_lock_root(project);
   if (project.workspace) {
@@ -528,6 +530,24 @@ Result<DependencyState> resolve_dependencies(CommandContext& ctx, const LoadedPr
     request.roots = *members;
   } else {
     request.roots.push_back(project.manifest);
+  }
+
+  // Feed the existing lock into resolution so git dependencies resolve to the
+  // commit it already pins instead of re-reading a moving branch. A lockfile
+  // that cannot be parsed has no pin to offer: under `--locked` that is a hard
+  // error, and otherwise `enforce_lock` rewrites it from the fresh resolution.
+  lockfile::DependencyLock existing_lock;
+  const stdfs::path lock_path = request.lock_root / "cova.lock";
+  if (fs::is_regular_file(lock_path)) {
+    auto loaded = lockfile::DependencyLock::load(lock_path);
+    if (!loaded) {
+      if (ctx.global.locked_mode()) {
+        return fail<DependencyState>(loaded.error());
+      }
+    } else {
+      existing_lock = std::move(*loaded);
+      request.existing_lock = &existing_lock;
+    }
   }
 
   auto graph = package::resolve(request);

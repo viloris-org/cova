@@ -98,7 +98,7 @@ struct DependencyState {
 // read-only callers (`cova graph`) pass false and never touch the file.
 Result<DependencyState> resolve_dependencies(CommandContext& ctx, const LoadedProject& project,
                                              const platform::Triple& target, bool apply_lock,
-                                             bool include_dev);
+                                             bool include_dev, bool refresh_git = false);
 
 // Plans the build for this invocation. `include_tests` controls whether test
 // actions are part of the graph.

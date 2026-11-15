@@ -26,10 +26,24 @@ cova add math --path ../math
 cova build
 ```
 
-Remote dependency management is **not implemented yet**: `cova add fmt` without a
-`--path`, and builds or tests that need a registry or git dependency, fail
-explicitly instead of pretending to fetch them. (A regular build skips remote
-development dependencies, because it does not need them.)
+Git dependencies are fetched, pinned and built the way CMake's `FetchContent`
+does it, without a generated CMake project:
+
+```bash
+cova add spdlog --git https://github.com/gabime/spdlog --rev v1.15.0
+cova build
+```
+
+Cova clones into `$COVA_HOME/git`, checks out a commit and records that commit
+plus a content hash of the commit's tree in `cova.lock`. The hash comes from
+git's own objects (path, mode and blob id), so it does not change with the
+checkout's line endings and a lockfile written on one platform stays valid on
+another. A plain build never re-reads a moved branch — only `cova update`
+refreshes refs — and `--offline`/`--frozen` resolve from the cache or fail. A
+`git` value without a URL scheme is a local repository resolved relative to the
+manifest, exactly like `path`. Registry dependencies (`cova add fmt` without a
+source) are **not implemented yet** and fail explicitly instead of pretending to
+fetch them.
 
 Cross compilation is a first-class command, not a configuration project:
 
@@ -79,7 +93,7 @@ What works today:
 | `doctor`, `target list`, `toolchain list/explain`, `sysroot list/verify` | Works |
 | Sysroot installation | Local archive or trusted local registry index; SHA-256 verified |
 | Managed toolchain installation | Trusted local registry index; SHA-256 verified, atomic commit |
-| Dependency manager (`add`, `fetch`, `update`, `vendor`) | Local path dependencies, inside or outside a workspace, are resolved transitively, built for the requested target and linked; `cova.lock` records the resolution. Remote dependency management (registry and git sources) is not implemented yet and fails honestly |
+| Dependency manager (`add`, `fetch`, `update`) | Local path and git dependencies are resolved transitively, built for the requested target and linked; `cova.lock` pins git commits and source hashes. Registry dependencies are not implemented yet and fail honestly |
 | Dependency lockfile | `cova.lock` is written on resolution; `--locked` refuses a missing, stale or would-change lockfile and `--frozen` implies `--locked --offline` |
 | Compilation database | Every `build` and `check` emits `compile_commands.json` with the exact compile arguments; a workspace gets one file covering its members |
 | Workspace | Discovery, ordering, shared settings and multi-package builds |
@@ -88,9 +102,11 @@ What works today:
 
 What deliberately does **not** work yet, by design:
 
-- **No network package registry or source fetcher.** Remote `cova add`, `cova
-  fetch` and `cova update` refuse rather than simulate a download. PRD §18.1
-  forbids trusting content we cannot verify.
+- **No network package registry.** `cova add <name>` without `--path` or
+  `--git` refuses rather than simulate a download, and registry dependencies in
+  a manifest are rejected. PRD §18.1 forbids trusting content we cannot verify.
+- **No git submodules and no vendoring of fetched sources.** A git dependency is
+  checked out from its own tree; `cova vendor` is still not implemented.
 - **No network component download.** `cova toolchain install` and `cova sysroot
   install` read a trusted local registry (`~/.cova/registry/index.toml` or
   `--registry <dir>`); an `http(s)://` archive URL is reported as unsupported.

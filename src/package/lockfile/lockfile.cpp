@@ -52,6 +52,9 @@ Table package_table(const LockedPackage& package) {
   if (package.source_url) {
     table.emplace("source-url", Value(*package.source_url));
   }
+  if (package.git_ref) {
+    table.emplace("git-ref", Value(*package.git_ref));
+  }
   if (package.git_rev) {
     table.emplace("git-rev", Value(*package.git_rev));
   }
@@ -196,6 +199,9 @@ Result<DependencyLock> DependencyLock::from_toml(std::string_view text) {
       }
       if (auto value = get(table, "source-url"); value != nullptr && value->is_string()) {
         package.source_url = value->as_string();
+      }
+      if (auto value = get(table, "git-ref"); value != nullptr && value->is_string()) {
+        package.git_ref = value->as_string();
       }
       if (auto value = get(table, "git-rev"); value != nullptr && value->is_string()) {
         package.git_rev = value->as_string();

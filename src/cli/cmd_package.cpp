@@ -14,6 +14,7 @@
 #include "core/filesystem/filesystem.hpp"
 #include "core/json/json.hpp"
 #include "manifest/manifest.hpp"
+#include "package/source/git.hpp"
 
 namespace cova::cli {
 namespace {
@@ -213,11 +214,9 @@ int report_milestone_gap(CommandContext& ctx, std::string_view command,
       "`cova " + std::string(command) + "` is not available in this milestone");
   diagnostic.note("missing capability", std::string(what));
   diagnostic.line(
-      "Cova's package manager needs a trusted registry and a verified fetcher; neither "
-      "exists yet. Rather than simulate them, this command fails explicitly (PRD §18.1, "
-      "OD-003).");
-  diagnostic.line("remote dependency management is not implemented yet; only local path "
-                  "dependencies are resolved and built.");
+      "This command needs a trusted package registry; one does not exist yet. Rather than "
+      "simulate it, this command fails explicitly (PRD §18.1, OD-003).");
+  diagnostic.line("git dependencies are resolved and built; registry dependencies are not.");
   engine.emit(std::move(diagnostic));
   return report_diagnostics(engine, ctx);
 }
@@ -247,17 +246,143 @@ void render_tree(const TreeNode& node, std::string prefix, bool last, std::strin
 
 }  // namespace
 
+namespace {
+
+// Declares, fetches and verifies a git dependency.
+//
+// The source is fetched *before* the manifest is edited: a mistyped URL or a
+// repository that is not a Cova package must not leave a declaration the build
+// cannot satisfy.
+int add_git_dependency(CommandContext& ctx, const LoadedProject& project, const std::string& name,
+                       const std::string& version) {
+  const std::string raw = *ctx.flags.get("git");
+  const std::string rev = ctx.flags.get("rev").value_or("");
+  if (raw.empty()) {
+    return report_error(Error::make("cova::add::missing_url", "`--git` needs a URL"), ctx);
+  }
+  // A local git source is a path typed relative to the shell, while the manifest
+  // records it relative to the project root (exactly like `path` dependencies).
+  // Fetching uses the resolved absolute path, so the command does not depend on
+  // where the manifest happens to live or on the caller's working directory.
+  const bool remote_url = manifest::is_remote_git_url(raw);
+  const stdfs::path local_source = fs::absolute_normalized(ctx.cwd / raw);
+  if (!remote_url && !fs::is_directory(local_source)) {
+    return report_error(Error::make("cova::add::source_missing",
+                                    "`" + raw + "` is neither a directory nor a git URL")
+                            .with("resolved: " + fs::generic_string(local_source)),
+                        ctx);
+  }
+  const std::string fetch_url = remote_url ? raw : fs::generic_string(local_source);
+  const std::string display_url = package::git::redact_url(fetch_url);
+  if (display_url != fetch_url) {
+    ctx.ui->warn("the git URL contains credentials; cova.lock records the redacted form `" +
+                 display_url + "`, but cova.toml and the local git cache keep it in clear text");
+  }
+
+  auto dirs = fs::cova_dirs();
+  if (!dirs) {
+    return report_error(dirs.error(), ctx);
+  }
+
+  package::git::FetchRequest request;
+  request.url = fetch_url;
+  request.rev = rev;
+  request.cache_root = dirs->git;
+  request.offline = ctx.global.offline_mode();
+  auto fetched = package::git::fetch(request);
+  if (!fetched) {
+    return report_error(fetched.error(), ctx);
+  }
+
+  const stdfs::path manifest_path = fetched->checkout / "cova.toml";
+  if (!fs::is_regular_file(manifest_path)) {
+    return report_error(
+        Error::make("cova::add::not_a_package",
+                    "`" + display_url + "` does not look like a Cova package")
+            .with("checked: " + fs::generic_string(manifest_path))
+            .with("a git dependency must have a cova.toml at the repository root"),
+        ctx);
+  }
+  auto loaded = manifest::load(manifest_path);
+  if (!loaded) {
+    return report_error(loaded.error(), ctx);
+  }
+  if (loaded->manifest.package.name != name) {
+    return report_error(
+        Error::make("cova::add::name_mismatch",
+                    "`" + display_url + "` is a Cova package named `" +
+                        loaded->manifest.package.name + "`, not `" + name + "`")
+            .with("add it as: cova add " + loaded->manifest.package.name + " --git \"" +
+                  display_url + "\""),
+        ctx);
+  }
+  // A version requirement on a git dependency is only useful if it is checked,
+  // so reject a tag that does not satisfy the `name@version` the user typed.
+  if (!version.empty()) {
+    auto requirement = VersionRequirement::parse(version);
+    if (!requirement) {
+      return report_error(requirement.error(), ctx);
+    }
+    auto actual = Version::parse(loaded->manifest.package.version);
+    if (!actual || !requirement->matches(*actual)) {
+      return report_error(
+          Error::make("cova::add::version_mismatch",
+                      "`" + display_url + "` is version " + loaded->manifest.package.version +
+                          ", which does not satisfy `" + version + "`")
+              .with("drop the requirement, or pick a revision that provides it"),
+          ctx);
+    }
+  }
+
+  const std::string manifest_url =
+      remote_url ? raw : relative_dependency_path(local_source, project.layout.root);
+  std::string value = "{ git = \"" + escape_toml_string(manifest_url) + "\"";
+  if (!rev.empty()) {
+    value += ", rev = \"" + escape_toml_string(rev) + "\"";
+  }
+  if (!version.empty()) {
+    value += ", version = \"" + escape_toml_string(version) + "\"";
+  }
+  if (ctx.flags.boolean("dev")) {
+    value += ", dev = true";
+  }
+  value += " }";
+
+  auto existing = fs::read_file(project.layout.manifest);
+  if (!existing) {
+    return report_error(existing.error(), ctx);
+  }
+  std::vector<std::string> lines = split_lines(*existing);
+  if (Status appended = append_dependency_line(lines, name, value); !appended) {
+    return report_error(appended.error(), ctx);
+  }
+  auto status = fs::write_file_atomic(project.layout.manifest, join_lines(lines));
+  if (!status) {
+    return report_error(status.error(), ctx);
+  }
+  ctx.ui->info("added git dependency `" + name + "` (" + display_url + "@" +
+               fetched->commit.substr(0, 12) + ")");
+  ctx.ui->verbose("resolved " + fetched->commit + "; `cova build` records it in cova.lock");
+  return 0;
+}
+
+}  // namespace
+
 int cmd_add(CommandContext& ctx) {
   if (ctx.positionals().empty()) {
     ctx.ui->error("`cova add` requires a package name");
     ctx.ui->info("usage: cova add <name>[@<version>] [--path <dir> | --git <url> [--rev <rev>]]");
     return 2;
   }
-  // Declaring a path dependency is a purely local manifest edit and is allowed.
   const bool local = ctx.flags.has("path");
-  if (!local) {
+  const bool remote = ctx.flags.has("git");
+  if (local && remote) {
+    ctx.ui->error("`cova add` accepts either `--path` or `--git`, not both");
+    return 2;
+  }
+  if (!local && !remote) {
     return report_milestone_gap(ctx, "add",
-                                "dependency resolution and source fetching from a registry");
+                                "a package registry to resolve a name without a source");
   }
 
   auto project = load_project(ctx);
@@ -270,6 +395,10 @@ int cmd_add(CommandContext& ctx) {
     version = name.substr(at + 1);
     name = name.substr(0, at);
   }
+  if (!str::is_package_name(name)) {
+    return report_error(Error::make("cova::add::invalid_name",
+                                    "`" + name + "` is not a valid package name"), ctx);
+  }
 
   manifest::Manifest manifest = project->manifest;
   for (auto& dependency : manifest.dependencies) {
@@ -279,6 +408,11 @@ int cmd_add(CommandContext& ctx) {
                           ctx);
     }
   }
+
+  if (remote) {
+    return add_git_dependency(ctx, *project, name, version);
+  }
+
   manifest::DependencySpec spec;
   spec.name = name;
   spec.path = fs::absolute_normalized(ctx.cwd / *ctx.flags.get("path"));
@@ -314,8 +448,7 @@ int cmd_add(CommandContext& ctx) {
     return report_error(status.error(), ctx);
   }
   ctx.ui->info("added path dependency `" + name + "`");
-  ctx.ui->verbose("note: `cova build` compiles and links local path dependencies; remote "
-                  "dependency management is not implemented yet");
+  ctx.ui->verbose("note: `cova build` compiles and links local path dependencies");
   return 0;
 }
 
@@ -365,9 +498,8 @@ int cmd_fetch(CommandContext& ctx) {
   if (!target) {
     return report_error(target.error(), ctx);
   }
-  // Fetching a path dependency means loading its manifest and recording the
-  // resolution; no network transport exists, so remote declarations are
-  // rejected by the resolver.
+  // Resolution fetches every git source that is not already cached and pins the
+  // commits it used into cova.lock.
   auto dependencies = resolve_dependencies(ctx, *project, *target, /*apply_lock=*/true,
                                            /*include_dev=*/true);
   if (!dependencies) {
@@ -376,24 +508,82 @@ int cmd_fetch(CommandContext& ctx) {
   if (dependencies->lock_written) {
     ctx.ui->info("wrote " + display_path(dependencies->lockfile, project->layout.root));
   }
-  std::size_t remote_free = 0;
+  std::size_t downloaded = 0;
+  std::size_t cached = 0;
+  std::size_t local = 0;
   for (const auto& package : dependencies->graph.packages) {
-    if (!package.root) {
-      ++remote_free;
+    if (package.root) {
+      continue;
+    }
+    if (package.source_url) {
+      if (package.source_downloaded) {
+        ++downloaded;
+      } else {
+        ++cached;
+      }
+    } else {
+      ++local;
     }
   }
-  if (remote_free == 0) {
+  if (downloaded == 0 && cached == 0 && local == 0) {
     ctx.ui->info("no dependencies to fetch");
   } else {
-    ctx.ui->info("resolved " + std::to_string(remote_free) +
-                 " local path dependency package(s); nothing to download");
+    std::string summary;
+    if (downloaded != 0) {
+      summary = "fetched " + std::to_string(downloaded) + " git dependency package(s)";
+    }
+    if (cached != 0) {
+      if (!summary.empty()) {
+        summary += "; ";
+      }
+      summary += std::to_string(cached) + " git dependency package(s) already cached";
+    }
+    if (local != 0) {
+      if (!summary.empty()) {
+        summary += "; ";
+      }
+      summary += "resolved " + std::to_string(local) + " local path package(s)";
+    }
+    ctx.ui->info(summary);
   }
   return 0;
 }
 
 int cmd_update(CommandContext& ctx) {
-  return report_milestone_gap(ctx, "update",
-                              "a dependency resolver and a registry to resolve against");
+  auto project = load_project(ctx);
+  if (!project) {
+    return report_error(project.error(), ctx);
+  }
+  auto target = resolve_target_from(ctx, *project);
+  if (!target) {
+    return report_error(target.error(), ctx);
+  }
+  // Re-read remote refs so a branch or tag rev advances, then rewrite the lock.
+  auto dependencies = resolve_dependencies(ctx, *project, *target, /*apply_lock=*/true,
+                                           /*include_dev=*/true, /*refresh_git=*/true);
+  if (!dependencies) {
+    return report_error(dependencies.error(), ctx);
+  }
+  std::size_t remote = 0;
+  for (const auto& package : dependencies->graph.packages) {
+    if (!package.root && package.source_url) {
+      ++remote;
+    }
+  }
+  if (remote == 0) {
+    // Resolution may still have rewritten the lock (a path or feature change),
+    // so report that before saying there was nothing to advance.
+    if (dependencies->lock_written) {
+      ctx.ui->info("wrote " + display_path(dependencies->lockfile, project->layout.root));
+    }
+    ctx.ui->info("no git dependencies to update");
+    return 0;
+  }
+  ctx.ui->info("updated " + std::to_string(remote) + " git dependency package(s)");
+  if (dependencies->lock_written) {
+    ctx.ui->info("wrote " + display_path(dependencies->lockfile, project->layout.root));
+  }
+  return 0;
 }
 
 int cmd_vendor(CommandContext& ctx) {
@@ -420,7 +610,7 @@ int cmd_vendor(CommandContext& ctx) {
     return 0;
   }
   return report_milestone_gap(ctx, "vendor",
-                              "source fetching; only remote dependencies can be vendored");
+                              "copying fetched sources into the project tree");
 }
 
 int cmd_tree(CommandContext& ctx) {
@@ -441,6 +631,12 @@ int cmd_tree(CommandContext& ctx) {
       entry.set("requirement", dependency.requirement_text);
       entry.set("kind", dependency.is_local() ? "path"
                                               : (dependency.is_git() ? "git" : "registry"));
+      if (dependency.git) {
+        entry.set("git", package::git::redact_url(*dependency.git));
+        if (dependency.git_rev) {
+          entry.set("rev", *dependency.git_rev);
+        }
+      }
       entry.set("dev", dependency.dev);
       deps.push(std::move(entry));
     }
@@ -458,7 +654,11 @@ int cmd_tree(CommandContext& ctx) {
     if (dependency.is_local()) {
       source = " (path " + fs::generic_string(*dependency.path) + ")";
     } else if (dependency.is_git()) {
-      source = " (git " + *dependency.git + ")";
+      source = " (git " + package::git::redact_url(*dependency.git);
+      if (dependency.git_rev) {
+        source += "@" + *dependency.git_rev;
+      }
+      source += ")";
     } else {
       source = " (" + dependency.requirement_text + ")";
     }
@@ -475,8 +675,8 @@ int cmd_tree(CommandContext& ctx) {
 
   if (!manifest.dependencies.empty()) {
     ctx.ui->warn(
-        "`cova tree` lists declared dependencies only; local path dependencies are resolved "
-        "and built by `cova build`, remote dependency management is not implemented yet");
+        "`cova tree` lists declared dependencies only; `cova build` resolves both path and "
+        "git dependencies into the build graph");
   }
   return 0;
 }
