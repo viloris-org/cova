@@ -1059,11 +1059,20 @@ COVA_TEST_NAMED(build, depfile_parses_windows_backslash_paths) {
       "C:\\build\\obj\\main.o: C:\\src\\main.cpp C:\\src\\inc\\a.hpp\n",
       cova::fs::Path("C:/project")));
   COVA_CHECK_EQ(depfile.dependencies.size(), std::size_t{2});
-  // The dependency keeps its original form; only the base is prepended.
+  // The dependency keeps its original form. A drive-absolute path is already
+  // absolute on Windows, so the base is only joined onto a relative one.
   const std::string first = cova::fs::generic_string(depfile.dependencies.front());
   COVA_CHECK_MSG(first.find("main.cpp") != std::string::npos,
                  "the source dependency must survive escaping");
-  COVA_CHECK_MSG(first.find("project") != std::string::npos, "the base must be applied");
+  COVA_CHECK_MSG(first.find("a.hpp") == std::string::npos,
+                 "each dependency must remain a separate input");
+  auto relative = COVA_REQUIRE_OK(cova::build::Depfile::parse("o.o: src\\main.cpp\n",
+                                                              cova::fs::Path("C:/project")));
+  const std::string relative_first = cova::fs::generic_string(relative.dependencies.front());
+  COVA_CHECK_MSG(relative_first.find("project") != std::string::npos,
+                 "the base must be applied to a relative dependency");
+  COVA_CHECK_MSG(relative_first.find("main.cpp") != std::string::npos,
+                 "the relative dependency must survive escaping");
 }
 
 COVA_TEST_NAMED(build, depfile_parses_escaped_spaces_and_colons) {

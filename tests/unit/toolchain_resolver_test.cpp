@@ -397,17 +397,30 @@ COVA_TEST_NAMED(toolchain, probe_scope_skips_unrequested_capabilities) {
   if (discovered.empty()) {
     return;
   }
+  // Discovery lists every compiler on PATH, including ones that predate the
+  // C++26 baseline (a stock Ubuntu image ships g++ 13 beside an installed
+  // g++-14). Pick the first descriptor that can actually compile C++, or skip
+  // the test when the host has no such compiler at all.
   cova::toolchain::ProbeOptions options;
   options.target = cova::platform::host_triple();
   options.required = {"cpp"};
-  auto report = cova::toolchain::probe(discovered.front(), options);
-  if (!report) {
+  cova::toolchain::ProbeReport report;
+  bool found = false;
+  for (const auto& descriptor : discovered) {
+    auto candidate = cova::toolchain::probe(descriptor, options);
+    if (candidate && candidate->capabilities.cpp_compilation) {
+      report = std::move(*candidate);
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
     return;
   }
-  COVA_CHECK(report->capabilities.cpp_compilation);
+  COVA_CHECK(report.capabilities.cpp_compilation);
   // The build fast path deliberately does not pay for these probes.
-  COVA_CHECK(!report->capabilities.executable_link);
-  COVA_CHECK(!report->capabilities.static_library);
+  COVA_CHECK(!report.capabilities.executable_link);
+  COVA_CHECK(!report.capabilities.static_library);
 }
 
 COVA_TEST_MAIN()
