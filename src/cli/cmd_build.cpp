@@ -508,6 +508,20 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
     local_state = std::move(*state);
   }
 
+  // Digests recorded by the previous build stay valid while a file's metadata
+  // sample is unchanged. Seeding the memo from them turns "hash the whole
+  // closure" into one stat per file, which is the difference between a
+  // no-change build measured in milliseconds and one measured in hundreds.
+  build::FileIdentityCache identity;
+  for (const auto& record : local_state.records()) {
+    for (const auto& digest : record.input_digests) {
+      identity.remember(digest.path, digest.stamp, digest.digest);
+    }
+    for (const auto& digest : record.output_digests) {
+      identity.remember(digest.path, digest.stamp, digest.digest);
+    }
+  }
+
   auto environment = make_action_environment(prepared, ctx);
   if (!environment) {
     return report_error(environment.error(), ctx);
@@ -532,21 +546,28 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
   // execution would re-hash the whole closure for no gain.
   std::set<std::uint64_t> verified_by_state;
 
+  // Whether the shared artifact cache holds anything this build could restore.
+  // The dependency scan exists to build a cache lookup key; with nothing to look
+  // up, the compiler's own depfile proves the closure instead, which removes a
+  // whole preprocessing pass per translation unit from a cold build.
+  std::optional<bool> cache_has_entries_state;
+  auto cache_can_answer = [&]() -> bool {
+    if (!cache.enabled) {
+      return false;
+    }
+    if (!cache_has_entries_state.has_value()) {
+      cache_has_entries_state = cache_has_entries(cache);
+    }
+    return *cache_has_entries_state;
+  };
+
   auto try_cache_restore = [&](const build::Action& action) -> bool {
     // Sharing requires a hermetic environment and a complete input closure.
     if (!cache.enabled || !action.cacheable || !env.shared_cache_eligible ||
         !action.input_closure_complete || !action.input_identity_complete) {
       return false;
     }
-    // The key must be recomputed when another action in this build could have
-    // changed this action's inputs, because the executor computed every key
-    // before anything ran (a link's identity covers object files an earlier
-    // action may only just have produced). An action with no dependencies has
-    // no such producer, so the executor's up-front key is still exact and can
-    // be reused instead of hashing the whole closure a second time.
-    const std::string key = action.dependencies.empty() && !action.computed_key.empty()
-                                ? action.computed_key
-                                : action.cache_key(env);
+    const std::string key = action.cache_key(env, &identity);
     if (!action.input_identity_complete) {
       return false;
     }
@@ -558,35 +579,33 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
     return false;
   };
   auto is_up_to_date = [&](const build::Action& action, std::string& reason) -> bool {
-    // 1. The shared cache can restore every output without running anything.
-    //    A dry run must not write artifacts, so it consults the incremental
-    //    record only and reports a cache-only hit as stale.
-    if (!dry_run && try_cache_restore(action)) {
-      reason = "restored from cache";
-      return true;
-    }
-    // 2. The local incremental record says the outputs are current. An
-    //    untracked environment or an incomplete input identity may not be
-    //    reused across executions at all.
     if (!action.input_identity_complete) {
       reason = "the input identity is incomplete";
       return false;
     }
-    if (env.incremental_eligible && local_state.is_up_to_date(action, reason)) {
+    // 1. The local incremental record. A matching plan identity plus unchanged
+    //    metadata proves every recorded input and output; nothing else is read.
+    //    The shared cache is consulted only afterwards: restoring an action the
+    //    record already proved current would copy the files it just verified.
+    if (env.incremental_eligible &&
+        local_state.is_up_to_date(action, reason, &identity)) {
       verified_by_state.insert(action.id.value);
       return true;
     }
-    if (env.incremental_eligible && local_state.inputs_match(action)) {
-      // The recorded closure is still exact; only the output is missing or
-      // stale. Reuse the recorded closure instead of paying for a scan.
-      reason = "inputs match the previous record; rebuilding the output";
+    if (dry_run) {
       return false;
     }
-    // 3. Both checks missed. Before running the action, ask the provider for
-    //    the real input closure, so a stale depfile or a newly included header
-    //    cannot be missed. The refreshed inputs produce the final identity.
-    if (action.kind == build::ActionKind::Compile && !dry_run &&
-        !action.input_closure_checked) {
+    // 2. The shared cache, when the closure is known well enough to key it.
+    if (action.input_closure_complete && try_cache_restore(action)) {
+      reason = "restored from cache";
+      return true;
+    }
+    // 3. No closure evidence (a cold tree, or a deleted depfile). A scan is only
+    //    worth its compiler pass when a cache entry could actually be found;
+    //    otherwise the compile itself writes the depfile that proves the
+    //    closure, and its content becomes the recorded identity.
+    if (action.kind == build::ActionKind::Compile && !action.input_closure_checked &&
+        !action.input_closure_complete && cache_can_answer()) {
       const auto scan_started = Clock::now();
       std::string detail;
       auto refreshed = refresh_compile_closure(action, env, detail);
@@ -607,7 +626,8 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
           reason = "restored from cache after dependency discovery";
           return true;
         }
-        if (env.incremental_eligible && local_state.is_up_to_date(action, reason)) {
+        if (env.incremental_eligible &&
+            local_state.is_up_to_date(action, reason, &identity)) {
           verified_by_state.insert(action.id.value);
           return true;
         }
@@ -620,7 +640,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
   };
 
   if (dry_run) {
-    build::Executor executor(prepared.plan.graph, env, options, is_up_to_date);
+    build::Executor executor(prepared.plan.graph, env, options, is_up_to_date, &identity);
     auto result = executor.dry_run();
     if (!result) {
       return report_error(result.error(), ctx);
@@ -664,18 +684,18 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
     }
   };
 
-  // A fresh build has no state and no cache entries, so every compile action
-  // needs a scan. Run those scans in parallel before the executor serializes
-  // its up-to-date checks. When state or cache evidence exists, the executor's
-  // normal miss path handles the (usually few) scans.
-  if (!dry_run && local_state.size() == 0 && !cache_has_entries(cache)) {
+  // A cold tree with a warm artifact cache needs every closure before the
+  // executor can ask the cache anything, and those scans are process-bound. Run
+  // them concurrently up front. A cold tree with nothing cached never scans: the
+  // compiles write their own depfiles, which prove the closure just as well.
+  if (!dry_run && local_state.size() == 0 && cache_can_answer()) {
     run_cold_dependency_scans(prepared.plan.graph, env, options.max_parallel, ctx);
   }
 
   // The executor snapshots its options, so the callbacks must be installed
   // before it is constructed.
   const auto execution_started = Clock::now();
-  build::Executor executor(prepared.plan.graph, env, options, is_up_to_date);
+  build::Executor executor(prepared.plan.graph, env, options, is_up_to_date, &identity);
   auto result = executor.run();
   if (ctx.global.verbose) {
     ctx.ui->verbose("build execution: " + elapsed_ms(execution_started) + "ms");
@@ -693,6 +713,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
   // the headers discovered through their depfile, so both the incremental
   // record and the cache entry cover the real input closure.
   std::vector<std::pair<build::Action, std::string>> publications;
+  bool state_dirty = false;
   for (const auto& outcome : result->outcomes) {
     if (!outcome.succeeded) {
       continue;
@@ -724,13 +745,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
       continue;
     }
     bool closure_verified = true;
-    std::string stability_detail;
-    if (!action->inputs_stable(&stability_detail)) {
-      closure_verified = false;
-      if (ctx.global.verbose) {
-        ctx.ui->verbose(action->label + ": " + stability_detail);
-      }
-    }
+    const std::int64_t action_started_ns = outcome.start_ns;
     build::ActionRecord record;
     // A compile's declared closure and its parsed depfile overlap almost
     // entirely, and the old linear scan over `record.input_hashes` made this
@@ -741,25 +756,34 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
       if (!recorded_inputs.insert(path).second) {
         return;
       }
+      fs::FileStamp stamp;
+      const std::string digest = identity.digest(input, &stamp);
+      // A file written while the action was running may have been read as two
+      // different versions; the artifact cannot be reused in that case. This is
+      // cheaper and stricter than re-hashing the closure after the fact.
+      if (action_started_ns > 0 && stamp.exists && stamp.mtime_ns > action_started_ns) {
+        closure_verified = false;
+      }
       record.input_paths.push_back(path);
-      auto digest = build::FileHasher{}.hash_file(input);
-      if (digest) {
-        record.input_hashes.emplace_back(path, cova::to_hex(*digest));
+      if (digest != "missing") {
+        record.input_hashes.emplace_back(path, digest);
+        record.input_digests.push_back(build::StampedDigest{path, digest, stamp});
       }
     };
     for (const auto& output : action->outputs) {
       const std::string path = fs::generic_string(output.path);
+      fs::FileStamp stamp;
+      const std::string digest = identity.digest(output.path, &stamp);
       record.output_paths.push_back(path);
-      auto digest = build::FileHasher{}.hash_file(output.path);
-      if (digest) {
-        record.output_hashes.emplace_back(path, cova::to_hex(*digest));
+      if (digest != "missing") {
+        record.output_hashes.emplace_back(path, digest);
+        record.output_digests.push_back(build::StampedDigest{path, digest, stamp});
       }
     }
     for (const auto& input : action->inputs) {
       add_input(input.path);
     }
-    if (action->kind == build::ActionKind::Compile && !action->outputs.empty() &&
-        !outcome.skipped) {
+    if (action->kind == build::ActionKind::Compile && !action->outputs.empty()) {
       fs::Path depfile = action->outputs.front().path;
       depfile += ".d";
       auto parsed = build::Depfile::load(depfile, prepared.project.layout.root);
@@ -777,15 +801,23 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
           continue;
         }
         add_input(header);
-        const bool already_an_input =
-            key_inputs.contains(fs::generic_string(fs::canonical_for_compare(header)));
-        if (!already_an_input) {
-          // A header the pre-execution scan did not see means the closure is
-          // not proven for this execution. The output may satisfy the user,
-          // but it must not become a reusable cache or incremental record.
-          closure_verified = false;
-          key_action.inputs.push_back(
-              build::FileInput{header, "header", build::InputOrigin::Observed});
+        const std::string canonical = fs::generic_string(fs::canonical_for_compare(header));
+        if (!key_inputs.contains(canonical)) {
+          if (action->input_closure_checked) {
+            // A scan was the authority for this execution and it did not see
+            // this header: the closure is not proven, so the artifact may
+            // satisfy the user but must not become reusable.
+            closure_verified = false;
+            key_action.inputs.push_back(
+                build::FileInput{header, "header", build::InputOrigin::Observed});
+          } else {
+            // No scan ran: the depfile written by this very execution is the
+            // authority for what the compiler read. Its content is recorded, so
+            // the next build plans the same closure from the canonical depfile.
+            key_action.inputs.push_back(
+                build::FileInput{header, "header", build::InputOrigin::Discovered});
+            key_inputs.insert(canonical);
+          }
         }
       }
       key_action.input_closure_complete = closure_verified;
@@ -796,7 +828,8 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
       }
       continue;
     }
-    record.cache_key = key_action.cache_key(env);
+    record.plan_key = key_action.plan_key(env, &identity);
+    record.cache_key = key_action.cache_key(env, &identity);
     if (!key_action.input_identity_complete) {
       if (ctx.global.verbose) {
         ctx.ui->verbose(action->label +
@@ -811,6 +844,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
             .count());
     record.duration_ms = static_cast<std::uint32_t>(outcome.duration.count());
     record.succeeded = true;
+    state_dirty = true;
     if (!outcome.skipped && env.shared_cache_eligible && action->cacheable &&
         key_action.input_closure_complete && key_action.input_identity_complete) {
       publications.emplace_back(std::move(key_action), record.cache_key);
@@ -841,6 +875,7 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
   // artifact-level verification passed. A failed or partial build leaves no
   // cache entry and no incremental record that a later build could trust.
   for (auto& [action, key] : publications) {
+    (void)0;
     auto stored = build::cache_store(cache, action, key);
     if (!stored) {
       if (stored.error().code == "cova::build::cache_nondeterminism") {
@@ -852,7 +887,8 @@ int execute_build(CommandContext& ctx, PreparedBuild& prepared, bool dry_run,
       }
     }
   }
-  if (local_state.size() > 0) {
+  state_dirty = state_dirty || identity.refreshed() > 0;
+  if (state_dirty && local_state.size() > 0) {
     auto save = local_state.save(state_file);
     if (!save) {
       ctx.ui->verbose("could not persist build state: " + save.error().message);

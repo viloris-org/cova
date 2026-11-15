@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "build/cache/cache.hpp"
 #include "build/scheduler/scheduler.hpp"
 #include "core/filesystem/filesystem.hpp"
 #include "core/process/process.hpp"
@@ -41,15 +42,21 @@ int parallelism(int requested) {
 }  // namespace
 
 Executor::Executor(const BuildGraph& graph, ActionEnvironment environment,
-                   ExecuteOptions options, UpToDateCheck up_to_date_check)
+                   ExecuteOptions options, UpToDateCheck up_to_date_check,
+                   FileIdentityCache* identity)
     : graph_(graph),
       environment_(std::move(environment)),
       options_(std::move(options)),
-      up_to_date_check_(std::move(up_to_date_check)) {}
+      up_to_date_check_(std::move(up_to_date_check)),
+      identity_(identity) {}
 
 ActionOutcome Executor::run_action(const Action& action) {
   ActionOutcome outcome;
   outcome.id = action.id;
+  outcome.start_ns = static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
   const auto started = std::chrono::steady_clock::now();
 
   if (action.argv.empty()) {
@@ -151,7 +158,7 @@ Result<BuildResult> Executor::dry_run() {
   BuildResult result;
   auto ordered = graph_.actions_in_order();
   for (const auto* action : ordered) {
-    action->cache_key(environment_);
+    action->plan_key(environment_, identity_);
     ActionOutcome outcome;
     outcome.id = action->id;
     std::string reason;
@@ -172,10 +179,11 @@ Result<BuildResult> Executor::dry_run() {
 Result<BuildResult> Executor::run() {
   BuildResult result;
   auto ordered = graph_.actions_in_order();
-  // Compute cache keys once; the incremental predicate and the recorder both use
-  // the same value.
+  // Compute the closure-free plan identity once. The content identity over the
+  // discovered header closure is only needed for a shared-cache lookup or for
+  // recording an executed action, so a no-change build never pays for it.
   for (const auto* action : ordered) {
-    action->cache_key(environment_);
+    action->plan_key(environment_, identity_);
   }
 
   // Dispatch straight from the dependency scheduler instead of walking the

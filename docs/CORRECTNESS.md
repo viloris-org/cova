@@ -145,23 +145,38 @@ Tests: `toolchain.probe_cache_is_versioned_and_rejects_mismatch`.
 Inputs distinguish three origins:
 
 * **DeclaredInputs** — named by the planner (source, object, library).
-* **DiscoveredInputs** — returned by the provider's dependency scan.
-* **ObservedInputs** — seen in the post-execution depfile but not in the scan.
+* **DiscoveredInputs** — read from the compiler's depfile (planned from the
+  canonical `.d` of an earlier build, or learned from this execution's depfile).
+* **ObservedInputs** — seen in a post-execution depfile although the pre-execution
+  scan for this execution did not list them.
 
-Before a compile action is executed after a cache/state miss, Cova runs the
-provider's dependency scan (`-MM` with the same effective flags and
-environment). The scan replaces previously discovered headers (so another
-target's or another include path's headers cannot accumulate), sets
-`input_closure_complete`, writes the canonical `.d` file and recomputes the
-final action identity. A cache/state check is then retried with that identity;
-a cache entry produced by a different closure is not used.
+The compiler's own depfile (`-MMD -MF`) is the authority for what a translation
+unit read. The planner seeds each compile action's closure from the canonical
+`.d` file beside its object, so a warm tree knows the closure without asking the
+compiler anything. A truly cold tree has no `.d` file, and Cova does not run a
+separate preprocessing pass just to manufacture one: the compile writes it, and
+the success path reads it back.
+
+Cova still runs an explicit dependency scan (`-MM` with the same effective flags
+and environment) in exactly one situation: the closure is unknown **and** the
+shared artifact cache may hold an entry for the action. The scan exists to build
+the cache lookup key, not to prove the closure for its own sake; with nothing
+cached it cannot change the outcome, so it is skipped. When it runs, it replaces
+previously discovered headers (so another target's or another include path's
+headers cannot accumulate), sets `input_closure_complete`, writes the canonical
+`.d` file and recomputes the action identity, and a cache/state check is retried
+with that identity. A cache entry produced by a different closure is not used.
 
 After execution:
 
-* every declared input is re-hashed (`Action::inputs_stable`); a change between
-  discovery and execution discards the result,
-* every post-execution depfile input must already be in the scanned closure; an
-  `ObservedInput` makes the closure unverified,
+* every input recorded for the action must have a modification time earlier than
+  the action's start (`ActionOutcome::start_ns`); a file written while the action
+  was running may have been read as two different versions, so the result is
+  discarded instead of published,
+* when a scan ran, every post-execution depfile input must already be in the
+  scanned closure; an extra `ObservedInput` makes the closure unverified,
+* when no scan ran, the depfile written by *this* execution is the closure
+  authority: its extra inputs are recorded as `DiscoveredInputs`,
 * unverified closures are neither recorded in `state.toml` nor published to the
   artifact cache.
 
@@ -172,23 +187,48 @@ is complete evidence (its listing is empty) and a later appearance changes the
 key. An enumeration error (unreadable directory, I/O failure) is **not**
 treated as a partial listing: the identity is marked incomplete, the action may
 run, but no cache or incremental record is reused or published. A missing or
-corrupt depfile causes a fresh scan; it cannot cause a false hit. Actions with an
-unproven closure may run, but they are not marked hermetic and cannot enter
-shared caches.
+corrupt depfile cannot cause a false hit: it lowers the action to "closure
+unknown" and the rules above apply.
 
-A dependency scan is only paid when the closure is genuinely unknown. A hot
-build is answered by the recorded identity and state. If the recorded identity
-and all input hashes still match but only an output is missing, the previous
-closure is reused without a scan (`BuildState::inputs_match`). A change to one
-translation unit scans only that unit. A cold build has no previous closure and
-therefore scans every compile action before its first execution; that is the
-price of proving the closure before publishing, and it is the main remaining
-performance cost. The verbose log reports each `dependency scan:` so the cost is
-visible.
+A restored cache entry carries the depfile that produced it, so `cova clean`
+followed by a cache restore leaves a tree that is indistinguishable from a
+compiled one: the next build reads the restored `.d` files, verifies the recorded
+inputs and reports the action up to date instead of rescanning. The verbose log
+reports each `dependency scan:` so the remaining cost is visible.
 
-Remaining limitation: there is no persistent scan-result cache and inputs are
-not snapshotted; the post-execution hash re-check is a detection mechanism, not
-a filesystem transaction.
+### 5.1 Staleness without re-reading the world
+
+The recorded identity is a content identity: every input contributes its
+SHA-256. Re-reading every header on every build is what made a no-change build
+cost hundreds of milliseconds, so the incremental check uses a metadata sample
+(`fs::FileStamp`: inode, size, nanosecond mtime) as a *validity stamp* for a
+digest that has already been computed:
+
+* the state file persists, per input and output, the digest and the stamp it
+  belongs to;
+* `FileIdentityCache` seeds those digests at the start of a build and answers a
+  lookup with one `stat` while the stamp is unchanged;
+* a moved stamp forces a real read and a real hash. If the bytes are unchanged
+  the digest - and therefore the key - is unchanged, so the action is still up
+  to date; the refreshed stamp is persisted. Ninja would have rebuilt here.
+
+So a no-change build is one `stat` per recorded file plus one plan-key pass, and
+a change that does not alter bytes (a `touch`) does not cause a rebuild. A
+content change, including one that keeps the file size, moves the mtime and is
+detected.
+
+The local record is matched by the **plan key**: the action identity over argv,
+declared inputs, include-directory listings, output paths, toolchain, sysroot,
+target and environment, deliberately excluding the discovered header closure.
+That makes the warm check independent of the depfile's exact contents (it
+verifies the recorded closure instead) and lets a record survive a regenerated
+`.d` file. The full identity - the one that includes the closure - is computed
+only when a shared-cache lookup or a record publication actually needs it.
+
+Remaining limitation: there is no persistent scan-result cache and inputs are not
+snapshotted; the freshness check is a detection mechanism, not a filesystem
+transaction, and a rewrite that restores both size and mtime is not detected
+(the same assumption every mtime-based build system makes).
 
 ## 6. Execution and artifact publication (FR-14 baseline)
 
@@ -221,48 +261,54 @@ reports a cache-only hit as stale. `cova build` reports "restored from cache" se
 
 ## 7. Performance work
 
-Build performance was measured on a synthetic 41-translation-unit project on
-the development host. The numbers are indicative, not a portable benchmark, but
-they show where the time went and what changed:
+Build performance is measured by `scripts/bench.py` against CMake + Ninja on the
+same sources, compiler and flags; [BENCHMARKING.md](BENCHMARKING.md) explains the
+method and [bench/cova-vs-cmake.md](bench/cova-vs-cmake.md) holds the latest
+numbers. What that harness exposed, and what this pass changed:
 
-| Scenario | Before this pass | After |
-|---|---|---|
-| Cold build (fresh `COVA_HOME`, 41 TUs) | 6.3 s | 1.3 s |
-| No-change incremental build | 1.9 s | 0.6 s |
-| Single-file incremental build | 2.0 s | 0.7 s |
-| Toolchain discovery (`cova toolchain list`) | 1.35 s | 0.23 s |
-
-The changes:
-
-* **Hard-link alias grouping.** Distribution aliases (`g++`, `c++`,
-  `x86_64-pc-linux-gnu-g++`) are usually hard links to one binary. Discovery
-  groups them by file identity, describes one representative per group with the
-  version/resource-dir/sysroot queries, and materializes the alias descriptors
-  by replacing only the driver path and id.
-* **Parallel discovery and subprogram enrichment.** Representative compiler
-  descriptions and the selected toolchain's `cc1`/`cc1plus`/assembler/... queries
-  run concurrently; results are consumed in deterministic order.
-* **Scoped probes.** A normal build asks only for C++ compilation, linking and
-  ABI facts. The full capability matrix (C, preprocessing, archives, C++26,
-  shared libraries, LTO, sanitizers, coverage, threads) is requested by
-  `cova doctor` and `cova explain`. Probe cache keys include the requested
-  scope, so the two reports never masquerade as each other.
-* **Parallel cold dependency scans.** When there is no incremental state and no
-  artifact-cache entry, there is nothing to reuse; the compile actions' closure
-  scans run concurrently before the executor. `Action::input_closure_checked`
-  prevents the executor from scanning the same action again.
-* **No duplicate executor scan.** Warm builds and evidence-backed rebuilds use
-  the recorded closure; the `BuildState::inputs_match` fast path avoids a scan
-  when only an output is missing.
+* **A 20 ms poll tail on every child process.** `proc::run` kept polling for a
+  constant slice after both pipes had closed and only reaped the child on a
+  timeout, so every compiler probe paid ~20 ms for nothing. It now waits for the
+  child as soon as no descriptor is left. This alone removed ~400 ms of CPU from
+  a warm build (21 compiler queries) and ~20 ms from every compilation.
+* **Staleness by metadata sample instead of by re-hashing.** `FileIdentityCache`
+  keeps the digests the state file already recorded and validates them with one
+  `stat` per file (see §5.1). A no-change build used to hash the whole closure two
+  or three times - once to build action keys, once to validate the record, once to
+  rewrite the record - and now reads nothing.
+* **The incremental record answers first, the cache second.** The previous order
+  restored every unchanged action from the shared cache, which copied files that
+  were already correct and hashed them again. The record's own proof is cheaper
+  and equally strong, so the cache is consulted only after it fails.
+* **A plan key for the warm path.** The closure-free identity (§5.1) is computed
+  for every action up front; the full content identity is computed only for an
+  action that needs a cache lookup or a new record. A no-build-change run no
+  longer hashes anything to decide it has nothing to do.
+* **The dependency scan is only run when a cache lookup needs it** (§5). This
+  removed one preprocessing pass per translation unit from every cold build: the
+  compile writes the depfile, and the success path records the closure.
+* **Restores carry their depfile**, so a cache-restored tree stops rescanning and
+  starts reporting "up to date" like a compiled one.
+* **Cached compiler queries and component digests.** `--version`,
+  `-print-resource-dir`, `--print-sysroot` and the subprogram queries are pure
+  functions of the driver binary; their answers are cached beside the probe cache
+  and keyed by the driver's metadata sample, so a warm build resolves a toolchain
+  without starting a process. Component hashes (driver, linker, archiver,
+  `cc1plus`, ...) are cached the same way.
+* **A discovery hint.** Scanning `/usr/bin` on every build to find compilers that
+  have not moved is pure latency. The driver list (one representative per
+  hard-link group) is persisted and validated by the roots' modification times
+  and each driver's metadata, so installing, replacing or removing a compiler
+  invalidates it.
+* **State persistence is conditional.** A build that changed nothing does not
+  rewrite `state.toml`, and `compile_commands.json` is left alone when its
+  content is unchanged.
 * **Observability.** `--verbose` reports project load, dependency resolution,
   toolchain resolution, planning, build execution, and each dependency scan's
   duration, so future bottlenecks are measurable without a profiler.
 
-A cold build still contains one preprocessing pass per compile action and the
-compiler's own compile pass. Removing that duplication would require a
-filesystem snapshot or a compiler integration that exposes the dependency
-closure during compilation; Cova deliberately keeps the pre-execution scan for
-cache correctness.
+The remaining structural cost is what the compiler itself does: a cold build is
+one process per translation unit, exactly like Ninja.
 
 ## 8. Caching qualification summary
 

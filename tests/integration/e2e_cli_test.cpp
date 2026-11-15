@@ -555,7 +555,7 @@ COVA_TEST_NAMED(integration, response_files_follow_compiler_nested_resolution) {
   COVA_CHECK_MSG(contains(used.combined(), "rsp=4"), used.combined());
 }
 
-COVA_TEST_NAMED(integration, dependency_scans_run_only_when_the_closure_is_unknown) {
+COVA_TEST_NAMED(integration, dependency_scans_run_only_when_a_cache_lookup_needs_them) {
   COVA_SKIP_UNLESS_CXX_DRIVER();
   cova::test::TempDir temp;
   cova::test::ScopedEnv home("COVA_HOME", temp.sub("covahome"));
@@ -567,18 +567,36 @@ COVA_TEST_NAMED(integration, dependency_scans_run_only_when_the_closure_is_unkno
   write_text(root / "src" / "extra.cpp", "int extra_value() { return 1; }\n");
   ScopedCwd cwd(root);
 
+  // Nothing cached, no recorded closure: the compiler's own depfile proves the
+  // closure, so a cold build pays no extra preprocessing pass.
   auto cold = run_cli({"build", "--verbose"});
   COVA_CHECK_MSG(cold.ok(), cold.combined());
-  COVA_CHECK_EQ(count_occurrences(cold.combined(), "dependency scan:"), std::size_t{2});
+  COVA_CHECK_EQ(count_occurrences(cold.combined(), "dependency scan:"), std::size_t{0});
 
   auto hot = run_cli({"build", "--verbose"});
   COVA_CHECK_MSG(hot.ok(), hot.combined());
   COVA_CHECK_EQ(count_occurrences(hot.combined(), "dependency scan:"), std::size_t{0});
 
+  // A changed source still has a recorded closure, so it does not scan either.
   write_text(root / "src" / "extra.cpp", "int extra_value() { return 2; }\n");
   auto changed = run_cli({"build", "--verbose"});
   COVA_CHECK_MSG(changed.ok(), changed.combined());
-  COVA_CHECK_EQ(count_occurrences(changed.combined(), "dependency scan:"), std::size_t{1});
+  COVA_CHECK_EQ(count_occurrences(changed.combined(), "dependency scan:"), std::size_t{0});
+
+  // Deleting the target directory removes both the state and the depfiles. The
+  // artifact cache can still answer, but only if the closure is known, so this
+  // is the one build that scans.
+  COVA_CHECK_MSG(run_cli({"clean"}).ok(), "clean failed");
+  auto restored = run_cli({"build", "--verbose"});
+  COVA_CHECK_MSG(restored.ok(), restored.combined());
+  COVA_CHECK_EQ(count_occurrences(restored.combined(), "dependency scan:"), std::size_t{2});
+  COVA_CHECK_MSG(contains(restored.combined(), "from cache"), restored.combined());
+
+  // The restore also writes the depfiles back, so the next build is warm.
+  auto warm = run_cli({"build", "--verbose"});
+  COVA_CHECK_MSG(warm.ok(), warm.combined());
+  COVA_CHECK_EQ(count_occurrences(warm.combined(), "dependency scan:"), std::size_t{0});
+  COVA_CHECK_MSG(contains(warm.combined(), "up to date"), warm.combined());
 }
 
 COVA_TEST_NAMED(integration, dry_run_does_not_restore_cache_outputs) {

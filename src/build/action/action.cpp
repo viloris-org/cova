@@ -24,7 +24,19 @@ struct ResponseContext {
   std::set<std::string> active;
   int depth = 0;
   bool identity_complete = true;
+  FileIdentityCache* identity = nullptr;
 };
+
+// Content digest of a file as lowercase hex, or "missing". The per-build memo
+// answers from a previously verified digest while the file's metadata sample is
+// unchanged, so the identity is still a content identity.
+std::string file_digest(FileIdentityCache* identity, const Path& path) {
+  if (identity != nullptr) {
+    return identity->digest(path);
+  }
+  auto digest = Sha256::hex_of_file(path);
+  return digest ? *digest : std::string("missing");
+}
 
 Path resolve_relative(Path path, const Path& working_dir) {
   if (path.is_relative() && !working_dir.empty()) {
@@ -41,15 +53,11 @@ void add_auxiliary_file_identity(ResponseContext& context, const Path& file,
   const Path resolved = resolve_relative(file, context.working_dir);
   context.fingerprint.add(role);
   context.fingerprint.add(fs::generic_string(resolved));
-  auto digest = Sha256::hex_of_file(resolved);
-  if (digest) {
-    context.fingerprint.add(*digest);
-  } else {
-    context.fingerprint.add("missing");
-    if (fs::is_regular_file(resolved)) {
-      // The file exists but cannot be read: the identity is not proven.
-      context.identity_complete = false;
-    }
+  const std::string digest = file_digest(context.identity, resolved);
+  context.fingerprint.add(digest);
+  if (digest == "missing" && fs::is_regular_file(resolved)) {
+    // The file exists but cannot be read: the identity is not proven.
+    context.identity_complete = false;
   }
 }
 
@@ -215,96 +223,36 @@ void add_argument_identity(ResponseContext& context, const std::string& argument
   }
 }
 
-std::string directory_entry_kind(const stdfs::directory_entry& entry) {
-  std::error_code ec;
-  const auto status = entry.symlink_status(ec);
-  if (ec) {
-    return "?";
-  }
-  if (stdfs::is_symlink(status)) {
-    return "l";
-  }
-  if (stdfs::is_directory(status)) {
-    return "d";
-  }
-  if (stdfs::is_regular_file(status)) {
-    return "f";
-  }
-  return "?";
-}
-
 // Adding, removing or renaming an entry in an include directory changes which
-// header a `#include <name>` resolves to. Hashing the directory listing makes
-// that change visible even before the depfile is regenerated.
-bool add_directory_identity(Fingerprint& fingerprint, std::string_view text,
-                            std::set<std::string>& seen) {
+// header a `#include <name>` resolves to. The listing is part of the identity so
+// that change is visible even before the depfile is regenerated. The per-build
+// memo computes it once per directory instead of once per compile action.
+bool add_directory_identity(FileIdentityCache* identity, Fingerprint& fingerprint,
+                            std::string_view text, std::set<std::string>& seen) {
   const Path directory(text);
   const std::string key = fs::generic_string(directory);
   if (!seen.insert(key).second) {
     return true;
   }
   fingerprint.add(key);
-  std::error_code ec;
-  const bool is_directory = stdfs::is_directory(directory, ec);
-  if (ec) {
-    // The directory status could not be established (for example a permission
-    // error on a parent). This is not equivalent to a missing directory.
-    fingerprint.add("directory-check-incomplete");
-    return false;
+  if (identity == nullptr) {
+    FileIdentityCache local;
+    bool complete = true;
+    const auto& entries = local.listing(directory, complete);
+    fingerprint.add("directory-listing");
+    for (const auto& entry : entries) {
+      fingerprint.add(entry);
+    }
+    return complete;
   }
-  if (!is_directory) {
-    // A missing include directory is complete evidence: its listing is empty.
-    // If the directory appears later, the key changes.
-    fingerprint.add("directory-missing");
-    return true;
-  }
-  std::vector<std::string> entries;
   bool complete = true;
-  stdfs::directory_iterator it(directory, ec);
-  if (ec) {
-    complete = false;
-  }
-  const stdfs::directory_iterator end;
-  while (!ec && it != end) {
-    const std::string name = it->path().filename().string();
-    const std::string kind = directory_entry_kind(*it);
-    if (kind == "?") {
-      // An entry whose type cannot be established makes the listing partial.
-      complete = false;
-    }
-    std::string line = name;
-    line.push_back('\t');
-    line += kind;
-    std::error_code link_error;
-    if (stdfs::is_symlink(it->path(), link_error)) {
-      if (link_error) {
-        complete = false;
-      }
-      std::error_code target_error;
-      const Path target = stdfs::read_symlink(it->path(), target_error);
-      line += "\t->";
-      line += target_error ? std::string("<unreadable>") : fs::generic_string(target);
-      if (target_error) {
-        complete = false;
-      }
-    }
-    entries.push_back(std::move(line));
-    it.increment(ec);
-  }
-  if (ec) {
-    // A partial listing is not a proof of the input closure. Keep the entries
-    // for diagnostics, but mark the identity incomplete so nothing is reused.
-    complete = false;
-    fingerprint.add("directory-enumeration-incomplete");
-  }
-  std::sort(entries.begin(), entries.end());
+  const auto& entries = identity->listing(directory, complete);
   fingerprint.add("directory-listing");
   for (const auto& entry : entries) {
     fingerprint.add(entry);
   }
   return complete;
 }
-
 
 std::vector<std::string> include_directories(const Action& action,
                                              const ActionEnvironment& environment) {
@@ -404,17 +352,24 @@ std::string_view to_string(InputOrigin origin) {
   return "declared";
 }
 
-std::string Action::cache_key(const ActionEnvironment& env) const {
+std::string Action::cache_key(const ActionEnvironment& env, FileIdentityCache* identity,
+                              bool declared_only) const {
   cova::Fingerprint fingerprint;
   fingerprint.add(kActionIdentitySchemaVersion);
   fingerprint.add(std::string(to_string(kind)));
   fingerprint.add(std::string(to_string(exec_platform)));
-  fingerprint.add(input_closure_complete ? "input-closure=complete" : "input-closure=incomplete");
+  if (!declared_only) {
+    // Whether the input closure is proven says nothing about the build step
+    // itself, so the plan key excludes it: the same compile must keep the same
+    // plan key whether or not a depfile from an earlier build is present.
+    fingerprint.add(input_closure_complete ? "input-closure=complete"
+                                           : "input-closure=incomplete");
+  }
   fingerprint.add(std::string(to_string(env.isolation)));
   fingerprint.add(env.explicit_environment ? "environment=explicit" : "environment=inherited");
 
   input_identity_complete = true;
-  ResponseContext response_context{fingerprint, working_dir, {}, 0, true};
+  ResponseContext response_context{fingerprint, working_dir, {}, 0, true, identity};
   for (std::size_t index = 0; index < argv.size(); ++index) {
     add_argument_identity(response_context, argv[index]);
     if ((argv[index] == "-T" || argv[index] == "-specs" || argv[index] == "--specs") &&
@@ -442,9 +397,8 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
   if (!argv.empty()) {
     const Path program(argv.front());
     if (!program.empty() && (program.has_parent_path() || program.is_absolute())) {
-      auto digest = Sha256::hex_of_file(program);
       fingerprint.add("executable");
-      fingerprint.add(digest ? *digest : std::string("missing"));
+      fingerprint.add(file_digest(identity, program));
     }
   }
   fingerprint.add(fs::generic_string(working_dir));
@@ -469,9 +423,10 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
     }
   }
 
-  FileHasher hasher;
-  computed_input_hashes.clear();
   for (const auto& input : inputs) {
+    if (declared_only && input.origin != InputOrigin::Declared) {
+      continue;
+    }
     const std::string path = fs::generic_string(input.path);
     fingerprint.add(path);
     fingerprint.add(input.role);
@@ -481,15 +436,7 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
       fingerprint.add("symlink");
       fingerprint.add(fs::generic_string(stdfs::read_symlink(input.path, link_error)));
     }
-    auto digest = hasher.hash_file(input.path);
-    if (digest) {
-      const std::string hex = cova::to_hex(*digest);
-      fingerprint.add(hex);
-      computed_input_hashes.emplace_back(path, hex);
-    } else {
-      fingerprint.add("missing");
-      computed_input_hashes.emplace_back(path, "missing");
-    }
+    fingerprint.add(file_digest(identity, input.path));
   }
   // Output paths matter: two actions with identical inputs but different
   // destinations are not interchangeable.
@@ -501,7 +448,7 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
   if (kind == ActionKind::Compile) {
     std::set<std::string> seen;
     for (const auto& directory : include_directories(*this, env)) {
-      if (!add_directory_identity(fingerprint, directory, seen)) {
+      if (!add_directory_identity(identity, fingerprint, directory, seen)) {
         input_identity_complete = false;
       }
     }
@@ -509,29 +456,16 @@ std::string Action::cache_key(const ActionEnvironment& env) const {
   fingerprint.add(input_identity_complete ? "identity=complete" : "identity=incomplete");
 
   std::string key = fingerprint.finish_hex();
-  computed_key = key;
+  if (!declared_only) {
+    computed_key = key;
+  } else {
+    computed_plan_key = key;
+  }
   return key;
 }
 
-bool Action::inputs_stable(std::string* detail) const {
-  if (!input_identity_complete) {
-    if (detail != nullptr) {
-      *detail = "the input identity is incomplete";
-    }
-    return false;
-  }
-  FileHasher hasher;
-  for (const auto& [path, expected] : computed_input_hashes) {
-    auto digest = hasher.hash_file(Path(path));
-    const std::string actual = digest ? cova::to_hex(*digest) : std::string("missing");
-    if (actual != expected) {
-      if (detail != nullptr) {
-        *detail = "input changed after discovery: " + path;
-      }
-      return false;
-    }
-  }
-  return true;
+std::string Action::plan_key(const ActionEnvironment& env, FileIdentityCache* identity) const {
+  return cache_key(env, identity, /*declared_only=*/true);
 }
 
 std::string Action::label_with_output() const {

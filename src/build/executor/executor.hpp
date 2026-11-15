@@ -2,6 +2,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -21,6 +22,10 @@ struct ActionOutcome {
   std::string failure_message;
   int exit_code = 0;
   std::chrono::milliseconds duration{0};
+  // Wall-clock start of the action, in nanoseconds since the Unix epoch. Inputs
+  // whose modification time is later than this may have been rewritten while
+  // the action was running, so the artifact must not be reused.
+  std::int64_t start_ns = 0;
   // ExecutionSucceeded, then each output exists (ArtifactValidated), then the
   // environment and input closure permit sharing (ShareEligible). Committed is
   // set by the caller that publishes the artifact cache entry.
@@ -60,13 +65,15 @@ class Executor {
   using UpToDateCheck = std::function<bool(const Action&, std::string&)>;
 
   Executor(const BuildGraph& graph, ActionEnvironment environment,
-           ExecuteOptions options, UpToDateCheck up_to_date_check);
+           ExecuteOptions options, UpToDateCheck up_to_date_check,
+           FileIdentityCache* identity = nullptr);
 
   // Executes ready actions, respecting dependencies and the parallelism limit.
   Result<BuildResult> run();
 
-  // Plans and reports without executing anything. Populates `computed_key` on
-  // every action so the caller can ask the incremental state the same question.
+  // Plans and reports without executing anything. Populates the plan identity
+  // on every action so the caller can ask the incremental state the same
+  // question.
   Result<BuildResult> dry_run();
 
  private:
@@ -77,6 +84,7 @@ class Executor {
   ActionEnvironment environment_;
   ExecuteOptions options_;
   UpToDateCheck up_to_date_check_;
+  FileIdentityCache* identity_ = nullptr;
 };
 
 }  // namespace cova::build

@@ -20,6 +20,8 @@
 
 namespace cova::build {
 
+class FileIdentityCache;
+
 namespace stdfs = std::filesystem;
 using Path = stdfs::path;
 
@@ -126,17 +128,22 @@ struct Action {
   // True when the last scan attempt failed to produce a usable closure. Such
   // an action may run, but its artifact must not be published.
   mutable bool input_closure_scan_failed = false;
-  // Content hashes captured by the last cache_key computation, used to detect
-  // inputs changed by another process between discovery and execution.
-  mutable std::vector<std::pair<std::string, std::string>> computed_input_hashes;
-
+  // Working directory, target, ABI, toolchain and environment identity produced
+  // by the executor before the incremental check. The plan key covers the
+  // declared inputs only, so it does not need the discovered header closure.
+  mutable std::string computed_plan_key;
   // Deterministic cache identity over the identity schema, action type, argv
   // (including response-file contents), input contents, include directories,
   // toolchain, sysroot, target, effective ABI and relevant environment.
-  std::string cache_key(const ActionEnvironment& env) const;
-  // Re-hashes the inputs captured by the last cache_key call. Returns false and
-  // sets `detail` when an input changed or disappeared.
-  bool inputs_stable(std::string* detail = nullptr) const;
+  // `identity` supplies digests for files whose metadata has not moved and is
+  // what makes a no-change build affordable; `declared_only` produces the plan
+  // key (discovered inputs are excluded).
+  std::string cache_key(const ActionEnvironment& env,
+                        FileIdentityCache* identity = nullptr,
+                        bool declared_only = false) const;
+  // Closure-free identity: same as cache_key(env, identity, /*declared_only=*/true).
+  std::string plan_key(const ActionEnvironment& env,
+                       FileIdentityCache* identity = nullptr) const;
   std::string label_with_output() const;
 };
 

@@ -256,16 +256,17 @@ bool add_depfile_inputs(Action& action, const fs::Path& depfile, const fs::Path&
   if (!parsed) {
     return false;
   }
+  // The depfile lists absolute, already-normalised paths, so plain path text
+  // dedupes them against the declared inputs. Resolving every entry (a realpath
+  // per header, hundreds per translation unit) and stat'ing each one made
+  // planning O(headers) syscalls per action; a stale entry for a deleted header
+  // costs one rebuild and is then gone, which the record check reports anyway.
   std::set<std::string> existing;
   for (const auto& input : action.inputs) {
-    existing.insert(fs::generic_string(fs::canonical_for_compare(input.path)));
+    existing.insert(fs::generic_string(input.path));
   }
   for (const auto& dependency : parsed->dependencies) {
-    if (!fs::is_regular_file(dependency)) {
-      continue;
-    }
-    const std::string key = fs::generic_string(fs::canonical_for_compare(dependency));
-    if (existing.insert(key).second) {
+    if (existing.insert(fs::generic_string(dependency)).second) {
       action.inputs.push_back(
           FileInput{dependency, "header", InputOrigin::Discovered});
     }

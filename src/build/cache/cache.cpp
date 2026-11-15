@@ -45,6 +45,75 @@ void put_strings(Table& table, std::string_view key, const std::vector<std::stri
   table.emplace(std::string(key), Value(std::move(array)));
 }
 
+// "<path>\t<mtime-ns>\t<size>\t<inode>\t<exists>\t<digest>". Parsed from the
+// right so a path containing a tab survives; digests never contain one.
+std::string encode_digest(const StampedDigest& digest) {
+  return digest.path + "\t" + std::to_string(digest.stamp.mtime_ns) + "\t" +
+         std::to_string(digest.stamp.size) + "\t" + std::to_string(digest.stamp.inode) +
+         "\t" + (digest.stamp.exists ? "1" : "0") + "\t" + digest.digest;
+}
+
+std::vector<std::string> encode_digests(const std::vector<StampedDigest>& digests) {
+  std::vector<std::string> encoded;
+  encoded.reserve(digests.size());
+  for (const auto& digest : digests) {
+    encoded.push_back(encode_digest(digest));
+  }
+  return encoded;
+}
+
+std::vector<StampedDigest> decode_digests(const Table& table, std::string_view key) {
+  std::vector<StampedDigest> digests;
+  for (const auto& encoded : strings_or(table, key)) {
+    // Split off the five fixed trailing fields, right to left.
+    std::vector<std::string> fields;
+    std::string rest = encoded;
+    bool broken = false;
+    for (int index = 0; index < 5; ++index) {
+      const auto position = rest.rfind('\t');
+      if (position == std::string::npos) {
+        broken = true;
+        break;
+      }
+      fields.push_back(rest.substr(position + 1));
+      rest.resize(position);
+    }
+    if (broken || fields.size() != 5) {
+      continue;
+    }
+    StampedDigest digest;
+    digest.path = rest;
+    digest.digest = fields[0];
+    digest.stamp.exists = fields[1] == "1";
+    try {
+      digest.stamp.inode = std::stoull(fields[2]);
+      digest.stamp.size = std::stoull(fields[3]);
+      digest.stamp.mtime_ns = std::stoll(fields[4]);
+    } catch (const std::exception&) {
+      continue;
+    }
+    digests.push_back(std::move(digest));
+  }
+  return digests;
+}
+
+std::string directory_entry_kind(const std::filesystem::directory_entry& entry) {
+  std::error_code ec;
+  const auto status = entry.symlink_status(ec);
+  if (ec) {
+    return "?";
+  }
+  if (std::filesystem::is_symlink(status)) {
+    return "l";
+  }
+  if (std::filesystem::is_directory(status)) {
+    return "d";
+  }
+  if (std::filesystem::is_regular_file(status)) {
+    return "f";
+  }
+  return "?";
+}
 
 }  // namespace
 
@@ -57,6 +126,111 @@ CacheSettings default_cache_settings() {
     settings.root = stdfs::temp_directory_path() / "cova-cache";
   }
   return settings;
+}
+
+// ---------------------------------------------------------------------------
+// Content digests, memoised per build
+// ---------------------------------------------------------------------------
+void FileIdentityCache::remember(const std::string& path, const fs::FileStamp& stamp,
+                                 std::string digest) {
+  Entry& entry = entries_[path];
+  entry.stamp = stamp;
+  entry.digest = std::move(digest);
+}
+
+const std::string& FileIdentityCache::digest(const Path& path, fs::FileStamp* stamp_out) {
+  const std::string key = fs::generic_string(path);
+  ++lookups_;
+  const fs::FileStamp current = fs::stamp(path);
+  const auto recorded = entries_.find(key);
+  if (recorded != entries_.end() && recorded->second.stamp == current) {
+    if (stamp_out != nullptr) {
+      *stamp_out = current;
+    }
+    return recorded->second.digest;
+  }
+  ++files_read_;
+  if (recorded != entries_.end()) {
+    // The file was recorded and its metadata moved, so the stored digest has to
+    // be re-derived and the record refreshed.
+    ++refreshed_;
+  }
+  std::string text = "missing";
+  if (current.exists) {
+    auto hashed = Sha256::hex_of_file(path);
+    text = hashed ? *hashed : std::string("missing");
+  }
+  Entry& entry = entries_[key];
+  entry.stamp = current;
+  entry.digest = std::move(text);
+  if (stamp_out != nullptr) {
+    *stamp_out = current;
+  }
+  return entry.digest;
+}
+
+const std::vector<std::string>& FileIdentityCache::listing(const Path& directory, bool& complete) {
+  const std::string key = fs::generic_string(directory);
+  if (auto it = listings_.find(key); it != listings_.end()) {
+    complete = it->second.complete;
+    return it->second.entries;
+  }
+  Listing listing;
+  std::error_code ec;
+  const bool is_directory = stdfs::is_directory(directory, ec);
+  if (ec) {
+    // The directory status could not be established (for example a permission
+    // error on a parent). This is not equivalent to a missing directory.
+    listing.entries.push_back("directory-check-incomplete");
+    listing.complete = false;
+  } else if (!is_directory) {
+    // A missing include directory is complete evidence: its listing is empty.
+    // If the directory appears later, the key changes.
+    listing.entries.push_back("directory-missing");
+  } else {
+    stdfs::directory_iterator it(directory, ec);
+    if (ec) {
+      listing.complete = false;
+    }
+    const stdfs::directory_iterator end;
+    while (!ec && it != end) {
+      const std::string name = it->path().filename().string();
+      const std::string kind = directory_entry_kind(*it);
+      if (kind == "?") {
+        // An entry whose type cannot be established makes the listing partial.
+        listing.complete = false;
+      }
+      std::string line = name;
+      line.push_back('\t');
+      line += kind;
+      std::error_code link_error;
+      if (stdfs::is_symlink(it->path(), link_error)) {
+        if (link_error) {
+          listing.complete = false;
+        }
+        std::error_code target_error;
+        const Path target = stdfs::read_symlink(it->path(), target_error);
+        line += "\t->";
+        line += target_error ? std::string("<unreadable>") : fs::generic_string(target);
+        if (target_error) {
+          listing.complete = false;
+        }
+      }
+      listing.entries.push_back(std::move(line));
+      it.increment(ec);
+    }
+    if (ec) {
+      // A partial listing is not a proof of the input closure. Keep the entries
+      // for diagnostics, but mark the identity incomplete so nothing is reused.
+      listing.complete = false;
+      listing.entries.push_back("directory-enumeration-incomplete");
+    }
+  }
+  std::sort(listing.entries.begin(), listing.entries.end());
+  complete = listing.complete;
+  Listing& stored = listings_[key];
+  stored = std::move(listing);
+  return stored.entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +262,7 @@ Result<BuildState> BuildState::load(const Path& path) {
       }
       const Table& table = *entry.as_table();
       ActionRecord record;
+      record.plan_key = string_or(table, "plan-key");
       record.cache_key = string_or(table, "cache-key");
       record.output_paths = strings_or(table, "output-paths");
       record.input_paths = strings_or(table, "input-paths");
@@ -99,6 +274,8 @@ Result<BuildState> BuildState::load(const Path& path) {
         record.output_hashes.emplace_back(encoded.substr(0, position),
                                           encoded.substr(position + 1));
       }
+      record.output_digests = decode_digests(table, "output-digests");
+      record.input_digests = decode_digests(table, "input-digests");
       record.toolchain_fingerprint = string_or(table, "toolchain-fingerprint");
       record.sysroot_fingerprint = string_or(table, "sysroot-fingerprint");
       if (auto value = get(table, "completed-at-ns"); value != nullptr && value->is_integer()) {
@@ -136,6 +313,9 @@ Status BuildState::save(const Path& path) const {
   toml::Array records;
   for (const auto& record : records_) {
     Table table;
+    if (!record.plan_key.empty()) {
+      table.emplace("plan-key", Value(record.plan_key));
+    }
     table.emplace("cache-key", Value(record.cache_key));
     put_strings(table, "output-paths", record.output_paths);
     put_strings(table, "input-paths", record.input_paths);
@@ -145,6 +325,8 @@ Status BuildState::save(const Path& path) const {
       hashes.push_back(input + "\t" + digest);
     }
     put_strings(table, "input-hashes", hashes);
+    put_strings(table, "input-digests", encode_digests(record.input_digests));
+    put_strings(table, "output-digests", encode_digests(record.output_digests));
     std::vector<std::string> output_hashes;
     output_hashes.reserve(record.output_hashes.size());
     for (const auto& [output, digest] : record.output_hashes) {
@@ -168,20 +350,63 @@ Status BuildState::save(const Path& path) const {
   return fs::write_file_atomic(path, toml::write(top));
 }
 
-bool BuildState::is_up_to_date(const Action& action, std::string& reason) const {
-  if (action.computed_key.empty()) {
+const ActionRecord* BuildState::find(const Action& action) const {
+  // The plan key answers "is this the same build step?" without hashing the
+  // header closure, so it is the primary identity. A record from an older
+  // schema (or a hand-built one) may only carry the full key.
+  if (!action.computed_plan_key.empty()) {
+    for (const auto& record : records_) {
+      if (record.plan_key == action.computed_plan_key) {
+        return &record;
+      }
+    }
+  }
+  if (!action.computed_key.empty()) {
+    for (const auto& record : records_) {
+      if (record.cache_key == action.computed_key) {
+        return &record;
+      }
+    }
+  }
+  return nullptr;
+}
+
+bool BuildState::verify_digests(
+    const std::vector<std::pair<std::string, std::string>>& hashes,
+    const std::vector<StampedDigest>& stamps, std::string_view role,
+    std::string& reason, FileIdentityCache* cache) const {
+  FileHasher hasher;
+  for (std::size_t index = 0; index < hashes.size(); ++index) {
+    const std::string& path = hashes[index].first;
+    const std::string& expected = hashes[index].second;
+    std::string actual;
+    if (cache != nullptr) {
+      actual = cache->digest(Path(path));
+    } else {
+      auto digest = hasher.hash_file(path);
+      actual = digest ? cova::to_hex(*digest) : std::string("missing");
+    }
+    if (actual == "missing") {
+      reason = std::string(role) + " is missing: " + path;
+      return false;
+    }
+    if (actual != expected) {
+      reason = std::string(role) + " changed: " + path;
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BuildState::is_up_to_date(const Action& action, std::string& reason,
+                               FileIdentityCache* cache) const {
+  if (action.computed_plan_key.empty() && action.computed_key.empty()) {
     // Output-path matching without an action identity is not a correctness
-    // proof. Callers must compute the key first.
+    // proof. Callers must compute the identity first.
     reason = "no action identity";
     return false;
   }
-  const ActionRecord* match = nullptr;
-  for (const auto& record : records_) {
-    if (record.cache_key == action.computed_key) {
-      match = &record;
-      break;
-    }
-  }
+  const ActionRecord* match = find(action);
   if (match == nullptr) {
     reason = "no previous build record";
     return false;
@@ -200,58 +425,34 @@ bool BuildState::is_up_to_date(const Action& action, std::string& reason) const 
     reason = "the previous record has no complete output integrity data";
     return false;
   }
-  FileHasher hasher;
-  for (const auto& [output, expected] : match->output_hashes) {
-    auto digest = hasher.hash_file(output);
-    if (!digest) {
-      reason = "output is unreadable: " + output;
-      return false;
-    }
-    if (cova::to_hex(*digest) != expected) {
-      reason = "output changed: " + output;
-      return false;
-    }
+  if (!verify_digests(match->output_hashes, match->output_digests, "output", reason, cache)) {
+    return false;
   }
-  for (const auto& [input, expected] : match->input_hashes) {
-    auto digest = hasher.hash_file(input);
-    if (!digest) {
-      reason = "input is missing: " + input;
-      return false;
-    }
-    if (cova::to_hex(*digest) != expected) {
-      reason = "input changed: " + input;
-      return false;
-    }
+  if (!verify_digests(match->input_hashes, match->input_digests, "input", reason, cache)) {
+    return false;
   }
   reason = "up to date";
   return true;
 }
 
-bool BuildState::inputs_match(const Action& action) const {
-  if (action.computed_key.empty()) {
-    return false;
-  }
-  const ActionRecord* match = nullptr;
-  for (const auto& record : records_) {
-    if (record.cache_key == action.computed_key) {
-      match = &record;
-      break;
-    }
-  }
+bool BuildState::inputs_match(const Action& action, FileIdentityCache* cache) const {
+  const ActionRecord* match = find(action);
   if (match == nullptr || !match->succeeded) {
     return false;
   }
-  FileHasher hasher;
-  for (const auto& [input, expected] : match->input_hashes) {
-    auto digest = hasher.hash_file(input);
-    if (!digest || cova::to_hex(*digest) != expected) {
-      return false;
-    }
-  }
-  return true;
+  std::string reason;
+  return verify_digests(match->input_hashes, match->input_digests, "input", reason, cache);
 }
 
 void BuildState::record(ActionRecord record) {
+  if (!record.plan_key.empty()) {
+    for (auto& existing : records_) {
+      if (existing.plan_key == record.plan_key) {
+        existing = std::move(record);
+        return;
+      }
+    }
+  }
   if (!record.cache_key.empty()) {
     for (auto& existing : records_) {
       if (existing.cache_key == record.cache_key) {
@@ -509,10 +710,17 @@ bool same_artifacts(const std::vector<Artifact>& left, const std::vector<Artifac
   return true;
 }
 
-Table artifact_manifest(const std::string& key, const std::vector<Artifact>& artifacts) {
+Table artifact_manifest(const std::string& key, const std::vector<Artifact>& artifacts,
+                         const std::string& depfile_path, const std::string& depfile_text) {
   Table top;
   top.emplace("schema-version", Value(std::string(kArtifactCacheSchemaVersion)));
   top.emplace("key", Value(key));
+  if (!depfile_text.empty()) {
+    Table depfile;
+    depfile.emplace("path", Value(depfile_path));
+    depfile.emplace("text", Value(depfile_text));
+    top.emplace("depfile", Value(std::move(depfile)));
+  }
   toml::Array outputs;
   for (const auto& artifact : artifacts) {
     Table entry;
@@ -661,8 +869,23 @@ Status cache_store(const CacheSettings& settings, const Action& action,
     }
   }
 
-  auto manifest = fs::write_file_atomic(directory / "manifest.toml",
-                                        toml::write(artifact_manifest(key, *artifacts)));
+  // A restored tree must also get the dependency record the compiler wrote:
+  // without it the next build cannot prove the input closure, would rescan, and
+  // would not notice a header change until that scan. Persisting it beside the
+  // outputs makes a restored tree indistinguishable from a compiled one.
+  std::string depfile_path;
+  std::string depfile_text;
+  if (action.kind == ActionKind::Compile && !action.outputs.empty()) {
+    Path depfile = action.outputs.front().path;
+    depfile += ".d";
+    if (auto text = fs::read_file(depfile)) {
+      depfile_path = fs::generic_string(depfile);
+      depfile_text = std::move(*text);
+    }
+  }
+  auto manifest = fs::write_file_atomic(
+      directory / "manifest.toml",
+      toml::write(artifact_manifest(key, *artifacts, depfile_path, depfile_text)));
   if (!manifest) {
     cleanup();
     return manifest;
@@ -788,6 +1011,20 @@ Result<bool> cache_restore(const CacheSettings& settings, const Action& action,
     auto renamed = fs::rename_path(entry.temporaries.front(), entry.destination);
     if (!renamed) {
       return fail_cleanup(renamed.error());
+    }
+  }
+  if (const Value* depfile = get(top, "depfile"); depfile != nullptr && depfile->is_table()) {
+    const Table& table = *depfile->as_table();
+    const std::string path = string_or(table, "path");
+    const std::string text = string_or(table, "text");
+    if (!path.empty() && !text.empty()) {
+      // Best effort: the outputs are already in place, and a tree without a
+      // depfile is still correct - it only costs the next build a rescan.
+      const Path destination(path);
+      if (destination.has_parent_path()) {
+        (void)fs::create_directories(destination.parent_path());
+      }
+      (void)fs::write_file_atomic(destination, text);
     }
   }
   return true;

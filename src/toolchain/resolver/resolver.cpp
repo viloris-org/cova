@@ -351,6 +351,7 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     options.include_managed = request.policy != Policy::SystemOnly;
     options.include_user_path = true;
     options.managed_root = request.toolchains_root;
+    options.cache_root = request.cache_root;
     if (request.compiler_family) {
       options.families.push_back(*request.compiler_family);
     }
@@ -560,7 +561,7 @@ ResolutionReport resolve(const ResolutionRequest& request) {
     // The build cache key must cover the driver's subprograms, but lockfiles
     // keep the descriptor's original content hash. Enrich only the selected
     // candidate instead of every discovery candidate.
-    enrich_compiler_subprograms(resolved.descriptor);
+    enrich_compiler_subprograms(resolved.descriptor, request.cache_root);
     resolved.target = request.target;
     resolved.abi_signature = make_abi_signature(probed, request.target);
     if (!abi_facts.empty()) {

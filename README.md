@@ -187,6 +187,24 @@ python3 scripts/devbuild.py clean
 
 Set `COVA_BUILD_DIR=build/<name>` to keep several build trees side by side.
 
+### Benchmarks
+
+`scripts/bench.py` measures Cova against CMake + Ninja on the same sources,
+compiler and flags, and writes a Markdown report plus the raw samples:
+
+```bash
+COVA_CXXFLAGS="-O2 -DNDEBUG" COVA_BUILD_DIR=build/bench-release \
+  python3 scripts/devbuild.py build
+
+python3 scripts/bench.py --tus 10,40,120 --real --cache-ab \
+  --markdown docs/bench/cova-vs-cmake.md --json docs/bench/cova-vs-cmake.json
+```
+
+The latest numbers are in [docs/bench/cova-vs-cmake.md](docs/bench/cova-vs-cmake.md);
+the methodology, the scenario list and the rules for honest numbers are in
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md). PRD §19.1 applies: these numbers
+belong to one machine and are not comparable across environments.
+
 ## Using Cova
 
 ```bash
@@ -320,6 +338,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - [docs/REGISTRY.md](docs/REGISTRY.md) — trusted local component registry schema and install rules
 - [docs/RELEASING.md](docs/RELEASING.md) — cutting a release, package formats and signing
 - [docs/MIGRATING.md](docs/MIGRATING.md) — moving an existing CMake, Meson, Make or Bazel project to Cova
+- [docs/BENCHMARKING.md](docs/BENCHMARKING.md) — measuring Cova against CMake + Ninja
+- [docs/bench/cova-vs-cmake.md](docs/bench/cova-vs-cmake.md) — latest benchmark results
 
 ## License
 

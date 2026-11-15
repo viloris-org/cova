@@ -29,6 +29,9 @@ struct DiscoveryOptions {
   std::filesystem::path managed_root;
   // Timeout for each version probe invocation.
   int probe_timeout_ms = 3000;
+  // Where compiler query answers may be cached. Empty disables the cache, which
+  // is what tests want: they must observe the compiler, not a previous answer.
+  std::filesystem::path cache_root;
 };
 
 // Candidates discovered on this host, de-duplicated by canonical executable
@@ -36,16 +39,19 @@ struct DiscoveryOptions {
 Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& options);
 
 // Discovers a single toolchain rooted at a specific compiler binary. Used by
-// tests and by `--toolchain <path>`.
+// tests and by `--toolchain <path>`. `cache_root` reuses previous query answers
+// while the driver binary is unchanged.
 Result<ToolchainDescriptor> describe_compiler(const std::filesystem::path& compiler_path,
-                                              ToolchainSource source);
+                                              ToolchainSource source,
+                                              const std::filesystem::path& cache_root = {});
 // Adds hashed driver subprograms (cc1/cc1plus/as/collect2/lto-wrapper/specs and
 // a linker fallback) to a descriptor. Call this for the selected toolchain only:
 // querying every discovery candidate is unnecessarily expensive. The
 // descriptor's `content_hash` is deliberately left unchanged so lockfiles keep
 // their existing identity; `compute_fingerprint()` (used by the build cache key)
 // includes the added components.
-void enrich_compiler_subprograms(ToolchainDescriptor& descriptor);
+void enrich_compiler_subprograms(ToolchainDescriptor& descriptor,
+                                 const std::filesystem::path& cache_root = {});
 
 
 // Parses `clang version 23.1.4 (...)` / `g++ (GCC) 16.2.1 20260810`.
@@ -72,10 +78,12 @@ SiblingTools find_sibling_tools(const std::filesystem::path& compiler_path,
                                 std::string_view family);
 
 // Reads the compiler's resource directory (`clang -print-resource-dir`).
-Result<std::filesystem::path> query_resource_dir(const std::filesystem::path& compiler_path);
+Result<std::filesystem::path> query_resource_dir(const std::filesystem::path& compiler_path,
+                                                 const std::filesystem::path& cache_root = {});
 
 // What the compiler reports as its default sysroot (`--print-sysroot`), if any.
-Result<std::filesystem::path> query_default_sysroot(const std::filesystem::path& compiler_path);
+Result<std::filesystem::path> query_default_sysroot(const std::filesystem::path& compiler_path,
+                                                    const std::filesystem::path& cache_root = {});
 
 // Lists targets the compiler claims (`--print-targets`). Empty when
 // unavailable.

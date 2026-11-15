@@ -24,6 +24,7 @@
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -287,6 +288,45 @@ std::optional<std::int64_t> mtime_ns(const Path& p) {
           time - stdfs::file_time_type::clock::now() + std::chrono::system_clock::now());
   return std::chrono::duration_cast<std::chrono::nanoseconds>(system_time.time_since_epoch())
       .count();
+}
+
+FileStamp stamp(const Path& p) {
+  FileStamp result;
+#ifdef _WIN32
+  // `_wstat64` reports the modification time in whole seconds, which is too
+  // coarse for "write, then compare": two edits inside one second would look
+  // like no change at all. The WIN32_FILE_ATTRIBUTE_DATA timestamp has the
+  // filesystem's 100ns resolution.
+  WIN32_FILE_ATTRIBUTE_DATA info{};
+  if (::GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &info) != 0) {
+    result.exists = true;
+    result.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) |
+                  static_cast<std::uint64_t>(info.nFileSizeLow);
+    const std::uint64_t ticks = (static_cast<std::uint64_t>(info.ftLastWriteTime.dwHighDateTime)
+                                 << 32) |
+                                static_cast<std::uint64_t>(info.ftLastWriteTime.dwLowDateTime);
+    // FILETIME counts 100ns intervals since 1601-01-01.
+    constexpr std::uint64_t kEpochShift = 116444736000000000ULL;
+    result.mtime_ns = ticks >= kEpochShift
+                          ? static_cast<std::int64_t>((ticks - kEpochShift) * 100ULL)
+                          : static_cast<std::int64_t>(ticks);
+  }
+#else
+  struct stat info {};
+  if (::stat(p.c_str(), &info) == 0) {
+    result.exists = true;
+    result.size = static_cast<std::uint64_t>(info.st_size);
+    result.inode = static_cast<std::uint64_t>(info.st_ino);
+#ifdef __APPLE__
+    result.mtime_ns = static_cast<std::int64_t>(info.st_mtimespec.tv_sec) * 1'000'000'000LL +
+                      static_cast<std::int64_t>(info.st_mtimespec.tv_nsec);
+#else
+    result.mtime_ns = static_cast<std::int64_t>(info.st_mtim.tv_sec) * 1'000'000'000LL +
+                      static_cast<std::int64_t>(info.st_mtim.tv_nsec);
+#endif
+  }
+#endif
+  return result;
 }
 
 Result<std::string> read_file(const Path& p) {

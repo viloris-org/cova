@@ -1171,6 +1171,13 @@ Result<ProcessResult> run(const ProcessSpec& spec) {
       ::kill(pid, SIGKILL);
       break;
     }
+    // Once every pipe is closed there is nothing to poll for. Sleeping a poll
+    // slice only to notice the child has exited added ~20ms to every child
+    // process (probes, depfiles, compilations), so reap it directly instead.
+    const bool stdin_pending = !stdin_closed && stdin_pipe[1] >= 0;
+    if (stdout_pipe[0] < 0 && stderr_pipe[0] < 0 && !stdin_pending) {
+      break;
+    }
 
     std::array<struct pollfd, 3> fds{};
     nfds_t count = 0;

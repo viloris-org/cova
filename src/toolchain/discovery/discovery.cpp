@@ -5,6 +5,7 @@
 #include <cctype>
 #include <future>
 #include <initializer_list>
+#include <sstream>
 #include <map>
 #include <set>
 #include <string>
@@ -12,6 +13,7 @@
 
 #include "core/filesystem/filesystem.hpp"
 #include "core/process/process.hpp"
+#include "toolchain/cache/query_cache.hpp"
 
 namespace cova::toolchain {
 namespace {
@@ -269,12 +271,181 @@ SiblingTools find_sibling_tools(const stdfs::path& compiler_path, std::string_vi
   return tools;
 }
 
-Result<stdfs::path> query_resource_dir(const stdfs::path& compiler_path) {
-  proc::ProcessSpec spec;
-  spec.program = compiler_path;
-  spec.args = {"-print-resource-dir"};
-  spec.timeout = std::chrono::milliseconds(3000);
-  auto result = proc::run(spec);
+// One representative driver plus the hard-linked aliases discovered beside it.
+// Describing each alias separately would repeat the version, resource-dir,
+// sysroot and sibling queries.
+struct CandidateGroup {
+  stdfs::path representative;
+  std::vector<stdfs::path> aliases;
+};
+
+constexpr std::string_view kDiscoveryHintSchema = "cova-discovery/1";
+
+std::string discovery_hint_key(const std::vector<stdfs::path>& roots) {
+  Fingerprint fingerprint;
+  fingerprint.add(kDiscoveryHintSchema);
+  for (const auto& root : roots) {
+    fingerprint.add(fs::generic_string(root));
+  }
+  return fingerprint.finish_hex();
+}
+
+// The hint is the list of driver paths found by scanning the roots, valid while
+// every root keeps its modification time (so no driver was added or removed)
+// and every driver keeps its metadata (so none was replaced). It exists because
+// scanning `/usr/bin` on every build to find compilers that have not moved is
+// pure latency: the answer changes only when the filesystem does.
+std::optional<std::vector<CandidateGroup>> load_discovery_hint(
+    const stdfs::path& file, const std::vector<stdfs::path>& roots) {
+  auto text = fs::read_file(file);
+  if (!text) {
+    return std::nullopt;
+  }
+  std::vector<CandidateGroup> groups;
+  std::istringstream input(*text);
+  std::vector<std::string> lines;
+  std::string line;
+  while (std::getline(input, line)) {
+    lines.push_back(line);
+  }
+  std::size_t index = 0;
+  if (lines.empty() || lines[0] != kDiscoveryHintSchema) {
+    return std::nullopt;
+  }
+  ++index;
+  auto read_prefix = [](const std::string& row, std::string_view tag, std::string& rest) {
+    if (row.size() <= tag.size() || row.compare(0, tag.size(), tag) != 0) {
+      return false;
+    }
+    rest = row.substr(tag.size() + 1);
+    return true;
+  };
+  int recorded_roots = 0;
+  if (index >= lines.size() || !read_prefix(lines[index], "roots", line)) {
+    return std::nullopt;
+  }
+  try {
+    recorded_roots = std::stoi(line);
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+  ++index;
+  if (recorded_roots < 0 || static_cast<std::size_t>(recorded_roots) != roots.size()) {
+    return std::nullopt;
+  }
+  for (int entry = 0; entry < recorded_roots; ++entry, ++index) {
+    if (index >= lines.size()) {
+      return std::nullopt;
+    }
+    long long mtime = 0;
+    int exists = 0;
+    const std::string& row = lines[index];
+    if (std::sscanf(row.c_str(), "%lld %d", &mtime, &exists) != 2) {
+      return std::nullopt;
+    }
+    const std::size_t kept = row.find(' ', row.find(' ') + 1);
+    const stdfs::path recorded_path(row.substr(kept + 1));
+    // Roots are compared in order, so a changed PATH or a different set of
+    // scan flags is a miss.
+    if (recorded_path != roots[static_cast<std::size_t>(entry)]) {
+      return std::nullopt;
+    }
+    const fs::FileStamp stamp = fs::stamp(recorded_path);
+    if ((stamp.exists ? 1 : 0) != exists || stamp.mtime_ns != mtime) {
+      return std::nullopt;
+    }
+  }
+  int recorded_groups = 0;
+  if (index >= lines.size() || !read_prefix(lines[index], "groups", line)) {
+    return std::nullopt;
+  }
+  try {
+    recorded_groups = std::stoi(line);
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+  ++index;
+  // `index` is advanced by the header line and by every member row below; the
+  // loop itself must not advance it again.
+  for (int group = 0; group < recorded_groups; ++group) {
+    int members = 0;
+    if (index >= lines.size() || !read_prefix(lines[index], "group", line)) {
+      return std::nullopt;
+    }
+    try {
+      members = std::stoi(line);
+    } catch (const std::exception&) {
+      return std::nullopt;
+    }
+    ++index;
+    CandidateGroup candidate;
+    for (int member = 0; member < members; ++member, ++index) {
+      if (index >= lines.size()) {
+        return std::nullopt;
+      }
+      long long mtime = 0;
+      unsigned long long size = 0;
+      unsigned long long inode = 0;
+      const std::string& row = lines[index];
+      if (std::sscanf(row.c_str(), "%lld %llu %llu", &mtime, &size, &inode) != 3) {
+        return std::nullopt;
+      }
+      std::size_t offset = 0;
+      for (int field = 0; field < 3; ++field) {
+        offset = row.find(' ', offset);
+        if (offset == std::string::npos) {
+          return std::nullopt;
+        }
+        ++offset;
+      }
+      const stdfs::path path(row.substr(offset));
+      const fs::FileStamp stamp = fs::stamp(path);
+      if (!stamp.exists || stamp.mtime_ns != mtime || stamp.size != size ||
+          stamp.inode != inode) {
+        return std::nullopt;
+      }
+      if (member == 0) {
+        candidate.representative = path;
+      }
+      // The scan represents a group as {representative, alias...}, and the
+      // describe loop emits one descriptor per member; keep both paths aligned.
+      candidate.aliases.push_back(path);
+    }
+    if (candidate.representative.empty()) {
+      return std::nullopt;
+    }
+    groups.push_back(std::move(candidate));
+  }
+  return groups;
+}
+
+void store_discovery_hint(const stdfs::path& file, const std::vector<stdfs::path>& roots,
+                          const std::vector<CandidateGroup>& groups) {
+  std::string text(kDiscoveryHintSchema);
+  text += "\nroots " + std::to_string(roots.size()) + "\n";
+  for (const auto& root : roots) {
+    const fs::FileStamp stamp = fs::stamp(root);
+    text += std::to_string(stamp.exists ? stamp.mtime_ns : 0) + " " +
+            (stamp.exists ? "1" : "0") + " " + fs::generic_string(root) + "\n";
+  }
+  text += "groups " + std::to_string(groups.size()) + "\n";
+  for (const auto& group : groups) {
+    text += "group " + std::to_string(group.aliases.size()) + "\n";
+    for (const auto& member : group.aliases) {
+      const fs::FileStamp stamp = fs::stamp(member);
+      text += std::to_string(stamp.mtime_ns) + " " + std::to_string(stamp.size) + " " +
+              std::to_string(stamp.inode) + " " + fs::generic_string(member) + "\n";
+    }
+  }
+  if (fs::create_directories(file.parent_path())) {
+    (void)fs::write_file_atomic(file, text);
+  }
+}
+
+Result<stdfs::path> query_resource_dir(const stdfs::path& compiler_path,
+                                        const stdfs::path& cache_root) {
+  auto result = run_query(compiler_path, {"-print-resource-dir"}, cache_root,
+                          std::chrono::milliseconds(3000));
   if (!result) {
     return fail<stdfs::path>(result.error());
   }
@@ -286,12 +457,10 @@ Result<stdfs::path> query_resource_dir(const stdfs::path& compiler_path) {
   return stdfs::path(path);
 }
 
-Result<stdfs::path> query_default_sysroot(const stdfs::path& compiler_path) {
-  proc::ProcessSpec spec;
-  spec.program = compiler_path;
-  spec.args = {"--print-sysroot"};
-  spec.timeout = std::chrono::milliseconds(3000);
-  auto result = proc::run(spec);
+Result<stdfs::path> query_default_sysroot(const stdfs::path& compiler_path,
+                                           const stdfs::path& cache_root) {
+  auto result = run_query(compiler_path, {"--print-sysroot"}, cache_root,
+                          std::chrono::milliseconds(3000));
   if (!result) {
     return fail<stdfs::path>(result.error());
   }
@@ -309,12 +478,10 @@ Result<stdfs::path> query_default_sysroot(const stdfs::path& compiler_path) {
 }
 
 Result<stdfs::path> query_program(const stdfs::path& compiler_path,
-                                   std::string_view query) {
-  proc::ProcessSpec spec;
-  spec.program = compiler_path;
-  spec.args = {std::string(query)};
-  spec.timeout = std::chrono::milliseconds(3000);
-  auto result = proc::run(spec);
+                                   std::string_view query,
+                                   const stdfs::path& cache_root) {
+  auto result = run_query(compiler_path, {std::string(query)}, cache_root,
+                          std::chrono::milliseconds(3000));
   if (!result || !result->success()) {
     return fail<stdfs::path>(Error::make("cova::toolchain::subprogram",
                                          "the compiler did not answer a subprogram query"));
@@ -362,8 +529,9 @@ stdfs::path resolve_reported_tool(const stdfs::path& compiler_directory,
 }
 
 std::optional<ToolComponent> query_subprogram_component(
-    const stdfs::path& compiler_path, std::string role, std::string_view query) {
-  auto reported = query_program(compiler_path, query);
+    const stdfs::path& compiler_path, std::string role, std::string_view query,
+    const stdfs::path& cache_root) {
+  auto reported = query_program(compiler_path, query, cache_root);
   if (!reported) {
     return std::nullopt;
   }
@@ -378,7 +546,7 @@ std::optional<ToolComponent> query_subprogram_component(
   ToolComponent component;
   component.role = std::move(role);
   component.path = fs::canonical_for_compare(resolved);
-  component.sha256 = Sha256::hex_of_file(component.path).value_or("");
+  component.sha256 = component_digest(component.path, cache_root);
   return component;
 }
 
@@ -386,7 +554,8 @@ std::optional<ToolComponent> query_subprogram_component(
 // `collect2`, `lto-wrapper` or a specs file changes the produced artifact even
 // when the driver executable is byte-identical.
 void add_compiler_subprogram_components(ToolchainDescriptor& descriptor,
-                                        const stdfs::path& compiler_path) {
+                                        const stdfs::path& compiler_path,
+                                        const stdfs::path& cache_root) {
   static constexpr std::pair<std::string_view, std::string_view> kQueries[] = {
       {"cc1", "-print-prog-name=cc1"},
       {"cc1plus", "-print-prog-name=cc1plus"},
@@ -405,10 +574,12 @@ void add_compiler_subprogram_components(ToolchainDescriptor& descriptor,
     if (descriptor.component(role) != nullptr) {
       continue;
     }
-    pending.push_back(
-        Pending{std::string(role), std::async(std::launch::async, [compiler_path, role, query] {
-                  return query_subprogram_component(compiler_path, std::string(role), query);
-                })});
+    pending.push_back(Pending{
+        std::string(role), std::async(std::launch::async,
+                                      [compiler_path, role, query, cache_root] {
+                                        return query_subprogram_component(
+                                            compiler_path, std::string(role), query, cache_root);
+                                      })});
   }
   for (auto& entry : pending) {
     if (auto component = entry.result.get()) {
@@ -447,7 +618,8 @@ std::vector<std::string> query_supported_targets(const stdfs::path& compiler_pat
 }
 
 Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
-                                              ToolchainSource source) {
+                                              ToolchainSource source,
+                                              const stdfs::path& cache_root) {
   if (!fs::is_regular_file(compiler_path) || !proc::is_executable(compiler_path)) {
     return fail<ToolchainDescriptor>(
         Error::make("cova::toolchain::not_executable",
@@ -462,11 +634,8 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   }
   const std::string& family = match->family;
 
-  proc::ProcessSpec spec;
-  spec.program = compiler_path;
-  spec.args = {"--version"};
-  spec.timeout = std::chrono::milliseconds(3000);
-  auto result = proc::run(spec);
+  auto result = run_query(compiler_path, {"--version"}, cache_root,
+                          std::chrono::milliseconds(3000));
   if (!result) {
     return fail<ToolchainDescriptor>(result.error());
   }
@@ -513,7 +682,7 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   cxx.path = fs::absolute_normalized(compiler_path);
   cxx.version_text = str::trim(banner);
   cxx.version = *version;
-  cxx.sha256 = Sha256::hex_of_file(cxx.path).value_or("");
+  cxx.sha256 = component_digest(cxx.path, cache_root);
   descriptor.components.push_back(cxx);
 
   std::vector<std::string> cc_names;
@@ -549,14 +718,14 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
     ToolComponent component;
     component.role = role;
     component.path = fs::canonical_for_compare(path);
-    component.sha256 = Sha256::hex_of_file(component.path).value_or("");
+    component.sha256 = component_digest(component.path, cache_root);
     descriptor.components.push_back(std::move(component));
   }
 
-  if (auto resource_dir = query_resource_dir(compiler_path)) {
+  if (auto resource_dir = query_resource_dir(compiler_path, cache_root)) {
     descriptor.resource_dir = *resource_dir;
   }
-  if (auto default_sysroot = query_default_sysroot(compiler_path)) {
+  if (auto default_sysroot = query_default_sysroot(compiler_path, cache_root)) {
     if (fs::is_directory(*default_sysroot)) {
       descriptor.default_sysroot = *default_sysroot;
     }
@@ -579,7 +748,8 @@ Result<ToolchainDescriptor> describe_compiler(const stdfs::path& compiler_path,
   return descriptor;
 }
 
-void enrich_compiler_subprograms(ToolchainDescriptor& descriptor) {
+void enrich_compiler_subprograms(ToolchainDescriptor& descriptor,
+                                 const stdfs::path& cache_root) {
   stdfs::path compiler = descriptor.component_path("cxx");
   if (compiler.empty()) {
     compiler = descriptor.component_path("cc");
@@ -587,7 +757,7 @@ void enrich_compiler_subprograms(ToolchainDescriptor& descriptor) {
   if (compiler.empty()) {
     return;
   }
-  add_compiler_subprogram_components(descriptor, compiler);
+  add_compiler_subprogram_components(descriptor, compiler, cache_root);
 }
 
 Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& options) {
@@ -613,63 +783,94 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
   std::vector<ToolchainDescriptor> descriptors;
   std::set<std::string> seen;
 
-  // Collect driver paths first. Describing each alias separately repeats
-  // version, resource-dir, sysroot and sibling queries; hard-linked aliases
-  // are grouped so only one representative is described.
-  std::vector<stdfs::path> candidates;
-  for (const auto& root : roots) {
-    if (!fs::is_directory(root)) {
-      continue;
+  // PATH usually names `/usr/bin` too, so the same directory would be scanned
+  // twice; dedupe by canonical path before iterating anything.
+  std::vector<stdfs::path> unique_roots;
+  {
+    std::set<std::string> root_keys;
+    for (const auto& root : roots) {
+      if (!root_keys.insert(fs::generic_string(fs::canonical_for_compare(root))).second) {
+        continue;
+      }
+      unique_roots.push_back(root);
     }
-    std::error_code ec;
-    for (auto it = stdfs::directory_iterator(root, ec); it != stdfs::directory_iterator();
-         it.increment(ec)) {
-      if (!fs::is_regular_file(it->path())) {
-        continue;
+  }
+  roots = std::move(unique_roots);
+
+  std::vector<CandidateGroup> groups;
+  bool used_hint = false;
+  stdfs::path hint_file;
+  if (!options.cache_root.empty() && !roots.empty()) {
+    hint_file = options.cache_root / "toolchain" / "discovery" /
+                (discovery_hint_key(roots) + ".txt");
+    if (auto cached = load_discovery_hint(hint_file, roots)) {
+      groups = std::move(*cached);
+      used_hint = true;
+      for (const auto& group : groups) {
+        for (const auto& member : group.aliases) {
+          seen.insert(fs::generic_string(fs::canonical_for_compare(member)));
+        }
       }
-      const std::string name = basename_lower(it->path());
-      const auto match = match_driver(name);
-      if (!match || !is_cxx_driver(*match)) {
-        continue;
-      }
-      const std::string canonical = fs::generic_string(fs::canonical_for_compare(it->path()));
-      if (!seen.insert(canonical).second) {
-        continue;
-      }
-      candidates.push_back(it->path());
     }
   }
 
-  struct CandidateGroup {
-    stdfs::path representative;
-    std::vector<stdfs::path> aliases;
-  };
-  std::vector<CandidateGroup> groups;
-  for (const auto& candidate : candidates) {
-    bool grouped = false;
-    for (auto& group : groups) {
-      if (candidate.parent_path() != group.representative.parent_path()) {
+  if (!used_hint) {
+    // Collect driver paths first. Describing each alias separately repeats
+    // version, resource-dir, sysroot and sibling queries; hard-linked aliases
+    // are grouped so only one representative is described.
+    std::vector<stdfs::path> candidates;
+    for (const auto& root : roots) {
+      if (!fs::is_directory(root)) {
         continue;
       }
-      const auto candidate_match = match_driver(basename_lower(candidate));
-      const auto representative_match =
-          match_driver(basename_lower(group.representative));
-      if (!candidate_match || !representative_match ||
-          candidate_match->family != representative_match->family ||
-          target_from_executable(basename_lower(candidate)) !=
-              target_from_executable(basename_lower(group.representative))) {
-        continue;
-      }
-      std::error_code equivalent_error;
-      if (stdfs::equivalent(candidate, group.representative, equivalent_error) &&
-          !equivalent_error) {
-        group.aliases.push_back(candidate);
-        grouped = true;
-        break;
+      std::error_code ec;
+      for (auto it = stdfs::directory_iterator(root, ec);
+           it != stdfs::directory_iterator(); it.increment(ec)) {
+        if (!fs::is_regular_file(it->path())) {
+          continue;
+        }
+        const std::string name = basename_lower(it->path());
+        const auto match = match_driver(name);
+        if (!match || !is_cxx_driver(*match)) {
+          continue;
+        }
+        const std::string canonical =
+            fs::generic_string(fs::canonical_for_compare(it->path()));
+        if (!seen.insert(canonical).second) {
+          continue;
+        }
+        candidates.push_back(it->path());
       }
     }
-    if (!grouped) {
-      groups.push_back(CandidateGroup{candidate, {candidate}});
+
+    for (const auto& candidate : candidates) {
+      bool grouped = false;
+      for (auto& group : groups) {
+        if (candidate.parent_path() != group.representative.parent_path()) {
+          continue;
+        }
+        const auto candidate_match = match_driver(basename_lower(candidate));
+        const auto representative_match = match_driver(basename_lower(group.representative));
+        if (!candidate_match || !representative_match ||
+            candidate_match->family != representative_match->family ||
+            target_from_executable(basename_lower(candidate)) !=
+                target_from_executable(basename_lower(group.representative))) {
+          continue;
+        }
+        std::error_code equivalent_error;
+        if (stdfs::equivalent(candidate, group.representative, equivalent_error) &&
+            !equivalent_error) {
+          group.aliases.push_back(candidate);
+          grouped = true;
+          break;
+        }
+      }
+      if (!grouped) {
+        groups.push_back(CandidateGroup{candidate, {candidate}});
+      }
+    }
+    if (!hint_file.empty()) {
+      store_discovery_hint(hint_file, roots, groups);
     }
   }
 
@@ -680,8 +881,10 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
   described.reserve(groups.size());
   for (const auto& group : groups) {
     described.push_back(std::async(std::launch::async,
-                                   [path = group.representative] {
-                                     return describe_compiler(path, ToolchainSource::System);
+                                   [path = group.representative,
+                                    cache_root = options.cache_root] {
+                                     return describe_compiler(path, ToolchainSource::System,
+                                                              cache_root);
                                    }));
   }
   for (std::size_t index = 0; index < groups.size(); ++index) {
@@ -690,7 +893,8 @@ Result<std::vector<ToolchainDescriptor>> discover(const DiscoveryOptions& option
       // A failed representative should not hide aliases that could still be
       // described independently (for example after a transient query error).
       for (const auto& candidate : groups[index].aliases) {
-        auto fallback = describe_compiler(candidate, ToolchainSource::System);
+        auto fallback =
+            describe_compiler(candidate, ToolchainSource::System, options.cache_root);
         if (fallback &&
             (options.families.empty() ||
              std::find(options.families.begin(), options.families.end(), fallback->family) !=

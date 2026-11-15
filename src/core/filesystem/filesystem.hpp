@@ -4,6 +4,7 @@
 // refuse to leave the managed root. Symlinks are never followed when deleting.
 #pragma once
 
+#include <compare>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -29,6 +30,22 @@ bool is_symlink(const Path& p);
 std::uint64_t file_size(const Path& p);
 // Modification time as nanoseconds since the epoch; nullopt when unavailable.
 std::optional<std::int64_t> mtime_ns(const Path& p);
+
+// One metadata sample, taken with a single system call. Incremental builds
+// compare a recorded sample with a fresh one: when it matches, the file was not
+// replaced, so a previously computed content hash is still valid. The triple
+// (inode, mtime, size) is what makes a rewrite visible; editing a file without
+// changing its size still moves the modification time.
+struct FileStamp {
+  std::int64_t mtime_ns = 0;
+  std::uint64_t size = 0;
+  std::uint64_t inode = 0;
+  bool exists = false;
+  auto operator<=>(const FileStamp&) const = default;
+};
+
+// Metadata for `p`; `exists` is false when it cannot be stat'ed.
+FileStamp stamp(const Path& p);
 
 // Reads a whole file as text.
 Result<std::string> read_file(const Path& p);
