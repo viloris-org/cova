@@ -1,6 +1,6 @@
 # Cova — Migrating an Existing Project
 
-> **Applies to Cova 0.1.0-beta-2.** The manifest schema and the main CLI are
+> **Applies to Cova 0.1.0-beta-3.** The manifest schema and the main CLI are
 > beta; this document describes the keys the binary in this tree accepts today.
 > Check `cova <command> --help` and the manifest parser before relying on a key
 > this guide does not mention.
